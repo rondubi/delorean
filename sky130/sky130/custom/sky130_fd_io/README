@@ -1,0 +1,22 @@
+This directory contains standard format files for "sky130_ef_io",
+which is an efabless addendum to the SkyWater I/O library "sky130_fd_io".
+
+sky130_ef_io does the following:
+
+(1) Changes the orientation of the corner pad from upper-right to
+    lower-left with a wrapper cell called "sky130_fd_io__corner_pad".  Also
+    extends the power buses to make the dimensions of the corner pad
+    multiples of 1um.
+
+(2) Adds a 1um-wide spacer cell to complement the existing 5um-wide
+    spacer cell.
+
+(3) Adds wrappers for all the combinations of power pad base cell +
+    power pad overlay, to create all 12 combinations, for pads with
+    either high- or low-voltage clamps, connecting to one of the six
+    power domains vddio, vdda, vccd, vssio, vssa, or vssd.
+
+(4) Fix a DRC error in the SkyWater GPIO pad layout
+
+"sky130_ef_io" is open source copyright 2020 efabless, Inc.
+Released under Apache 2.0 license

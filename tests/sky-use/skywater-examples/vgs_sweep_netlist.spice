@@ -1,0 +1,22 @@
+* PMOS VGS sweep for LVT, SVT, and HVT devices (from SKY130_VGS_sweep.ipynb)
+.lib "$DELOREAN_ROOT/sky130/sky130/sky130A/libs.tech/ngspice/sky130.lib.spice" tt
+
+XML vdp vgp 0 vbp sky130_fd_pr__pfet_01v8_lvt L=0.35 W=4 nf=1 mult=1 m=1
++ ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'
++ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W'
++ sa=0 sb=0 sd=0
+
+XMS vdp vgp 0 vbp sky130_fd_pr__pfet_01v8 L=0.15 W=2 nf=1 mult=1 m=1
++ ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'
++ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W'
++ sa=0 sb=0 sd=0
+
+XMH vdp vgp 0 vbp sky130_fd_pr__pfet_01v8_hvt L=0.15 W=2 nf=1 mult=1 m=1
++ ad='int((nf+1)/2) * W/nf * 0.29' as='int((nf+2)/2) * W/nf * 0.29'
++ pd='2*int((nf+1)/2) * (W/nf + 0.29)' ps='2*int((nf+2)/2) * (W/nf + 0.29)' nrd='0.29 / W' nrs='0.29 / W'
++ sa=0 sb=0 sd=0
+
+vsdp 0 vdp dc 0.9
+vsgp 0 vgp dc 0
+vsbp 0 vbp dc 0
+.end

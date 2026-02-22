@@ -1,0 +1,5 @@
+* First simulation "continuous time" (from SKY130_Track_and_Hold.ipynb)
+.inc track_hold_netlist.spice
+.option method=gear
+.tran 1n {per*(nfft+3)}
+.end

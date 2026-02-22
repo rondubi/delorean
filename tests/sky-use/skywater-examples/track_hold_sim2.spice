@@ -1,0 +1,5 @@
+* Second simulation "discrete time" (from SKY130_Track_and_Hold.ipynb)
+.inc track_hold_netlist.spice
+.option method=gear reltol=1e-6 interp
+.tran {per} {per*(nfft+3)} {0.25*per}
+.end
