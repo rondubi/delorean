@@ -2,17 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DELOREAN_ROOT="${DELOREAN_ROOT:-${REPO_ROOT}}"
 
-# Runs the track-and-hold sim1 deck with the standard BSIM4 OSDI plugin, with perf + strace.
+# Runs the track-and-hold sim2 deck with the standard BSIM4 OSDI plugin, with perf + strace.
 
 NGSPICE_BIN="${NGSPICE_BIN:-${HOME}/opt/ngspice/bin/ngspice}"
 OSDI_PATH="${OSDI_PATH:-${REPO_ROOT}/code/OpenVAF-altered/OpenVAF/integration_tests/BSIM4/bsim4.osdi}"
-NETLIST="${NETLIST:-${SCRIPT_DIR}/track_hold_sim1_300.spice}"
-LOG="${LOG:-${SCRIPT_DIR}/artifacts/logs/run_track_hold_sim1_bsim4_300_perf.log}"
-RAW="${RAW:-${SCRIPT_DIR}/artifacts/raw/track_hold_sim1_bsim4_300_perf.raw}"
-WRDATA="${WRDATA:-${SCRIPT_DIR}/artifacts/wrdata/track_hold_sim1_bsim4_300_perf_out.txt}"
+NETLIST="${NETLIST:-${REPO_ROOT}/netlists/track_hold_sim2_300.spice}"
+LOG="${LOG:-${REPO_ROOT}/artifacts/logs/run_track_hold_sim2_bsim4_300_perf.log}"
+RAW="${RAW:-${REPO_ROOT}/artifacts/raw/track_hold_sim2_bsim4_300_perf.raw}"
+WRDATA="${WRDATA:-${REPO_ROOT}/artifacts/wrdata/track_hold_sim2_bsim4_300_perf_out.txt}"
 
 PERF_BIN="${PERF_BIN:-perf}"
 PERF_EVENTS="${PERF_EVENTS:-task-clock,cycles,instructions,branches,branch-misses,cache-misses,context-switches,cpu-migrations}"
@@ -22,8 +22,8 @@ OSDI_PROBE_GROUP="${OSDI_PROBE_GROUP:-osdi}"
 OSDI_PROBE_EVENTS="${OSDI_PROBE_EVENTS:-eval_0,setup_model_0,setup_instance_0}"
 
 RUN_ID="${RUN_ID:-$(date +%s%N)}"
-PERF_LOG="${PERF_LOG:-${SCRIPT_DIR}/artifacts/perf/run_track_hold_sim1_bsim4_300_perf_${RUN_ID}.csv}"
-STRACE_LOG="${STRACE_LOG:-${SCRIPT_DIR}/artifacts/strace/run_track_hold_sim1_bsim4_300_strace_${RUN_ID}.log}"
+PERF_LOG="${PERF_LOG:-${REPO_ROOT}/artifacts/perf/run_track_hold_sim2_bsim4_300_perf_${RUN_ID}.csv}"
+STRACE_LOG="${STRACE_LOG:-${REPO_ROOT}/artifacts/strace/run_track_hold_sim2_bsim4_300_strace_${RUN_ID}.log}"
 
 mkdir -p "$(dirname "${LOG}")" "$(dirname "${RAW}")" "$(dirname "${WRDATA}")" "$(dirname "${PERF_LOG}")" "$(dirname "${STRACE_LOG}")"
 if [ -n "${OSDI_LOG:-}" ] && [ "${OSDI_LOG}" != "/dev/null" ]; then
@@ -114,48 +114,15 @@ else
 fi
 
 osdi_count="${osdi_count:-0}"
-runtime_call_count=0
-declare -A probe_call_counts=()
-
-if [ "${PROBE_ENABLED}" -eq 1 ] && [ "${#probe_names[@]}" -gt 0 ] && [ -f "${PERF_LOG}" ]; then
-  for probe_name in "${probe_names[@]}"; do
-    event_name="${OSDI_PROBE_GROUP}:${probe_name}"
-    probe_count="$(
-      awk -F, -v ev="${event_name}" '
-        $3 == ev {
-          value = $1
-          gsub(/,/, "", value)
-          if (value ~ /^[0-9]+([.][0-9]+)?$/) {
-            printf "%.0f\n", value
-            found = 1
-            exit
-          }
-        }
-        END {
-          if (!found) {
-            print 0
-          }
-        }
-      ' "${PERF_LOG}"
-    )"
-    probe_call_counts["${probe_name}"]="${probe_count}"
-    runtime_call_count=$((runtime_call_count + probe_count))
-  done
-fi
 
 {
   echo "OSDI_PATH=${OSDI_PATH}"
-  echo "OSDI_INVOCATIONS=${runtime_call_count}"
-  echo "OSDI_RUNTIME_CALLS=${runtime_call_count}"
+  echo "OSDI_INVOCATIONS=${osdi_count}"
   echo "OSDI_FILE_OPENS=${osdi_count}"
   echo "OSDI_PROBES_ENABLED=${PROBE_ENABLED}"
   echo "OSDI_PROBE_GROUP=${OSDI_PROBE_GROUP}"
   echo "OSDI_PROBE_EVENTS=${OSDI_PROBE_EVENTS}"
   echo "OSDI_PROBE_EVENT_LIST=${PERF_PROBE_EVENTS}"
-  for probe_name in "${probe_names[@]}"; do
-    probe_key="$(printf '%s' "${probe_name}" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9' '_')"
-    echo "OSDI_PROBE_${probe_key}_CALLS=${probe_call_counts[${probe_name}]:-0}"
-  done
   echo "PERF_LOG=${PERF_LOG}"
   echo "STRACE_LOG=${STRACE_LOG}"
 } | tee "${OSDI_LOG:-/dev/null}"

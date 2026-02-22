@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Benchmark the SKY130 VGS sweep deck with both BSIM4 OSDI variants.
+Benchmark the SKY130 track-and-hold simulations (sim1 and sim2) with both BSIM4
+OSDI variants, emulating bench_inverter_osdi.py.
 """
 
 from __future__ import annotations
@@ -15,10 +16,15 @@ from typing import Dict, List
 
 
 TRIALS = int(os.environ.get("TRIALS", "3"))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
+RUN_SCRIPTS_DIR = os.path.join(ROOT_DIR, "run-scripts")
 
 SCRIPTS: Dict[str, str] = {
-    "vgs_bsim4": "./run_vgs_sweep_bsim4.sh",
-    "vgs_bsim4_elided": "./run_vgs_sweep_bsim4_elided.sh",
+    "sim1_bsim4_300": f"{RUN_SCRIPTS_DIR}/run_track_hold_sim1_bsim4_300.sh",
+    "sim1_bsim4_elided_300": f"{RUN_SCRIPTS_DIR}/run_track_hold_sim1_bsim4_elided_300.sh",
+    "sim2_bsim4_300": f"{RUN_SCRIPTS_DIR}/run_track_hold_sim2_bsim4_300.sh",
+    "sim2_bsim4_elided_300": f"{RUN_SCRIPTS_DIR}/run_track_hold_sim2_bsim4_elided_300.sh",
 }
 
 
@@ -72,17 +78,17 @@ def main() -> int:
     results: Dict[str, List[float]] = {name: [] for name in SCRIPTS}
 
     total_runs = len(order)
-    print(f"Running {TRIALS} trials per script ({total_runs} total) in random order...\n")
+    print(f"Running {TRIALS} trials per script ({total_runs} total) in random order...\\n")
 
     for idx, name in enumerate(order, 1):
         cmd = SCRIPTS[name]
         elapsed = run_once(name, cmd)
         results[name].append(elapsed)
-        print(f"[{idx:02d}/{total_runs}] {name:17s} {elapsed:.3f}s")
+        print(f"[{idx:02d}/{total_runs}] {name:18s} {elapsed:.3f}s")
 
-    print("\nSummary:")
+    print("\\nSummary:")
     for name, values in results.items():
-        print(f"- {name:17s} {summarize(values)}")
+        print(f"- {name:18s} {summarize(values)}")
     return 0
 
 

@@ -2,17 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DELOREAN_ROOT="${DELOREAN_ROOT:-${REPO_ROOT}}"
 
 # Runs the track-and-hold sim2 deck with the standard BSIM4 OSDI plugin.
 
 NGSPICE_BIN="${NGSPICE_BIN:-${HOME}/opt/ngspice/bin/ngspice}"
 OSDI_PATH="${OSDI_PATH:-${REPO_ROOT}/code/OpenVAF-altered/OpenVAF/integration_tests/BSIM4/bsim4.osdi}"
-NETLIST="${NETLIST:-${SCRIPT_DIR}/track_hold_sim2.spice}"
-LOG="${LOG:-${SCRIPT_DIR}/artifacts/logs/run_track_hold_sim2_bsim4.log}"
-RAW="${RAW:-${SCRIPT_DIR}/artifacts/raw/track_hold_sim2_bsim4.raw}"
-WRDATA="${WRDATA:-${SCRIPT_DIR}/artifacts/wrdata/track_hold_sim2_bsim4_out.txt}"
+NETLIST="${NETLIST:-${REPO_ROOT}/netlists/track_hold_sim2.spice}"
+LOG="${LOG:-${REPO_ROOT}/artifacts/logs/run_track_hold_sim2_bsim4.log}"
+RAW="${RAW:-${REPO_ROOT}/artifacts/raw/track_hold_sim2_bsim4.raw}"
+WRDATA="${WRDATA:-${REPO_ROOT}/artifacts/wrdata/track_hold_sim2_bsim4_out.txt}"
 
 mkdir -p "$(dirname "${LOG}")" "$(dirname "${RAW}")"
 if [ -n "${WRDATA:-}" ]; then

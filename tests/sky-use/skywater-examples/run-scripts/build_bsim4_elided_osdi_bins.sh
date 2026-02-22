@@ -2,15 +2,15 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DELOREAN_ROOT="${DELOREAN_ROOT:-${REPO_ROOT}}"
 
 
 OPENVAF_BIN="${OPENVAF_BIN:-${REPO_ROOT}/code/OpenVAF-altered/OpenVAF/target/debug/openvaf-r}"
 VA_FILE="${VA_FILE:-${REPO_ROOT}/code/OpenVAF-altered/OpenVAF/integration_tests/BSIM4/bsim4.va}"
 ELISION_DIR="${ELISION_DIR:-${REPO_ROOT}/artifacts/sky130_bin_elision_lists}"
-OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/artifacts/osdi/pfet_01v8_bins}"
-LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/artifacts/logs/osdi_build_bins}"
+OUT_DIR="${OUT_DIR:-/artifacts/osdi/pfet_01v8_bins}"
+LOG_DIR="${LOG_DIR:-/artifacts/logs/osdi_build_bins}"
 
 mkdir -p "${OUT_DIR}" "${LOG_DIR}"
 

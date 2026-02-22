@@ -2,16 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DELOREAN_ROOT="${DELOREAN_ROOT:-${REPO_ROOT}}"
 
-# Runs the SkyWater inverter netlist with the elided BSIM4 OSDI plugin.
+# Runs the track-and-hold sim2 deck with the elided BSIM4 OSDI plugin.
 
 NGSPICE_BIN="${NGSPICE_BIN:-${HOME}/opt/ngspice/bin/ngspice}"
 OSDI_PATH="${OSDI_PATH:-${REPO_ROOT}/code/OpenVAF-altered/OpenVAF/integration_tests/BSIM4/bsim4.elided.osdi}"
-NETLIST="${NETLIST:-${SCRIPT_DIR}/c7552_ann_skywater_inverter_osdi.net}"
-LOG="${LOG:-${SCRIPT_DIR}/artifacts/logs/run_inverter_bsim4_elided.log}"
-RAW="${RAW:-${SCRIPT_DIR}/artifacts/raw/inverter_bsim4_elided.raw}"
+NETLIST="${NETLIST:-${REPO_ROOT}/netlists/track_hold_sim2_300.spice}"
+LOG="${LOG:-${REPO_ROOT}/artifacts/logs/run_track_hold_sim2_bsim4_elided_300.log}"
+RAW="${RAW:-${REPO_ROOT}/artifacts/raw/track_hold_sim2_bsim4_elided_300.raw}"
+WRDATA="${WRDATA:-${REPO_ROOT}/artifacts/wrdata/track_hold_sim2_bsim4_elided_300_out.txt}"
 
 mkdir -p "$(dirname "${LOG}")" "$(dirname "${RAW}")"
 if [ -n "${WRDATA:-}" ]; then
@@ -22,8 +23,13 @@ exec "${NGSPICE_BIN}" -b -o "${LOG}" -r "${RAW}" <<EOF
 * driver deck
 .control
 pre_osdi ${OSDI_PATH}
+set ngbehavior=hsa
+set ng_nomodcheck
 source ${NETLIST}
+set wr_singlescale
+set wr_vecnames
 run
+wrdata ${WRDATA} out
 quit
 .endc
 .end

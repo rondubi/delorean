@@ -2,17 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DELOREAN_ROOT="${DELOREAN_ROOT:-${REPO_ROOT}}"
 
 # Runs the track-and-hold sim2 deck with the elided BSIM4 OSDI plugin, with perf + strace.
 
 NGSPICE_BIN="${NGSPICE_BIN:-${HOME}/opt/ngspice/bin/ngspice}"
 OSDI_PATH="${OSDI_PATH:-${REPO_ROOT}/code/OpenVAF-altered/OpenVAF/integration_tests/BSIM4/bsim4.elided.osdi}"
-NETLIST="${NETLIST:-${SCRIPT_DIR}/track_hold_sim2_300.spice}"
-LOG="${LOG:-${SCRIPT_DIR}/artifacts/logs/run_track_hold_sim2_bsim4_elided_300_perf.log}"
-RAW="${RAW:-${SCRIPT_DIR}/artifacts/raw/run_track_hold_sim2_bsim4_elided_300_perf.raw}"
-WRDATA="${WRDATA:-${SCRIPT_DIR}/artifacts/wrdata/run_track_hold_sim2_bsim4_elided_300_perf_out.txt}"
+NETLIST="${NETLIST:-${REPO_ROOT}/netlists/track_hold_sim2_300.spice}"
+LOG="${LOG:-${REPO_ROOT}/artifacts/logs/run_track_hold_sim2_bsim4_elided_300_perf.log}"
+RAW="${RAW:-${REPO_ROOT}/artifacts/raw/run_track_hold_sim2_bsim4_elided_300_perf.raw}"
+WRDATA="${WRDATA:-${REPO_ROOT}/artifacts/wrdata/run_track_hold_sim2_bsim4_elided_300_perf_out.txt}"
 
 PERF_BIN="${PERF_BIN:-perf}"
 PERF_EVENTS="${PERF_EVENTS:-task-clock,cycles,instructions,branches,branch-misses,cache-misses,context-switches,cpu-migrations}"
@@ -22,8 +22,8 @@ OSDI_PROBE_GROUP="${OSDI_PROBE_GROUP:-osdi}"
 OSDI_PROBE_EVENTS="${OSDI_PROBE_EVENTS:-eval_0,setup_model_0,setup_instance_0}"
 
 RUN_ID="${RUN_ID:-$(date +%s%N)}"
-PERF_LOG="${PERF_LOG:-${SCRIPT_DIR}/artifacts/perf/run_track_hold_sim2_bsim4_elided_300_perf_${RUN_ID}.csv}"
-STRACE_LOG="${STRACE_LOG:-${SCRIPT_DIR}/artifacts/strace/run_track_hold_sim2_bsim4_elided_300_strace_${RUN_ID}.log}"
+PERF_LOG="${PERF_LOG:-${REPO_ROOT}/artifacts/perf/run_track_hold_sim2_bsim4_elided_300_perf_${RUN_ID}.csv}"
+STRACE_LOG="${STRACE_LOG:-${REPO_ROOT}/artifacts/strace/run_track_hold_sim2_bsim4_elided_300_strace_${RUN_ID}.log}"
 
 mkdir -p "$(dirname "${LOG}")" "$(dirname "${RAW}")" "$(dirname "${WRDATA}")" "$(dirname "${PERF_LOG}")" "$(dirname "${STRACE_LOG}")"
 if [ -n "${OSDI_LOG:-}" ] && [ "${OSDI_LOG}" != "/dev/null" ]; then
