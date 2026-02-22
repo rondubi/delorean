@@ -1,0 +1,11 @@
+set num_threads=8
+*set ngbehavior=mc
+set ngbehavior=hsa
+set ng_nomodcheck
+unset interactive
+set ngdebug
+set nginfo
+*set noinit
+*set wnflag=0
+set filetype=ascii
+option KLU

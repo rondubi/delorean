@@ -1,0 +1,20 @@
+[package]
+name = "verilogae_ffi"
+version = "1.0.0"
+authors = ["DSPOM"]
+edition = "2021"
+license = "GPL-3.0"
+
+links = "verilogae"
+
+[lib]
+doctest = false
+
+
+[dependencies]
+
+verilogae = { version = "1.0.0", path = "../verilogae", optional = true }
+
+[features]
+default = ["static"]
+static = ["verilogae"]

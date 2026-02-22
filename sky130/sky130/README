@@ -1,0 +1,416 @@
+------------------------------------
+open_pdks
+----------------------------------------
+Master PDK generator for SkyWater Sky130
+Hybrid 180nm / 130nm foundry process
+for open source EDA tools
+----------------------------------------
+
+-------------------------------------------------------------------------------
+Quick summary (TL;DR):
+
+    Prerequisites:
+
+    	sudo apt install python3
+
+    The Magic VLSI layout tool is used often by the installation.  If you do
+    not have it, then obtain it and install with the following:
+
+    	sudo apt install m4 tcsh tcl-dev tk-dev
+
+	git clone https://github.com/RTimothyEdwards/magic
+	cd magic
+	./configure
+	make
+	sudo make install
+
+    Open_PDKs SKY130 Installation: Most people will want to run the following
+    for PDK installation:
+
+	./configure --enable-sky130-pdk
+	make
+	sudo make install
+	make distclean
+
+    This will download and install the SkyWater SKY130 PDK, the SKY130 setup
+    files for xschem, a third-party library containing alphanumeric layouts,
+    and others.
+
+    With the above configuration line, the PDK files will be installed into
+    the path
+		/usr/local/share/pdk/sky130A/
+
+    From open_pdks version 1.0.269, there is a process variant
+
+		/usr/local/share/pdk/sky130B/
+
+    which reflects support for ReRAM.
+
+-------------------------------------------------------------------------------
+Detailed instructions for the patient reader:
+-------------------------------------------------------------------------------
+Prerequisites:
+
+1. EDA tools:
+
+    For installing files to use with the Magic layout tool, Magic must be installed.
+    Obtain Magic from:
+
+	https://github.com/RTimothyEdwards/magic
+
+    No other tools are required for installation, although open_pdks will
+    generate and install the setup files for a number of tools.
+
+2. Foundry source files [optional]:
+
+    If you do not have the foundry source files, the latest versions of
+    each library will be downloaded from github, and installed locally into
+    the open_pdks/sources/ directory.  If you have the foundry source files,
+    then you can pass the location of each library repository to the
+    open_pdks configure script.  The instructions below are needed ONLY
+    if you intend to download and install the PDK sources outside of
+    open_pdks.  Instructions below are only valid for the SkyWater SKY130
+    process.  For other open-source PDKs, instructions can be found in the
+    corresponding README file in that PDK directory.
+
+    Obtain sources for the SkyWater sky130 130nm process from the git repository
+    at the following location:
+
+	 https://github.com/efabless/
+
+    As of open_pdks version 1.0.428, the Sky130 sources are no longer under
+    a single umbrella repository, so each core library must be downloaded
+    individually.  The individual core repositories are:
+
+	 https://github.com/efabless/skywater-pdk-libs-sky130_fd_pr
+	 https://github.com/efabless/skywater-pdk-libs-sky130_fd_io
+	 https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_hd
+	 https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_hdll
+	 https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_lp
+	 https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_hs
+	 https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_ms
+	 https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_ls
+	 https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_hvl
+
+    This repositories may go in any convenient location.  To keep the overhead
+    low, you may install only the repositories that you need.  At a minimum, the
+    I/O library, primitive devices, and the high density and high voltage
+    digital standard cell libraries should be installed.  The remaining standard
+    cell libraries are optional, as needed for low-leakage, high speed, low power,
+    etc., applications.
+
+    Then follow the instructions below for generating the additional files
+    for supporting the open source EDA tool flows.
+
+PDK Installation:
+
+Step 1:
+
+    Run "configure" to set the paths to the Google/SkyWater source
+    repositories and to set the path to the install location.  Note that
+    the configure script is located in the open_pdks top level directory,
+    not in the foundry subdirctory, and should be run from the top level
+    directory.  The primary configure options are as follows:
+
+	--enable-sky130-pdk
+		This is mandatory for specifying that the installation
+		is for the SKY130 PDK.
+
+	--with-sky130-variants=all|A|B
+		When set to "all" (which is the default), both variants
+		sky130A and sky130B are generated and installed.   If
+		only one PDK variant needs to be installed, then use
+		this option to restrict the installation to a single
+		PDK variant.
+
+	--with-sky130-link-targets=none|source
+		"none" copies files from the source directories to
+		the target.  "source" makes symbolic links to the source
+		directories.  Use "source" only if doing a local install,
+		and the source foundry data will not be deleted.  For
+		distribution installations, the value must be set to
+		"none".
+
+	--with-ef-style
+		This option should not be used except in the context
+		of the Efabless "open galaxy" platform where it is
+		used.  The default is "no".  There are some differences
+		in these two styles, the most important of which being
+		that the order of directories for the IP libraries
+		is <file_format>/<library_name> instead of
+		<library_name>/<file_format>. Other differences
+		include version tracking of the Magic setup files
+		and the location of the technology LEF file.
+
+	--enable-primitive-sky130[=<path>] 
+		The path to the sky130_fd_pr library, a core PDK
+		library containing the primitive device models and
+		layouts.  If the configuration option or the path is
+		not specified, then the library will be downloaded from
+		github automatically.  To disable this package, use
+		"--disable-primitive-sky130".
+
+	--enable-io-sky130[=<path>] 
+		The path to the sky130_fd_io library, a core PDK
+		library containing the padframe cell layouts and data.
+		If the configuration option or the path is not specified,
+		then the library will be downloaded from github
+		automatically.  To disable this package, use
+		"--disable-io-sky130".
+
+	--enable-sc-hs-sky130[=<path>] 
+		The path to the sky130_fd_sc_hs library, a core PDK
+		library containing the high-speed standard cell layouts
+		and data.  If the configuration option or the path is
+		not specified, then the library will be downloaded from
+		github automatically.  To disable this package, use
+		"--disable-sc-hs-sky130".
+
+	--enable-sc-ms-sky130[=<path>] 
+		The path to the sky130_fd_sc_ms library, a core PDK
+		library containing the medium-speed standard cell layouts
+		and data.  If the configuration option or the path is
+		not specified, then the library will be downloaded from
+		github automatically.  To disable this package, use
+		"--disable-sc-ms-sky130".
+
+	--enable-sc-ls-sky130[=<path>] 
+		The path to the sky130_fd_sc_ls library, a core PDK
+		library containing the low-speed standard cell layouts
+		and data.  If the configuration option or the path is
+		not specified, then the library will be downloaded from
+		github automatically.  To disable this package, use
+		"--disable-sc-ls-sky130".
+
+	--enable-sc-lp-sky130[=<path>] 
+		The path to the sky130_fd_sc_lp library, a core PDK
+		library containing the low-power standard cell layouts
+		and data.  If the configuration option or the path is
+		not specified, then the library will be downloaded from
+		github automatically.  To disable this package, use
+		"--disable-sc-lp-sky130".
+
+	--enable-sc-hd-sky130[=<path>] 
+		The path to the sky130_fd_sc_hd library, a core PDK
+		library containing the high-density standard cell layouts
+		and data.  If the configuration option or the path is
+		not specified, then the library will be downloaded from
+		github automatically.  To disable this package, use
+		"--disable-sc-hd-sky130".
+
+	--enable-sc-hdll-sky130[=<path>] 
+		The path to the sky130_fd_sc_hdll library, a core PDK
+		library containing the high-density, low-leakage standard
+		cell layouts and data.  If the configuration option or
+		the path is not specified, then the library will be
+		downloaded from github automatically.  To disable this
+		package, use "--disable-sc-hdll-sky130".
+
+	--enable-sc-hvl-sky130[=<path>] 
+		The path to the sky130_fd_sc_hvl library, a core PDK
+		library containing the high-voltage standard cell layouts
+		and data.  If the configuration option or the path is
+		not specified, then the library will be downloaded from
+		github automatically.  To disable this package, use
+		"--disable-sc-hvl-sky130".
+
+	--enable-alpha-sky130[=<path>] 
+		The path to the sky130_ml_xx_hd library, a third-party
+		library containing layouts of alphanumeric characters
+		for adding text to layout.  If the configuration option
+		or the path is not specified, then the library will be
+		downloaded from github automatically.  To disable this
+		package, use "--disable-alpha-sky130".
+
+	--enable-xschem-sky130[=<path>]
+		The path to the SKY130 setup for the xschem schematic
+		entry/schematic capture tool.  If the configuration
+		option or the path is not specified, then the library
+		will be downloaded from github automatically.  To disable
+		this package, use "--disable-xschem-sky130".
+
+	--enable-sram-sky130[=<path>]
+		This 3rd party library contains pre-compiled and verified
+		memory blocks from the OpenRAM open source memory compiler.
+		It is disabled by default due to the length of time
+		required to install, but it is recommended if you will be
+		using SRAM in a design.  If the path is not specified,
+		then the library will be downloaded from github automatically.
+
+	--enable-osu-t12-sky130[=<path>]
+		This 3rd party library is a set of open-source digital
+		standard cells at 12 track pitch height.  If the path is
+		not specified, then the library will be downloaded from
+		github automatically.
+
+	--enable-osu-t15-sky130[=<path>]
+		This 3rd party library is a set of open-source digital
+		standard cells at 15 track pitch height.  If the path is
+		not specified, then the library will be downloaded from
+		github automatically.
+
+	--enable-osu-t18-sky130[=<path>]
+		This 3rd party library is a set of open-source digital
+		standard cells at 18 track pitch height.  If the path is
+		not specified, then the library will be downloaded from
+		github automatically.
+
+	--prefix=<path>
+		This redirects the installation destination.  open_pdks
+		installs into ${prefix}/share/pdk/, and by default
+		${prefix} is /usr/local.  Be advised that Makefile
+		automatically adds the "share/" path regardless.  To
+		install in a different location, pass these (optional)
+		environment variables to "make":
+
+		SHARED_PDKS_PATH = <path>
+			Overrides ${prefix}/share/pdk/ and installs
+			directly into the specified <path>
+
+		DESTDIR = <path>
+			When defined, then "make install" installs into
+			the specified <path>.  However, all references
+			to files in the PDK will reference SHARED_PDKS_PATH.
+			Use DESTDIR if you want to install into a temporary
+			location such as a git repository or tarball that
+			will eventually be distributed and placed at
+			SHARED_PDKS_PATH on the target systems.
+
+Step 2:
+	Run:
+
+	    make
+
+	This will pre-process the setup files to create the PDK-specific files
+	for the SKY130A PDK, and process all vendor files, and place everything
+	in a local staging area (subdirectory sky130/sky130A and/or
+	sky130/sky130B).
+
+Step 3:
+	Run:
+
+	    [sudo] make install
+
+	This copies all files from the staging area into the
+	destination target.  All pointers to absolute paths in the
+	files are changed to match the local path.
+
+Step 4:
+	Any time you want to check if there are updates to repositories
+	that have been automatically pulled for open_pdks, Run:
+
+		make update
+
+	to pull any recent changes from the git repositories, and then
+	rebuild the PDK.
+
+Step 5:
+	After installation, the staging area is no longer needed and can
+	be removed with
+
+		make clean
+	or
+		make veryclean  (also removes the log files)
+
+	If you have not specified the installation to make symbolic links
+	back to the repository sources, then the sources are no longer
+	needed, either, and may be removed using
+
+		make distclean
+
+	However, doing so means that if the PDK needs to be updated and/or
+	rebuilt, the sources will have to be re-cloned from their public
+	repositories. 
+
+	If at any time you want to remove the PDK, make sure you have run
+	the "configure" script to enable the PDK you want to remove, and
+	then do:
+
+		make uninstall
+
+-------------------------------------------------------------------------------
+Summary of the installation directories:
+
+    The Makefile script takes the source files and generates files for local
+    PDK names "SKY130A", "SKY130B", etc.
+
+    The definition of each PDK is made in the Makefile using defines; e.g.,
+	-DMETAL5, etc.
+
+    The make script makes use of the python script "preproc.py" (in the ../common
+    directory) to parse each source file for "#ifdef ..."-type macros.  The syntax
+    is similar to that used by the C preprocessor (cpp) but does not assume C
+    language syntax in the input file, so is generally better to use than cpp
+    (has less unexpected/unintentional behavior).  See comments in the preproc.py
+    script for a full list of macros that it accepts (short list: #ifdef, #ifndef,
+    #define, #include, and boolean operators ||, &&, and !). 
+
+    Files generated:
+	.tech		techfile for magic (full DRC, extract, GDS)
+	-GDS.tech	techfile for magic, vendor mask layers
+	.tcl		PDK script for magic
+	-BindKeys	key binding script for magic partly matching Cadence defaults
+	.magicrc	magic startup script (copy to local directory as .magicrc)
+	_setup.tcl	netgen setup script for LVS
+	.sh		qflow master setup script, standard 1.8V digital
+	.par		graywolf setup file, standard 1.8V digital
+
+    The installation directory below LOCAL_PATH is the name of the PDK;  e.g.,
+
+	    sky130A/		5-metal stack with MiM cap and redistribution layer
+
+    The installation directory hierarchy below the PDK name looks like the following:
+
+		libs.tech/		technology and setup files
+
+		    magic/		magic techfiles, startup file, PDK script,
+					and key binding script.
+		    netgen/		netgen setup file
+		    qflow/		qflow scripts and graywolf setup files.
+		    klayout/		setup files for klayout
+		    openlane/		setup and supplementary files for openlane
+		    ngspice/		base model files and libraries for ngspice
+		    xschem/		setup files for xschem
+		    irsim/		setup and parameter files for IRSIM
+
+		libs.ref/		foundry data
+
+    Each subdirectory of libs.ref is further divided into sections based on the
+    IP libraries.  The section names are foundry-dependent.  For SkyWater Sky130,
+    these sections include one or more of:
+
+		    sky130_fd_sc_hd/		1.8V digital logic (high density)
+		    sky130_fd_sc_hdll/		1.8V digital logic (high density low leakage)
+		    sky130_fd_sc_hs/		1.8V digital logic (high speed)
+		    sky130_fd_sc_hvl/		3.3V digital logic
+		    sky130_fd_sc_lp/		1.8V digital logic (low power)
+		    sky130_fd_sc_ls/		1.8V digital logic (low speed)
+		    sky130_fd_sc_ms/		3.3V digital logic (medium speed)
+
+		    sky130_fd_io/		Standard I/O
+
+		    sky130_fd_pr/		Primitive devices w/fixed layout
+
+		    sky130_ml_xx_hd/		Library of alphanumeric layouts
+
+		    sky130_sram_macros/		Library of SRAM macros
+		    sky130_fd_bd_sram/		Library of SRAM components
+
+    Each IP library has subdirectories corresponding to library standard file
+    formats.  These are the following (not all of them may be present in any
+    given library):
+
+		        cdl/		CDL netlists
+		        doc/		Foundry documentation
+		        gds/		GDS files
+		        lef/		LEF macro files
+		        lib/		Timing files
+		        mag/		Magic files derived from GDS
+		        maglef/		Magic files derived from LEF macros
+		        spice/		SPICE netlists (ngspice compatible)
+		        techlef/	LEF technology files
+		        verilog/	verilog modules
+
+    The target installation destinations assume the directory structure above.  Changing
+    this requires editing the source files.
+
