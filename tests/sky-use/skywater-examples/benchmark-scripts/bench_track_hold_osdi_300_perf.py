@@ -18,18 +18,19 @@ from typing import Dict, List, Tuple
 
 
 TRIALS = int(os.environ.get("TRIALS", "3"))
-
-SCRIPTS: Dict[str, str] = {
-    "sim1_bsim4_300_perf       ": "./run_track_hold_sim1_bsim4_300_perf.sh",
-    "sim1_bsim4_elided_300_perf": "./run_track_hold_sim1_bsim4_elided_300_perf.sh",
-    "sim2_bsim4_300_perf       ": "./run_track_hold_sim2_bsim4_300_perf.sh",
-    "sim2_bsim4_elided_300_perf": "./run_track_hold_sim2_bsim4_elided_300_perf.sh",
-}
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ARTIFACTS_DIR = os.path.join(SCRIPT_DIR, "artifacts")
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
+RUN_SCRIPTS_DIR = os.path.join(ROOT_DIR, "run-scripts")
+ARTIFACTS_DIR = os.path.join(ROOT_DIR, "artifacts")
 PERF_DIR = f"{ARTIFACTS_DIR}/perf"
 STRACE_DIR = f"{ARTIFACTS_DIR}/strace"
 OSDI_DIR = f"{ARTIFACTS_DIR}/osdi"
+SCRIPTS: Dict[str, str] = {
+    "sim1_bsim4_300_perf       ": f"{RUN_SCRIPTS_DIR}/run_track_hold_sim1_bsim4_300_perf.sh",
+    "sim1_bsim4_elided_300_perf": f"{RUN_SCRIPTS_DIR}/run_track_hold_sim1_bsim4_elided_300_perf.sh",
+    "sim2_bsim4_300_perf       ": f"{RUN_SCRIPTS_DIR}/run_track_hold_sim2_bsim4_300_perf.sh",
+    "sim2_bsim4_elided_300_perf": f"{RUN_SCRIPTS_DIR}/run_track_hold_sim2_bsim4_elided_300_perf.sh",
+}
 
 DEFAULT_EVENTS = (
     "task-clock,cycles,instructions,branches,branch-misses,"

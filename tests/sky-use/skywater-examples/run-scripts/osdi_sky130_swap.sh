@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers to force SKY130 nfet_01v8_lvt through OSDI for benchmark runs.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export DELOREAN_ROOT="${DELOREAN_ROOT:-${REPO_ROOT}}"
 
 SKY130_OSDI_SWAP_ENABLE="${SKY130_OSDI_SWAP_ENABLE:-1}"

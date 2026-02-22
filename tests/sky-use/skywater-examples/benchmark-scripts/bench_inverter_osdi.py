@@ -1,33 +1,37 @@
 #!/usr/bin/env python3
 """
-Benchmark the SKY130 track-and-hold simulations (sim1 and sim2) with both BSIM4
-OSDI variants, emulating bench_inverter_osdi.py.
+Benchmark the inverter run scripts with both BSIM4 OSDI variants.
+
+Runs each script TRIALS times (default: 5) in random order to avoid warm-cache bias
+and reports mean/median/stddev timing per variant.
 """
 
 from __future__ import annotations
 
 import os
 import random
-import statistics
 import subprocess
 import sys
 import time
 from typing import Dict, List
+import statistics
 
 
-TRIALS = int(os.environ.get("TRIALS", "3"))
+TRIALS = int(os.environ.get("TRIALS", "5"))
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)
+RUN_SCRIPTS_DIR = os.path.join(ROOT_DIR, "run-scripts")
 
 SCRIPTS: Dict[str, str] = {
-    "sim1_bsim4_300": "./run_track_hold_sim1_bsim4_300.sh",
-    "sim1_bsim4_elided_300": "./run_track_hold_sim1_bsim4_elided_300.sh",
-    "sim2_bsim4_300": "./run_track_hold_sim2_bsim4_300.sh",
-    "sim2_bsim4_elided_300": "./run_track_hold_sim2_bsim4_elided_300.sh",
+    "bsim4": f"{RUN_SCRIPTS_DIR}/run_inverter_bsim4.sh",
+    "bsim4_elided": f"{RUN_SCRIPTS_DIR}/run_inverter_bsim4_elided.sh",
 }
 
 
 def run_once(name: str, cmd: str) -> float:
     """Run the given script once and return elapsed seconds."""
     start = time.monotonic()
+    # Suppress stdout/stderr from ngspice to keep benchmark output clean; logs go to files.
     completed = subprocess.run(
         [cmd],
         stdout=subprocess.PIPE,
@@ -49,6 +53,7 @@ def summarize(values: List[float]) -> str:
     mean = statistics.mean(values)
     median = statistics.median(values)
     stdev = statistics.stdev(values) if len(values) > 1 else 0.0
+    # Quartiles for box-and-whisker style summary.
     sorted_vals = sorted(values)
     q1 = statistics.quantiles(sorted_vals, n=4)[0] if len(values) > 1 else median
     q3 = statistics.quantiles(sorted_vals, n=4)[2] if len(values) > 1 else median
@@ -69,23 +74,23 @@ def main() -> int:
         sys.stderr.write("TRIALS must be >= 1\n")
         return 1
 
-    order = [name for name in SCRIPTS for _ in range(TRIALS)]
+    order = ["bsim4"] * TRIALS + ["bsim4_elided"] * TRIALS
     random.shuffle(order)
 
     results: Dict[str, List[float]] = {name: [] for name in SCRIPTS}
 
     total_runs = len(order)
-    print(f"Running {TRIALS} trials per script ({total_runs} total) in random order...\\n")
+    print(f"Running {TRIALS} trials per script ({total_runs} total) in random order...\n")
 
     for idx, name in enumerate(order, 1):
         cmd = SCRIPTS[name]
         elapsed = run_once(name, cmd)
         results[name].append(elapsed)
-        print(f"[{idx:02d}/{total_runs}] {name:18s} {elapsed:.3f}s")
+        print(f"[{idx:02d}/{total_runs}] {name:14s} {elapsed:.3f}s")
 
-    print("\\nSummary:")
+    print("\nSummary:")
     for name, values in results.items():
-        print(f"- {name:18s} {summarize(values)}")
+        print(f"- {name:14s} {summarize(values)}")
     return 0
 
 
