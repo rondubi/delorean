@@ -1,5 +1,5 @@
 * Track-and-hold circuit using single NMOS (from SKY130_Track_and_Hold.ipynb)
-.lib "$DELOREAN_ROOT/sky130/sky130/sky130A/libs.tech/ngspice/sky130.lib.spice" tt
+.lib "/home/ron/open_pdks/sources/sky130_fd_pr/models/sky130.lib.spice" tt
 x1 in clk out 0 sky130_fd_pr__nfet_01v8_lvt w=5 l=0.15
 cl out 0 100f
 vin  in 0 sin (0.4 0.2 {fin})
