@@ -1,0 +1,35 @@
+
+Note: No compatibility mode selected!
+
+
+Circuit: * driver deck
+
+
+Note: Compatibility modes selected: hs a
+
+Warning: m=xx on .subckt line will override multiplier m hierarchy!
+
+
+Circuit: * pmos vgs sweep for lvt, svt, and hvt devices (from sky130_vgs_sweep.ipynb)
+
+option SCALE: Scale is set to 1e-06 for instance and model parameters
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using SPARSE 1.3 as Direct Linear Solver
+
+No. of Data Rows : 1
+Doing analysis at TEMP = 27.000000 and TNOM = 27.000000
+
+Using SPARSE 1.3 as Direct Linear Solver
+Fatal error: DC Transfer Function: Voltage source, current source, or resistor named "vgs_start" is not in the circuit
+doAnalyses: no such device
+
+dc simulation(s) aborted
+Error: no such device or model name m.XML.msky130_fd_pr__pfet_01v8_lvt
+Error: no such device or model name m.XML.msky130_fd_pr__pfet_01v8_lvt
+Error: no such device or model name m.XMS.msky130_fd_pr__pfet_01v8
+Error: no such device or model name m.XMS.msky130_fd_pr__pfet_01v8
+Error: no such device or model name m.XMH.msky130_fd_pr__pfet_01v8_hvt
+Error: no such device or model name m.XMH.msky130_fd_pr__pfet_01v8_hvt
+Error: no such vector @m.XML.msky130_fd_pr__pfet_01v8_lvt[gm]
+ngspice-44 done
