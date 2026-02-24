@@ -1,0 +1,18 @@
+Running 3 trials per script (12 total) in random order...\n
+[01/12] sim2_bsim4_300     22.298s
+[02/12] sim2_bsim4_300     22.131s
+[03/12] sim1_bsim4_elided_300 12.668s
+[04/12] sim1_bsim4_elided_300 12.633s
+[05/12] sim2_bsim4_elided_300 22.052s
+[06/12] sim2_bsim4_elided_300 22.037s
+[07/12] sim1_bsim4_300     12.629s
+[08/12] sim2_bsim4_elided_300 22.304s
+[09/12] sim1_bsim4_elided_300 12.529s
+[10/12] sim1_bsim4_300     12.674s
+[11/12] sim1_bsim4_300     12.684s
+[12/12] sim2_bsim4_300     21.956s
+\nSummary:
+- sim1_bsim4_300     n=3 mean=12.662s median=12.674s stddev=0.030s p25=12.629s p75=12.684s min=12.629s max=12.684s
+- sim1_bsim4_elided_300 n=3 mean=12.610s median=12.633s stddev=0.073s p25=12.529s p75=12.668s min=12.529s max=12.668s
+- sim2_bsim4_300     n=3 mean=22.128s median=22.131s stddev=0.171s p25=21.956s p75=22.298s min=21.956s max=22.298s
+- sim2_bsim4_elided_300 n=3 mean=22.131s median=22.052s stddev=0.150s p25=22.037s p75=22.304s min=22.037s max=22.304s
