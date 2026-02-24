@@ -1,2 +1,4 @@
 __pycache__/
 *.pyc
+artifacts/archive/results_*/202*-openvaf-elision-*-dropoff.*
+artifacts/results/202*-openvaf-elision-*-dropoff.*
