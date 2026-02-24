@@ -1,0 +1,12 @@
+Running 3 trials per script (6 total) in random order...
+
+[01/6] vgs_bsim4_elided_300 8.947s
+[02/6] vgs_bsim4_300     8.865s
+[03/6] vgs_bsim4_300     8.960s
+[04/6] vgs_bsim4_elided_300 9.045s
+[05/6] vgs_bsim4_300     9.182s
+[06/6] vgs_bsim4_elided_300 9.105s
+
+Summary:
+- vgs_bsim4_300     n=3 mean=9.002s median=8.960s stddev=0.162s p25=8.865s p75=9.182s min=8.865s max=9.182s
+- vgs_bsim4_elided_300 n=3 mean=9.032s median=9.045s stddev=0.080s p25=8.947s p75=9.105s min=8.947s max=9.105s
