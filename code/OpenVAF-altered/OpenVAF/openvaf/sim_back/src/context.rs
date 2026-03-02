@@ -69,8 +69,8 @@ impl<'a> Context<'a> {
         if stage == OptimiziationStage::Initial {
             dead_code_elimination(&mut self.func, &self.output_values);
         }
-        sparse_conditional_constant_propagation(&mut self.func, &self.cfg);
         inst_combine(&mut self.func);
+        sparse_conditional_constant_propagation(&mut self.func, &self.cfg);
         if stage == OptimiziationStage::Final {
             simplify_cfg(&mut self.func, &mut self.cfg);
         } else {
