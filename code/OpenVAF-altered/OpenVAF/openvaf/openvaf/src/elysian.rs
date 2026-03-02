@@ -29,6 +29,9 @@ pub fn parse_file(path: &Utf8PathBuf) -> io::Result<HashMap<String, NumericValue
         if trimmed.is_empty() {
             continue;
         }
+        if trimmed.starts_with("#") {
+            continue;
+        }
 
         let parts: Vec<&str> = trimmed.split('=').collect();
         if parts.len() != 2 {
