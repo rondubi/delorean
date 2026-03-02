@@ -69,15 +69,32 @@ impl<'a> SimplifyCfg<'a> {
 
         loop {
             self.local_changed = false;
+            // Forward pass
             let mut cursor = self.func.layout.blocks_cursor();
-            // Loop over all of the basic blocks and remove them if they are unneeded.
             while let Some(bb) = cursor.next {
                 self.simplify_bb(bb);
-                // only advance after simplification to avoid visiting dead blocks
                 cursor.next(&self.func.layout);
             }
             if !self.local_changed {
                 break;
+            }
+            // Reverse pass to handle cascading merges:
+            // When B merges into predecessor A in forward pass,
+            // A may now be mergeable too. Reverse handles this chain in 1 pass.
+            let blocks: Vec<_> = {
+                let mut v = Vec::new();
+                let mut c = self.func.layout.blocks_cursor();
+                while let Some(bb) = c.next {
+                    v.push(bb);
+                    c.next(&self.func.layout);
+                }
+                v
+            };
+            for &bb in blocks.iter().rev() {
+                // Check block still exists (has instructions)
+                if self.func.layout.block_insts(bb).next().is_some() {
+                    self.simplify_bb(bb);
+                }
             }
             changed = true
         }
