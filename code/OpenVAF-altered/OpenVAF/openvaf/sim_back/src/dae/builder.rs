@@ -750,7 +750,7 @@ impl<'a> Builder<'a> {
         };
         for (unknown, residual) in &mut self.system.residual.iter_mut_enumerated() {
             // we purpusfully ignore small signal values here since they never contribute the residual
-            residual.react_small_signal = F_ZERO;
+            residual.resist_small_signal = F_ZERO;
             residual.react_small_signal = F_ZERO;
             let is_kirchoff =
                 matches!(self.system.unknowns[unknown], SimUnknownKind::KirchoffLaw(_));
