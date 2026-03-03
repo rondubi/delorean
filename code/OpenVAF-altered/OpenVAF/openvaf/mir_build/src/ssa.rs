@@ -337,7 +337,7 @@ impl<C: ControlFlowGraph> SSABuilder<C> {
             // safe to optimize this line of lookups.
             // We can stop the search here, the algorithm can handle these cases, even if they are
             // in an undefined island.
-            if !self.cfg.has_single_predecessor(block) {
+            if !self.cfg.has_single_predecessor(current) {
                 return true;
             }
 
@@ -345,7 +345,7 @@ impl<C: ControlFlowGraph> SSABuilder<C> {
                 return false;
             }
 
-            let next = self.cfg.predecessors(block).next().unwrap();
+            let next = self.cfg.predecessors(current).next().unwrap();
             visited.insert(current, block_cnt);
             current = next;
         }
