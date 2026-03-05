@@ -488,6 +488,63 @@ impl DataFlowGraph {
     }
 }
 
+impl DfgValues {
+    /// Compact values by removing dead/unused value entries.
+    /// `value_map[old_idx] = Some(new_idx)` for values to keep.
+    /// Preserves the dead/alive status: values with no uses remain dead,
+    /// values with uses get a sentinel so `is_dead()` returns false.
+    pub fn compact_values(&mut self, value_map: &[Option<Value>], new_num_values: usize) {
+        let sentinel_use = Use::from(0usize);
+        let mut new_defs: TiVec<Value, ValueData> = TiVec::with_capacity(new_num_values);
+
+        for old_idx in 0..self.defs.len() {
+            if value_map[old_idx].is_some() {
+                let old_val = Value::from(old_idx);
+                let old_data = &self.defs[old_val];
+                // Preserve dead/alive status: if the value had uses, set sentinel;
+                // if it was dead (no uses), keep it dead.
+                let (new_head, new_tail) = if old_data.uses_head.is_none() {
+                    (None.into(), None.into())
+                } else {
+                    (sentinel_use.into(), sentinel_use.into())
+                };
+                new_defs.push(ValueData {
+                    ty: old_data.ty.clone(),
+                    uses_head: new_head,
+                    uses_tail: new_tail,
+                    tag: old_data.tag,
+                });
+            }
+        }
+
+        // Rebuild const interning maps with remapped Value indices
+        let mut new_int_consts = AHashMap::new();
+        for (&k, &v) in &self.int_consts {
+            if let Some(new_v) = value_map[usize::from(v)] {
+                new_int_consts.insert(k, new_v);
+            }
+        }
+        let mut new_real_consts = AHashMap::new();
+        for (&k, &v) in &self.real_consts {
+            if let Some(new_v) = value_map[usize::from(v)] {
+                new_real_consts.insert(k, new_v);
+            }
+        }
+        let mut new_str_consts = AHashMap::new();
+        for (&k, &v) in &self.str_consts {
+            if let Some(new_v) = value_map[usize::from(v)] {
+                new_str_consts.insert(k, new_v);
+            }
+        }
+        self.int_consts = new_int_consts;
+        self.real_consts = new_real_consts;
+        self.str_consts = new_str_consts;
+
+        // Leave uses TiVec as-is (stale but safe - sentinel prevents is_dead() from returning true)
+        self.defs = new_defs;
+    }
+}
+
 impl Borrow<DfgValues> for DataFlowGraph {
     fn borrow(&self) -> &DfgValues {
         &self.values

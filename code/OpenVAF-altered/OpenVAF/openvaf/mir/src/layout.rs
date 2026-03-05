@@ -318,6 +318,57 @@ impl<'f> IntoIterator for &'f Layout {
     }
 }
 
+impl Layout {
+    /// Compact blocks by renumbering live blocks contiguously.
+    /// `block_map[old_idx] = Some(new_idx)` for blocks in the layout.
+    /// Inst indices are NOT changed.
+    pub fn compact_blocks(&mut self, block_map: &[Option<Block>]) {
+        // Collect old block order before modifying
+        let old_blocks: Vec<Block> = self.blocks().collect();
+        let new_num_blocks = old_blocks.len();
+
+        // Rebuild block nodes in layout order
+        let mut new_blocks: TiVec<Block, BlockNode> = TiVec::with_capacity(new_num_blocks);
+        let mut prev_new_bb: Option<Block> = None;
+
+        for &old_bb in &old_blocks {
+            let new_bb = block_map[usize::from(old_bb)].unwrap();
+            let old_node = &self.blocks[old_bb];
+
+            new_blocks.push(BlockNode {
+                prev: prev_new_bb.into(),
+                next: None.into(),
+                first_inst: old_node.first_inst, // Inst indices unchanged
+                last_inst: old_node.last_inst,   // Inst indices unchanged
+            });
+
+            if let Some(prev) = prev_new_bb {
+                new_blocks[prev].next = new_bb.into();
+            }
+
+            prev_new_bb = Some(new_bb);
+        }
+
+        // Update inst->block mappings in all InstNodes
+        for inst_idx in 0..self.insts.len() {
+            let inst = Inst::from(inst_idx);
+            if let Some(old_block) = self.insts[inst].block.expand() {
+                if let Some(&Some(new_block)) =
+                    block_map.get(usize::from(old_block))
+                {
+                    self.insts[inst].block = new_block.into();
+                }
+            }
+        }
+
+        self.blocks = new_blocks;
+        self.first_block =
+            if new_num_blocks > 0 { Some(Block::from(0usize)) } else { None };
+        self.last_block =
+            if new_num_blocks > 0 { Some(Block::from(new_num_blocks - 1)) } else { None };
+    }
+}
+
 /// Methods for arranging instructions.
 ///
 /// An instruction starts out as *not inserted* in the layout. An instruction can be inserted into

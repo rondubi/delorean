@@ -7,7 +7,8 @@ use typed_index_collections::{TiSliceKeys, TiVec};
 use crate::dfg::values::{DfgValues, ValueDataType};
 use crate::entities::Tag;
 use crate::instructions::{UseList, UseListPool};
-use crate::{DataFlowGraph, Inst, InstructionData, Use, Value, ValueList, ValueListPool};
+use crate::instructions::PhiForest;
+use crate::{Block, DataFlowGraph, Inst, InstructionData, Use, Value, ValueList, ValueListPool};
 
 #[derive(Clone)]
 pub struct DfgInsructions {
@@ -298,6 +299,80 @@ impl DataFlowGraph {
     /// instruction, that is the only effect.
     pub fn make_inst_results(&mut self, inst: Inst) -> usize {
         self.make_inst_results_reusing(inst, iter::empty())
+    }
+}
+
+impl DfgInsructions {
+    /// Remap all Value references in instruction arguments and results.
+    pub(super) fn remap_values(&mut self, value_map: &[Option<Value>]) {
+        // Remap arguments
+        for inst_idx in 0..self.declarations.len() {
+            let inst = Inst::from(inst_idx);
+            for arg in self.args_mut(inst) {
+                if let Some(new_val) = value_map.get(usize::from(*arg)).and_then(|v| *v) {
+                    *arg = new_val;
+                }
+            }
+        }
+        // Remap results
+        for inst_idx in 0..self.declarations.len() {
+            let inst = Inst::from(inst_idx);
+            for val in self.results[inst].as_mut_slice(&mut self.value_lists) {
+                if let Some(new_val) = value_map.get(usize::from(*val)).and_then(|v| *v) {
+                    *val = new_val;
+                }
+            }
+        }
+    }
+
+    /// Remap all Block references in branch, jump, and phi instructions.
+    pub(super) fn remap_blocks(
+        &mut self,
+        block_map: &[Option<Block>],
+        phi_forest: &mut PhiForest,
+    ) {
+        for inst_idx in 0..self.declarations.len() {
+            let inst = Inst::from(inst_idx);
+            match &mut self.declarations[inst] {
+                InstructionData::Branch { then_dst, else_dst, .. } => {
+                    if let Some(new_b) = block_map.get(usize::from(*then_dst)).and_then(|v| *v) {
+                        *then_dst = new_b;
+                    }
+                    if let Some(new_b) = block_map.get(usize::from(*else_dst)).and_then(|v| *v) {
+                        *else_dst = new_b;
+                    }
+                }
+                InstructionData::Jump { destination } => {
+                    if let Some(new_b) =
+                        block_map.get(usize::from(*destination)).and_then(|v| *v)
+                    {
+                        *destination = new_b;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Handle PhiNodes separately to avoid borrow issues with phi_forest
+        for inst_idx in 0..self.declarations.len() {
+            let inst = Inst::from(inst_idx);
+            if !self.declarations[inst].is_phi() {
+                continue;
+            }
+
+            // Collect old edges
+            let edges: Vec<(Block, u32)> =
+                self.declarations[inst].unwrap_phi().blocks.iter(phi_forest).collect();
+
+            // Rebuild with remapped blocks
+            let phi = self.declarations[inst].unwrap_phi_mut();
+            phi.blocks.clear(phi_forest);
+            for (old_block, arg_idx) in edges {
+                if let Some(new_block) = block_map.get(usize::from(old_block)).and_then(|v| *v) {
+                    phi.blocks.insert(new_block, arg_idx, phi_forest, &());
+                }
+            }
+        }
     }
 }
 

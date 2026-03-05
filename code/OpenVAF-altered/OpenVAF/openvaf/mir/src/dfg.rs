@@ -387,6 +387,18 @@ impl DataFlowGraph {
     pub fn make_invalid_value(&mut self) -> Value {
         self.values.make(ValueDataType::Invalid, None)
     }
+
+    /// Compact values and remap block/value references in instructions.
+    pub fn compact(
+        &mut self,
+        value_map: &[Option<Value>],
+        block_map: &[Option<Block>],
+        new_num_values: usize,
+    ) {
+        self.insts.remap_values(value_map);
+        self.insts.remap_blocks(block_map, &mut self.phi_forest);
+        self.values.compact_values(value_map, new_num_values);
+    }
 }
 
 /// Object that can display an instruction.
