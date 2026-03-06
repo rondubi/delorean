@@ -188,7 +188,7 @@ impl<'a> CompiledModule<'a> {
         let gvn = cx.optimize(OptimiziationStage::PostDerivative);
         dae_system.sparsify(&mut cx);
 
-        // Final optimization pass: ADCE + CFG cleanup after sparsification
+        // ADCE + CFG cleanup after sparsification
         cx.compute_cfg();
         cx.optimize(OptimiziationStage::Final);
 
