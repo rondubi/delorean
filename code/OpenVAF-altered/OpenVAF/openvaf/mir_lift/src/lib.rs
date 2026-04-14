@@ -403,12 +403,18 @@ fn emit_grouped_body(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn R
     let inlineable = compute_inlineable_groups(unit, &groups, &group_by_block);
     let copy_aliases = compute_copy_aliases(unit);
     let expr_aliases = compute_expr_aliases(unit);
-    let state_values = shared_state_values(unit, &group_by_block, &copy_aliases, &expr_aliases);
+    let cross_group_values = cross_group_materialized_values(unit, &group_by_block, &copy_aliases, &expr_aliases);
+    let localized_roots = localized_return_roots(unit, &cross_group_values, &copy_aliases, &expr_aliases);
+    let state_values = shared_state_values(&cross_group_values);
+
+    if !localized_roots.is_empty() {
+        writeln!(out, "    _ret = {{}}")?;
+    }
 
     for value in state_values.iter().copied().filter(|value| !matches!(unit.source.dfg.value_def(*value), ValueDef::Param(_))) {
         writeln!(out, "    {} = None", value_name(value))?;
     }
-    if !state_values.is_empty() {
+    if !state_values.is_empty() || !localized_roots.is_empty() {
         writeln!(out)?;
     }
 
@@ -427,6 +433,7 @@ fn emit_grouped_body(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn R
             &state_values,
             &copy_aliases,
             &expr_aliases,
+            &localized_roots,
         )?;
         writeln!(out)?;
     }
@@ -444,6 +451,7 @@ fn emit_grouped_body(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn R
         &unit.return_values,
         &copy_aliases,
         &expr_aliases,
+        &localized_roots,
         resolver,
         1,
     )?;
@@ -502,6 +510,7 @@ fn emit_group_function(
     state_values: &[Value],
     copy_aliases: &HashMap<Value, Value>,
     expr_aliases: &HashMap<Value, ExprAlias>,
+    localized_roots: &HashSet<Value>,
 ) -> Result<()> {
     let state_set: HashSet<Value> = state_values.iter().copied().collect();
     let phi_results = group_phi_results(unit, group.blocks[0]);
@@ -528,8 +537,10 @@ fn emit_group_function(
         let param = phi_param_name(value);
         if state_set.contains(&value) {
             writeln!(out, "        {} = {}", value_name(value), param)?;
+            maybe_store_localized_root(out, value, &value_name(value), copy_aliases, localized_roots, 2)?;
         } else {
             aliases.insert(value, param);
+            maybe_store_localized_alias(out, value, copy_aliases, expr_aliases, &aliases, localized_roots, 2)?;
         }
     }
 
@@ -545,6 +556,7 @@ fn emit_group_function(
         &state_set,
         copy_aliases,
         expr_aliases,
+        localized_roots,
         group.blocks[0],
         2,
         &mut aliases,
@@ -581,17 +593,13 @@ fn group_nonlocals(
     needed
 }
 
-fn shared_state_values(
+fn cross_group_materialized_values(
     unit: &FunctionUnit<'_>,
     group_by_block: &HashMap<Block, usize>,
     copy_aliases: &HashMap<Value, Value>,
     expr_aliases: &HashMap<Value, ExprAlias>,
-) -> Vec<Value> {
+) -> HashSet<Value> {
     let mut shared = HashSet::new();
-    for &value in &unit.return_values {
-        collect_materialized_values(unit.source, value, copy_aliases, expr_aliases, &mut shared);
-    }
-
     for &block in &unit.blocks {
         let group = group_by_block[&block];
         for &inst in unit.insts(block) {
@@ -602,8 +610,24 @@ fn shared_state_values(
             }
         }
     }
+    shared
+}
 
-    let mut shared: Vec<Value> = shared.into_iter().collect();
+fn localized_return_roots(
+    unit: &FunctionUnit<'_>,
+    cross_group_values: &HashSet<Value>,
+    copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
+) -> HashSet<Value> {
+    let mut localized = HashSet::new();
+    for &value in &unit.return_values {
+        collect_localized_roots(unit.source, value, cross_group_values, copy_aliases, expr_aliases, &mut localized);
+    }
+    localized
+}
+
+fn shared_state_values(cross_group_values: &HashSet<Value>) -> Vec<Value> {
+    let mut shared: Vec<Value> = cross_group_values.iter().copied().collect();
     shared.sort_by_key(|value| format!("{value}"));
     shared
 }
@@ -828,6 +852,7 @@ fn emit_group_block(
     state_set: &HashSet<Value>,
     copy_aliases: &HashMap<Value, Value>,
     expr_aliases: &HashMap<Value, ExprAlias>,
+    localized_roots: &HashSet<Value>,
     block: Block,
     indent: usize,
     aliases: &mut HashMap<Value, String>,
@@ -844,6 +869,7 @@ fn emit_group_block(
             state_set,
             copy_aliases,
             expr_aliases,
+            localized_roots,
             block,
             block,
             indent,
@@ -865,6 +891,7 @@ fn emit_group_block(
             state_set,
             copy_aliases,
             expr_aliases,
+            localized_roots,
             aliases,
         )?;
     }
@@ -888,6 +915,7 @@ fn emit_group_block(
                     state_set,
                     copy_aliases,
                     expr_aliases,
+                    localized_roots,
                     destination,
                     indent,
                     aliases,
@@ -904,6 +932,7 @@ fn emit_group_block(
                     state_set,
                     copy_aliases,
                     expr_aliases,
+                    localized_roots,
                     destination,
                     block,
                     indent,
@@ -919,7 +948,15 @@ fn emit_group_block(
                 out,
                 "{}if {}:",
                 pad(indent),
-                condition_expr(unit.source, resolver, cond, copy_aliases, expr_aliases, aliases)
+                condition_expr(
+                    unit.source,
+                    resolver,
+                    cond,
+                    copy_aliases,
+                    expr_aliases,
+                    localized_roots,
+                    aliases,
+                )
             )?;
             if group_by_block[&then_dst] == group.id {
                 let mut then_aliases = aliases.clone();
@@ -935,6 +972,7 @@ fn emit_group_block(
                     state_set,
                     copy_aliases,
                     expr_aliases,
+                    localized_roots,
                     then_dst,
                     indent + 1,
                     &mut then_aliases,
@@ -953,6 +991,7 @@ fn emit_group_block(
                     state_set,
                     copy_aliases,
                     expr_aliases,
+                    localized_roots,
                     then_dst,
                     block,
                     indent + 1,
@@ -975,6 +1014,7 @@ fn emit_group_block(
                     state_set,
                     copy_aliases,
                     expr_aliases,
+                    localized_roots,
                     else_dst,
                     indent + 1,
                     &mut else_aliases,
@@ -993,6 +1033,7 @@ fn emit_group_block(
                     state_set,
                     copy_aliases,
                     expr_aliases,
+                    localized_roots,
                     else_dst,
                     block,
                     indent + 1,
@@ -1023,6 +1064,7 @@ fn transition_to_group(
     state_set: &HashSet<Value>,
     copy_aliases: &HashMap<Value, Value>,
     expr_aliases: &HashMap<Value, ExprAlias>,
+    localized_roots: &HashSet<Value>,
     destination: Block,
     pred: Block,
     indent: usize,
@@ -1042,7 +1084,17 @@ fn transition_to_group(
             unit.source
                 .dfg
                 .phi_edge_val(phi, pred)
-                .map(|value| value_expr(unit.source, value, resolver, copy_aliases, expr_aliases, aliases))
+                .map(|value| {
+                    value_expr(
+                        unit.source,
+                        value,
+                        resolver,
+                        copy_aliases,
+                        expr_aliases,
+                        localized_roots,
+                        aliases,
+                    )
+                })
         })
         .collect::<Vec<_>>()
         ;
@@ -1056,8 +1108,10 @@ fn transition_to_group(
         for (result, arg) in group_phi_results(unit, destination).into_iter().zip(args.into_iter()) {
             if state_set.contains(&result) {
                 writeln!(out, "{}{} = {}", pad(indent), value_name(result), arg)?;
+                maybe_store_localized_root(out, result, arg.as_str(), copy_aliases, localized_roots, indent)?;
             } else {
                 aliases.insert(result, arg);
+                maybe_store_localized_alias(out, result, copy_aliases, expr_aliases, aliases, localized_roots, indent)?;
             }
         }
         return emit_group_block(
@@ -1071,6 +1125,7 @@ fn transition_to_group(
             state_set,
             copy_aliases,
             expr_aliases,
+            localized_roots,
             destination,
             indent,
             aliases,
@@ -1097,6 +1152,7 @@ fn emit_inst(
     state_set: &HashSet<Value>,
     copy_aliases: &HashMap<Value, Value>,
     expr_aliases: &HashMap<Value, ExprAlias>,
+    localized_roots: &HashSet<Value>,
     aliases: &mut HashMap<Value, String>,
 ) -> Result<()> {
     let data = function.dfg.insts[inst].clone();
@@ -1110,7 +1166,16 @@ fn emit_inst(
 
     let rendered = function.dfg.display_inst(inst).to_string();
     let results = function.dfg.inst_results(inst);
-    match lift_inst(function, resolver, inst, &data, copy_aliases, expr_aliases, aliases) {
+    match lift_inst(
+        function,
+        resolver,
+        inst,
+        &data,
+        copy_aliases,
+        expr_aliases,
+        localized_roots,
+        aliases,
+    ) {
         Some(expr) if results.len() == 1 => {
             if !state_set.contains(&results[0])
                 && (copy_aliases.contains_key(&results[0])
@@ -1118,8 +1183,10 @@ fn emit_inst(
                     || can_inline_expr_alias(&data, &expr))
             {
                 aliases.insert(results[0], expr);
+                maybe_store_localized_alias(out, results[0], copy_aliases, expr_aliases, aliases, localized_roots, indent)?;
             } else {
                 writeln!(out, "{}{} = {}", pad(indent), value_name(results[0]), expr)?;
+                maybe_store_localized_root(out, results[0], &value_name(results[0]), copy_aliases, localized_roots, indent)?;
             }
         }
         Some(expr) if results.is_empty() => {
@@ -1159,16 +1226,17 @@ fn lift_inst(
     data: &InstructionData,
     copy_aliases: &HashMap<Value, Value>,
     expr_aliases: &HashMap<Value, ExprAlias>,
+    localized_roots: &HashSet<Value>,
     aliases: &HashMap<Value, String>,
 ) -> Option<String> {
     match data {
         InstructionData::Unary { opcode, arg } => {
-            let arg = value_expr(function, *arg, resolver, copy_aliases, expr_aliases, aliases);
+            let arg = value_expr(function, *arg, resolver, copy_aliases, expr_aliases, localized_roots, aliases);
             unary_expr(*opcode, arg)
         }
         InstructionData::Binary { opcode, args } => {
-            let lhs = value_expr(function, args[0], resolver, copy_aliases, expr_aliases, aliases);
-            let rhs = value_expr(function, args[1], resolver, copy_aliases, expr_aliases, aliases);
+            let lhs = value_expr(function, args[0], resolver, copy_aliases, expr_aliases, localized_roots, aliases);
+            let rhs = value_expr(function, args[1], resolver, copy_aliases, expr_aliases, localized_roots, aliases);
             binary_expr(*opcode, lhs, rhs)
         }
         InstructionData::Call { func_ref, args } => {
@@ -1176,7 +1244,17 @@ fn lift_inst(
             let args = args
                 .as_slice(&function.dfg.insts.value_lists)
                 .iter()
-                .map(|arg| value_expr(function, *arg, resolver, copy_aliases, expr_aliases, aliases))
+                .map(|arg| {
+                    value_expr(
+                        function,
+                        *arg,
+                        resolver,
+                        copy_aliases,
+                        expr_aliases,
+                        localized_roots,
+                        aliases,
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             Some(format!("{target}({args})"))
@@ -1195,9 +1273,10 @@ fn condition_expr(
     cond: Value,
     copy_aliases: &HashMap<Value, Value>,
     expr_aliases: &HashMap<Value, ExprAlias>,
+    localized_roots: &HashSet<Value>,
     aliases: &HashMap<Value, String>,
 ) -> String {
-    value_expr(function, cond, resolver, copy_aliases, expr_aliases, aliases)
+    value_expr(function, cond, resolver, copy_aliases, expr_aliases, localized_roots, aliases)
 }
 
 fn unary_expr(opcode: Opcode, arg: String) -> Option<String> {
@@ -1264,6 +1343,7 @@ fn emit_return_values(
     values: &[Value],
     copy_aliases: &HashMap<Value, Value>,
     expr_aliases: &HashMap<Value, ExprAlias>,
+    localized_roots: &HashSet<Value>,
     resolver: &dyn Resolver,
     indent: usize,
 ) -> Result<()> {
@@ -1272,12 +1352,13 @@ fn emit_return_values(
         .copied()
         .into_iter()
         .map(|value| {
-            let expr = value_expr(
+            let expr = return_value_expr(
                 function,
                 value,
                 resolver,
                 copy_aliases,
                 expr_aliases,
+                localized_roots,
                 &HashMap::new(),
             );
             format!("{:?}: {expr}", value_name(value))
@@ -1286,6 +1367,29 @@ fn emit_return_values(
         .join(", ");
     writeln!(out, "{}return {{{entries}}}", pad(indent))?;
     Ok(())
+}
+
+fn return_value_expr(
+    function: &Function,
+    value: Value,
+    resolver: &dyn Resolver,
+    copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
+    localized_roots: &HashSet<Value>,
+    aliases: &HashMap<Value, String>,
+) -> String {
+    let value = canonical_value(value, copy_aliases);
+    if localized_roots.contains(&value) {
+        return format!("_ret[{:#?}]", value_name(value));
+    }
+    if let Some(alias) = aliases.get(&value) {
+        return alias.clone();
+    }
+    if let Some(alias) = expr_aliases.get(&value) {
+        let arg = return_value_expr(function, alias.arg, resolver, copy_aliases, expr_aliases, localized_roots, aliases);
+        return unary_expr(alias.opcode, arg).unwrap_or_else(|| value_name(value));
+    }
+    value_expr_no_alias(function, value, resolver)
 }
 
 fn call_name(function: &Function, func_ref: FuncRef) -> String {
@@ -1303,6 +1407,7 @@ fn value_expr(
     resolver: &dyn Resolver,
     copy_aliases: &HashMap<Value, Value>,
     expr_aliases: &HashMap<Value, ExprAlias>,
+    localized_roots: &HashSet<Value>,
     aliases: &HashMap<Value, String>,
 ) -> String {
     if let Some(alias) = aliases.get(&value) {
@@ -1310,9 +1415,10 @@ fn value_expr(
     }
     let value = canonical_value(value, copy_aliases);
     if let Some(alias) = expr_aliases.get(&value) {
-        let arg = value_expr(function, alias.arg, resolver, copy_aliases, expr_aliases, aliases);
+        let arg = value_expr(function, alias.arg, resolver, copy_aliases, expr_aliases, localized_roots, aliases);
         return unary_expr(alias.opcode, arg).unwrap_or_else(|| value_name(value));
     }
+    let _ = localized_roots;
     value_expr_no_alias(function, value, resolver)
 }
 
@@ -1449,6 +1555,63 @@ fn collect_materialized_values(
     }
 }
 
+fn collect_localized_roots(
+    function: &Function,
+    value: Value,
+    cross_group_values: &HashSet<Value>,
+    copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
+    out: &mut HashSet<Value>,
+) {
+    let value = canonical_value(value, copy_aliases);
+    if let Some(alias) = expr_aliases.get(&value) {
+        collect_localized_roots(function, alias.arg, cross_group_values, copy_aliases, expr_aliases, out);
+        return;
+    }
+    match function.dfg.value_def(value) {
+        ValueDef::Param(_) | ValueDef::Const(_) | ValueDef::Invalid => {}
+        ValueDef::Result(_, _) if !cross_group_values.contains(&value) => {
+            out.insert(value);
+        }
+        ValueDef::Result(_, _) => {}
+    }
+}
+
+fn maybe_store_localized_root(
+    out: &mut String,
+    value: Value,
+    expr: &str,
+    copy_aliases: &HashMap<Value, Value>,
+    localized_roots: &HashSet<Value>,
+    indent: usize,
+) -> Result<()> {
+    let root = canonical_value(value, copy_aliases);
+    if localized_roots.contains(&root) && root == value {
+        writeln!(out, "{}_ret[{:#?}] = {}", pad(indent), value_name(root), expr)?;
+    }
+    Ok(())
+}
+
+fn maybe_store_localized_alias(
+    out: &mut String,
+    value: Value,
+    copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
+    aliases: &HashMap<Value, String>,
+    localized_roots: &HashSet<Value>,
+    indent: usize,
+) -> Result<()> {
+    let root = canonical_value(value, copy_aliases);
+    if localized_roots.contains(&root) && root == value {
+        if let Some(expr) = aliases.get(&value) {
+            writeln!(out, "{}_ret[{:#?}] = {}", pad(indent), value_name(root), expr)?;
+        }
+    } else if localized_roots.contains(&root) && expr_aliases.contains_key(&value) {
+        let _ = aliases;
+    }
+    Ok(())
+}
+
 fn value_name(value: Value) -> String {
     format!("{value}").replace('.', "_")
 }
@@ -1545,7 +1708,8 @@ mod tests {
         assert!(lifted.contains("_fn_0()"));
         assert!(lifted.contains("math.sin"));
         assert!(!lifted.contains("v36 = v35"));
-        assert!(lifted.contains(r#""v36": v35"#));
+        assert!(lifted.contains(r#"_ret["v19"] = phi_v19"#));
+        assert!(lifted.contains(r#""v36": _ret["v35"]"#));
     }
 
     #[test]
