@@ -162,6 +162,12 @@ struct BlockGroup {
     blocks: Vec<Block>,
 }
 
+#[derive(Clone, Copy)]
+struct ExprAlias {
+    opcode: Opcode,
+    arg: Value,
+}
+
 fn build_units<'a>(functions: &'a [Function], metadata: &CompilationDb) -> Result<Vec<FunctionUnit<'a>>> {
     if metadata.functions.is_empty() {
         let mut units = Vec::with_capacity(functions.len());
@@ -396,7 +402,8 @@ fn emit_grouped_body(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn R
         .collect();
     let inlineable = compute_inlineable_groups(unit, &groups, &group_by_block);
     let copy_aliases = compute_copy_aliases(unit);
-    let state_values = shared_state_values(unit, &group_by_block, &copy_aliases);
+    let expr_aliases = compute_expr_aliases(unit);
+    let state_values = shared_state_values(unit, &group_by_block, &copy_aliases, &expr_aliases);
 
     for value in state_values.iter().copied().filter(|value| !matches!(unit.source.dfg.value_def(*value), ValueDef::Param(_))) {
         writeln!(out, "    {} = None", value_name(value))?;
@@ -419,6 +426,7 @@ fn emit_grouped_body(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn R
             &inlineable,
             &state_values,
             &copy_aliases,
+            &expr_aliases,
         )?;
         writeln!(out)?;
     }
@@ -430,7 +438,15 @@ fn emit_grouped_body(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn R
         .collect::<Vec<_>>()
         .join(", ");
     writeln!(out, "    _fn_{entry_group}({entry_args})")?;
-    emit_return_values(out, unit.source, &unit.return_values, &copy_aliases, resolver, 1)?;
+    emit_return_values(
+        out,
+        unit.source,
+        &unit.return_values,
+        &copy_aliases,
+        &expr_aliases,
+        resolver,
+        1,
+    )?;
     Ok(())
 }
 
@@ -485,6 +501,7 @@ fn emit_group_function(
     inlineable: &HashSet<usize>,
     state_values: &[Value],
     copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
 ) -> Result<()> {
     let state_set: HashSet<Value> = state_values.iter().copied().collect();
     let phi_results = group_phi_results(unit, group.blocks[0]);
@@ -527,6 +544,7 @@ fn emit_group_function(
         inlineable,
         &state_set,
         copy_aliases,
+        expr_aliases,
         group.blocks[0],
         2,
         &mut aliases,
@@ -567,27 +585,19 @@ fn shared_state_values(
     unit: &FunctionUnit<'_>,
     group_by_block: &HashMap<Block, usize>,
     copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
 ) -> Vec<Value> {
-    let mut shared: HashSet<Value> = unit
-        .return_values
-        .iter()
-        .copied()
-        .map(|value| canonical_value(value, copy_aliases))
-        .collect();
+    let mut shared = HashSet::new();
+    for &value in &unit.return_values {
+        collect_materialized_values(unit.source, value, copy_aliases, expr_aliases, &mut shared);
+    }
 
     for &block in &unit.blocks {
         let group = group_by_block[&block];
         for &inst in unit.insts(block) {
             for &arg in unit.source.dfg.insts[inst].arguments(&unit.source.dfg.insts.value_lists) {
-                let arg = canonical_value(arg, copy_aliases);
-                let ValueDef::Result(def_inst, _) = unit.source.dfg.value_def(arg) else {
-                    continue;
-                };
-                let Some(def_block) = unit.source.layout.inst_block(def_inst) else {
-                    continue;
-                };
-                if unit.contains_block(def_block) && group_by_block[&def_block] != group {
-                    shared.insert(arg);
+                if crosses_group_boundary(unit, arg, group, group_by_block, copy_aliases, expr_aliases) {
+                    collect_materialized_values(unit.source, arg, copy_aliases, expr_aliases, &mut shared);
                 }
             }
         }
@@ -817,6 +827,7 @@ fn emit_group_block(
     inlineable: &HashSet<usize>,
     state_set: &HashSet<Value>,
     copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
     block: Block,
     indent: usize,
     aliases: &mut HashMap<Value, String>,
@@ -832,6 +843,7 @@ fn emit_group_block(
             inlineable,
             state_set,
             copy_aliases,
+            expr_aliases,
             block,
             block,
             indent,
@@ -844,7 +856,17 @@ fn emit_group_block(
         if matches!(unit.source.dfg.insts[inst], InstructionData::PhiNode(_)) {
             continue;
         }
-        emit_inst(out, unit.source, resolver, inst, indent, state_set, copy_aliases, aliases)?;
+        emit_inst(
+            out,
+            unit.source,
+            resolver,
+            inst,
+            indent,
+            state_set,
+            copy_aliases,
+            expr_aliases,
+            aliases,
+        )?;
     }
 
     match unit
@@ -865,6 +887,7 @@ fn emit_group_block(
                     inlineable,
                     state_set,
                     copy_aliases,
+                    expr_aliases,
                     destination,
                     indent,
                     aliases,
@@ -880,6 +903,7 @@ fn emit_group_block(
                     inlineable,
                     state_set,
                     copy_aliases,
+                    expr_aliases,
                     destination,
                     block,
                     indent,
@@ -895,7 +919,7 @@ fn emit_group_block(
                 out,
                 "{}if {}:",
                 pad(indent),
-                condition_expr(unit.source, resolver, cond, copy_aliases, aliases)
+                condition_expr(unit.source, resolver, cond, copy_aliases, expr_aliases, aliases)
             )?;
             if group_by_block[&then_dst] == group.id {
                 let mut then_aliases = aliases.clone();
@@ -910,6 +934,7 @@ fn emit_group_block(
                     inlineable,
                     state_set,
                     copy_aliases,
+                    expr_aliases,
                     then_dst,
                     indent + 1,
                     &mut then_aliases,
@@ -927,6 +952,7 @@ fn emit_group_block(
                     inlineable,
                     state_set,
                     copy_aliases,
+                    expr_aliases,
                     then_dst,
                     block,
                     indent + 1,
@@ -948,6 +974,7 @@ fn emit_group_block(
                     inlineable,
                     state_set,
                     copy_aliases,
+                    expr_aliases,
                     else_dst,
                     indent + 1,
                     &mut else_aliases,
@@ -965,6 +992,7 @@ fn emit_group_block(
                     inlineable,
                     state_set,
                     copy_aliases,
+                    expr_aliases,
                     else_dst,
                     block,
                     indent + 1,
@@ -994,6 +1022,7 @@ fn transition_to_group(
     inlineable: &HashSet<usize>,
     state_set: &HashSet<Value>,
     copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
     destination: Block,
     pred: Block,
     indent: usize,
@@ -1013,7 +1042,7 @@ fn transition_to_group(
             unit.source
                 .dfg
                 .phi_edge_val(phi, pred)
-                .map(|value| value_expr(unit.source, value, resolver, copy_aliases, aliases))
+                .map(|value| value_expr(unit.source, value, resolver, copy_aliases, expr_aliases, aliases))
         })
         .collect::<Vec<_>>()
         ;
@@ -1041,6 +1070,7 @@ fn transition_to_group(
             inlineable,
             state_set,
             copy_aliases,
+            expr_aliases,
             destination,
             indent,
             aliases,
@@ -1066,6 +1096,7 @@ fn emit_inst(
     indent: usize,
     state_set: &HashSet<Value>,
     copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
     aliases: &mut HashMap<Value, String>,
 ) -> Result<()> {
     let data = function.dfg.insts[inst].clone();
@@ -1079,9 +1110,13 @@ fn emit_inst(
 
     let rendered = function.dfg.display_inst(inst).to_string();
     let results = function.dfg.inst_results(inst);
-    match lift_inst(function, resolver, inst, &data, copy_aliases, aliases) {
+    match lift_inst(function, resolver, inst, &data, copy_aliases, expr_aliases, aliases) {
         Some(expr) if results.len() == 1 => {
-            if !state_set.contains(&results[0]) && is_simple_name(&expr) {
+            if !state_set.contains(&results[0])
+                && (copy_aliases.contains_key(&results[0])
+                    || expr_aliases.contains_key(&results[0])
+                    || can_inline_expr_alias(&data, &expr))
+            {
                 aliases.insert(results[0], expr);
             } else {
                 writeln!(out, "{}{} = {}", pad(indent), value_name(results[0]), expr)?;
@@ -1123,16 +1158,17 @@ fn lift_inst(
     inst: Inst,
     data: &InstructionData,
     copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
     aliases: &HashMap<Value, String>,
 ) -> Option<String> {
     match data {
         InstructionData::Unary { opcode, arg } => {
-            let arg = value_expr(function, *arg, resolver, copy_aliases, aliases);
+            let arg = value_expr(function, *arg, resolver, copy_aliases, expr_aliases, aliases);
             unary_expr(*opcode, arg)
         }
         InstructionData::Binary { opcode, args } => {
-            let lhs = value_expr(function, args[0], resolver, copy_aliases, aliases);
-            let rhs = value_expr(function, args[1], resolver, copy_aliases, aliases);
+            let lhs = value_expr(function, args[0], resolver, copy_aliases, expr_aliases, aliases);
+            let rhs = value_expr(function, args[1], resolver, copy_aliases, expr_aliases, aliases);
             binary_expr(*opcode, lhs, rhs)
         }
         InstructionData::Call { func_ref, args } => {
@@ -1140,7 +1176,7 @@ fn lift_inst(
             let args = args
                 .as_slice(&function.dfg.insts.value_lists)
                 .iter()
-                .map(|arg| value_expr(function, *arg, resolver, copy_aliases, aliases))
+                .map(|arg| value_expr(function, *arg, resolver, copy_aliases, expr_aliases, aliases))
                 .collect::<Vec<_>>()
                 .join(", ");
             Some(format!("{target}({args})"))
@@ -1158,9 +1194,10 @@ fn condition_expr(
     resolver: &dyn Resolver,
     cond: Value,
     copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
     aliases: &HashMap<Value, String>,
 ) -> String {
-    value_expr(function, cond, resolver, copy_aliases, aliases)
+    value_expr(function, cond, resolver, copy_aliases, expr_aliases, aliases)
 }
 
 fn unary_expr(opcode: Opcode, arg: String) -> Option<String> {
@@ -1226,6 +1263,7 @@ fn emit_return_values(
     function: &Function,
     values: &[Value],
     copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
     resolver: &dyn Resolver,
     indent: usize,
 ) -> Result<()> {
@@ -1234,8 +1272,14 @@ fn emit_return_values(
         .copied()
         .into_iter()
         .map(|value| {
-            let canonical = canonical_value(value, copy_aliases);
-            let expr = value_expr_no_alias(function, canonical, resolver);
+            let expr = value_expr(
+                function,
+                value,
+                resolver,
+                copy_aliases,
+                expr_aliases,
+                &HashMap::new(),
+            );
             format!("{:?}: {expr}", value_name(value))
         })
         .collect::<Vec<_>>()
@@ -1258,12 +1302,17 @@ fn value_expr(
     value: Value,
     resolver: &dyn Resolver,
     copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
     aliases: &HashMap<Value, String>,
 ) -> String {
     if let Some(alias) = aliases.get(&value) {
         return alias.clone();
     }
     let value = canonical_value(value, copy_aliases);
+    if let Some(alias) = expr_aliases.get(&value) {
+        let arg = value_expr(function, alias.arg, resolver, copy_aliases, expr_aliases, aliases);
+        return unary_expr(alias.opcode, arg).unwrap_or_else(|| value_name(value));
+    }
     value_expr_no_alias(function, value, resolver)
 }
 
@@ -1305,6 +1354,25 @@ fn compute_copy_aliases(unit: &FunctionUnit<'_>) -> HashMap<Value, Value> {
     aliases
 }
 
+fn compute_expr_aliases(unit: &FunctionUnit<'_>) -> HashMap<Value, ExprAlias> {
+    let mut aliases = HashMap::new();
+    for &block in &unit.blocks {
+        for &inst in unit.insts(block) {
+            let Some(&result) = unit.source.dfg.inst_results(inst).first() else {
+                continue;
+            };
+            let InstructionData::Unary { opcode, arg } = unit.source.dfg.insts[inst] else {
+                continue;
+            };
+            if !is_inline_alias_opcode(opcode) || opcode == Opcode::OptBarrier {
+                continue;
+            }
+            aliases.insert(result, ExprAlias { opcode, arg });
+        }
+    }
+    aliases
+}
+
 fn direct_copy_source(function: &Function, inst: Inst) -> Option<Value> {
     match function.dfg.insts[inst] {
         InstructionData::Unary { opcode: Opcode::OptBarrier, arg } => Some(arg),
@@ -1323,6 +1391,64 @@ fn canonical_value(mut value: Value, aliases: &HashMap<Value, Value>) -> Value {
     value
 }
 
+fn is_inline_alias_opcode(opcode: Opcode) -> bool {
+    matches!(
+        opcode,
+        Opcode::Inot
+            | Opcode::Bnot
+            | Opcode::Fneg
+            | Opcode::Ineg
+            | Opcode::FIcast
+            | Opcode::BIcast
+            | Opcode::IFcast
+            | Opcode::BFcast
+            | Opcode::IBcast
+            | Opcode::FBcast
+            | Opcode::OptBarrier
+    )
+}
+
+fn crosses_group_boundary(
+    unit: &FunctionUnit<'_>,
+    value: Value,
+    group: usize,
+    group_by_block: &HashMap<Block, usize>,
+    copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
+) -> bool {
+    let value = canonical_value(value, copy_aliases);
+    if let Some(alias) = expr_aliases.get(&value) {
+        return crosses_group_boundary(unit, alias.arg, group, group_by_block, copy_aliases, expr_aliases);
+    }
+    let ValueDef::Result(def_inst, _) = unit.source.dfg.value_def(value) else {
+        return false;
+    };
+    let Some(def_block) = unit.source.layout.inst_block(def_inst) else {
+        return false;
+    };
+    unit.contains_block(def_block) && group_by_block[&def_block] != group
+}
+
+fn collect_materialized_values(
+    function: &Function,
+    value: Value,
+    copy_aliases: &HashMap<Value, Value>,
+    expr_aliases: &HashMap<Value, ExprAlias>,
+    out: &mut HashSet<Value>,
+) {
+    let value = canonical_value(value, copy_aliases);
+    if let Some(alias) = expr_aliases.get(&value) {
+        collect_materialized_values(function, alias.arg, copy_aliases, expr_aliases, out);
+        return;
+    }
+    match function.dfg.value_def(value) {
+        ValueDef::Const(_) | ValueDef::Invalid => {}
+        ValueDef::Param(_) | ValueDef::Result(_, _) => {
+            out.insert(value);
+        }
+    }
+}
+
 fn value_name(value: Value) -> String {
     format!("{value}").replace('.', "_")
 }
@@ -1338,6 +1464,31 @@ fn is_simple_name(expr: &str) -> bool {
         _ => return false,
     }
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn can_inline_expr_alias(data: &InstructionData, expr: &str) -> bool {
+    if is_simple_name(expr) {
+        return true;
+    }
+
+    matches!(
+        data,
+        InstructionData::Unary {
+            opcode:
+                Opcode::Inot
+                | Opcode::Bnot
+                | Opcode::Fneg
+                | Opcode::Ineg
+                | Opcode::FIcast
+                | Opcode::BIcast
+                | Opcode::IFcast
+                | Opcode::BFcast
+                | Opcode::IBcast
+                | Opcode::FBcast
+                | Opcode::OptBarrier,
+            ..
+        }
+    )
 }
 
 fn sanitize_ident(name: &str) -> String {
