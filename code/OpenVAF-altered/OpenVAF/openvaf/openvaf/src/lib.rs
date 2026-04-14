@@ -1,7 +1,6 @@
 use std::fs::{create_dir_all, remove_file};
 use std::io::Write;
 use std::time::Instant;
-use std::collections::HashMap;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -9,6 +8,7 @@ use basedb::diagnostics::{ConsoleSink, DiagnosticSink};
 use basedb::BaseDB;
 use camino::Utf8PathBuf;
 use hir::CompilationDB;
+use lasso::Rodeo;
 use linker::link;
 use mir_llvm::LLVMBackend;
 use sim_back::collect_modules;
@@ -25,7 +25,7 @@ pub use target::spec::{get_target_names, Target};
 mod cache;
 pub mod elysian;
 
-use basedb::{CliParamDefault, CliParamDefaultValue};
+use basedb::CliParamDefault;
 
 #[derive(Debug, Clone)]
 pub enum CompilationDestination {
@@ -36,6 +36,21 @@ pub enum CompilationDestination {
 pub enum CompilationTermination {
     Compiled { lib_file: Utf8PathBuf },
     FatalDiagnostic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodegenBackend {
+    Llvm,
+    MirLift,
+}
+
+impl CodegenBackend {
+    pub fn output_extension(self) -> &'static str {
+        match self {
+            CodegenBackend::Llvm => "osdi",
+            CodegenBackend::MirLift => "py",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +65,7 @@ pub struct Opts {
     pub opt_lvl: OptLevel,
     pub target: Target,
     pub target_cpu: String,
+    pub backend: CodegenBackend,
     pub dump_mir: bool, 
     pub dump_unopt_mir: bool, 
     pub dump_ir: bool, 
@@ -192,51 +208,12 @@ pub fn compile(opts: &Opts) -> Result<CompilationTermination> {
         return Ok(CompilationTermination::FatalDiagnostic);
     };
 
-    let back = LLVMBackend::new(&opts.codegen_opts, &opts.target, opts.target_cpu.clone(), &[]);
     if opts.dry_run {
         return Ok(CompilationTermination::Compiled { lib_file });
     }
-    let (paths, compiled_modules, literals) = osdi::compile(&db, &modules, &lib_file, &opts.target, &back, true, opts.opt_lvl, opts.dump_mir, opts.dump_unopt_mir, opts.dump_ir, opts.dump_unopt_ir, &opts.params_to_leave);
-
-    // Dump MIR of compiled modules
-    if opts.dump_mir || opts.dump_unopt_mir {
-        let cu = db.compilation_unit();
-        println!("Compilation unit: {}", cu.name(&db));
-        println!("");
-
-        println!("Literals:");
-        for (k, v) in literals.iter() {
-            println!("  {:?} -> '{}'", k, v);
-        }
-        println!("");
-
-        for(module, cmodule) in modules.iter().zip(compiled_modules.iter()) {
-            print_module("  ", &db, &module, &cmodule.dae_system, &cmodule.init);
-            println!("");
-
-            println!("Model setup HIR interner of {}", module.module.name(&db));
-            print_intern("  ", &db, &cmodule.model_param_intern);
-            println!("");
-
-            println!("Instance setup HIR interner of {}", module.module.name(&db));
-            print_intern("  ", &db, &cmodule.init.intern);
-            println!("");
-
-            println!("Evaluation HIR interner of {}", module.module.name(&db));
-            print_intern("  ", &db, &cmodule.intern);
-            println!("");
-        }
-    }
-
-    // TODO configure linker
-    link(None, &opts.target, lib_file.as_ref(), |linker| {
-        for path in &paths {
-            linker.add_object(path);
-        }
-    })?;
-
-    for obj_file in paths {
-        remove_file(obj_file).context("failed to delete intermediate compile artifact")?;
+    match opts.backend {
+        CodegenBackend::Llvm => compile_with_llvm(opts, &db, &modules, &lib_file)?,
+        CodegenBackend::MirLift => compile_with_mir_lift(opts, &db, &modules, &lib_file)?,
     }
 
     let seconds = Instant::elapsed(&start).as_secs_f64();
@@ -247,4 +224,178 @@ pub fn compile(opts: &Opts) -> Result<CompilationTermination> {
     writeln!(&mut stderr, " building {} in {:.2}s", opts.input.file_name().unwrap(), seconds)?;
 
     Ok(CompilationTermination::Compiled { lib_file })
+}
+
+fn compile_with_llvm(
+    opts: &Opts,
+    db: &CompilationDB,
+    modules: &[sim_back::ModuleInfo],
+    lib_file: &Utf8PathBuf,
+) -> Result<()> {
+    let back = LLVMBackend::new(&opts.codegen_opts, &opts.target, opts.target_cpu.clone(), &[]);
+    let (paths, compiled_modules, literals) = osdi::compile(
+        db,
+        modules,
+        lib_file,
+        &opts.target,
+        &back,
+        true,
+        opts.opt_lvl,
+        opts.dump_mir,
+        opts.dump_unopt_mir,
+        opts.dump_ir,
+        opts.dump_unopt_ir,
+        &opts.params_to_leave,
+    );
+
+    if opts.dump_mir || opts.dump_unopt_mir {
+        let cu = db.compilation_unit();
+        println!("Compilation unit: {}", cu.name(db));
+        println!("");
+
+        println!("Literals:");
+        for (k, v) in literals.iter() {
+            println!("  {:?} -> '{}'", k, v);
+        }
+        println!("");
+
+        for (module, cmodule) in modules.iter().zip(compiled_modules.iter()) {
+            print_module("  ", db, module, &cmodule.dae_system, &cmodule.init);
+            println!("");
+
+            println!("Model setup HIR interner of {}", module.module.name(db));
+            print_intern("  ", db, &cmodule.model_param_intern);
+            println!("");
+
+            println!("Instance setup HIR interner of {}", module.module.name(db));
+            print_intern("  ", db, &cmodule.init.intern);
+            println!("");
+
+            println!("Evaluation HIR interner of {}", module.module.name(db));
+            print_intern("  ", db, &cmodule.intern);
+            println!("");
+        }
+    }
+
+    link(None, &opts.target, lib_file.as_ref(), |linker| {
+        for path in &paths {
+            linker.add_object(path);
+        }
+    })?;
+
+    for obj_file in paths {
+        remove_file(obj_file).context("failed to delete intermediate compile artifact")?;
+    }
+
+    Ok(())
+}
+
+fn compile_with_mir_lift(
+    opts: &Opts,
+    db: &CompilationDB,
+    modules: &[sim_back::ModuleInfo],
+    lib_file: &Utf8PathBuf,
+) -> Result<()> {
+    let mut literals = Rodeo::default();
+    let mut python = String::new();
+    let mut first_unit = true;
+    let mut stderr = StandardStream::stderr(ColorChoice::Auto);
+
+    for module in modules {
+        writeln!(
+            &mut stderr,
+            "mir-lift: building MIR for {}",
+            module.module.name(db)
+        )?;
+        let mut compiled = sim_back::CompiledModule::new(
+            db,
+            module,
+            &mut literals,
+            opts.dump_unopt_mir,
+            opts.dump_mir,
+            &opts.params_to_leave,
+        );
+
+        let base_name = module.module.name(db);
+        compiled.model_param_setup.name = format!("{base_name}_model");
+        compiled.init.func.name = format!("{base_name}_init");
+        compiled.eval.name = format!("{base_name}_eval");
+        let model_output_values = compiled
+            .model_param_intern
+            .outputs
+            .values()
+            .copied()
+            .filter_map(|value| value.expand())
+            .collect::<Vec<_>>();
+        let init_output_values = compiled
+            .init
+            .intern
+            .outputs
+            .values()
+            .copied()
+            .filter_map(|value| value.expand())
+            .collect::<Vec<_>>();
+        let eval_output_values = compiled
+            .intern
+            .outputs
+            .values()
+            .copied()
+            .filter_map(|value| value.expand())
+            .collect::<Vec<_>>();
+
+        writeln!(&mut stderr, "mir-lift: lifting {} model setup", base_name)?;
+        append_lifted_python(
+            &mut python,
+            &mir_lift::lift_function_with_returns(
+                &compiled.model_param_setup,
+                &model_output_values,
+                &literals,
+            )?,
+            &mut first_unit,
+        )?;
+        writeln!(&mut stderr, "mir-lift: lifting {} init", base_name)?;
+        append_lifted_python(
+            &mut python,
+            &mir_lift::lift_function_with_returns(
+                &compiled.init.func,
+                &init_output_values,
+                &literals,
+            )?,
+            &mut first_unit,
+        )?;
+        writeln!(&mut stderr, "mir-lift: lifting {} eval", base_name)?;
+        append_lifted_python(
+            &mut python,
+            &mir_lift::lift_function_with_returns(
+                &compiled.eval,
+                &eval_output_values,
+                &literals,
+            )?,
+            &mut first_unit,
+        )?;
+    }
+
+    writeln!(&mut stderr, "mir-lift: writing {}", lib_file)?;
+    std::fs::write(lib_file, python).context("failed to write mir_lift output")?;
+    Ok(())
+}
+
+fn append_lifted_python(out: &mut String, lifted: &str, first_unit: &mut bool) -> Result<()> {
+    if *first_unit {
+        out.push_str(lifted);
+        *first_unit = false;
+        return Ok(());
+    }
+
+    out.push('\n');
+    out.push('\n');
+    out.push_str(strip_lift_prelude(lifted));
+    Ok(())
+}
+
+fn strip_lift_prelude(lifted: &str) -> &str {
+    lifted
+        .find("\ndef ")
+        .map(|idx| &lifted[idx + 1..])
+        .unwrap_or(lifted)
 }

@@ -39,11 +39,24 @@ pub fn lift_text(input: &str, metadata_json: Option<&str>) -> Result<String> {
 
 pub fn lift_function(function: &Function, resolver: &dyn Resolver) -> Result<String> {
     let unit = FunctionUnit::whole(function)?;
+    emit_function_unit(&unit, resolver)
+}
+
+pub fn lift_function_with_returns(
+    function: &Function,
+    return_values: &[Value],
+    resolver: &dyn Resolver,
+) -> Result<String> {
+    let unit = FunctionUnit::whole_with_returns(function, return_values)?;
+    emit_function_unit(&unit, resolver)
+}
+
+fn emit_function_unit(unit: &FunctionUnit<'_>, resolver: &dyn Resolver) -> Result<String> {
     let mut out = String::new();
     out.push_str("import math\n\n\n");
     out.push_str("def mir_unlifted(text):\n");
     out.push_str("    return f\"<unlifted:{text}>\"\n\n\n");
-    emit_unit(&mut out, &unit, resolver)?;
+    emit_unit(&mut out, unit, resolver)?;
     Ok(out)
 }
 
@@ -211,6 +224,10 @@ impl<'a> FunctionUnit<'a> {
         Self::whole_named(source, sanitize_ident(&source.name))
     }
 
+    fn whole_with_returns(source: &'a Function, return_values: &[Value]) -> Result<Self> {
+        Self::whole_named_with_returns(source, sanitize_ident(&source.name), return_values)
+    }
+
     fn whole_named(source: &'a Function, name: String) -> Result<Self> {
         let blocks: Vec<Block> = source.layout.blocks().collect();
         let entry = source
@@ -232,6 +249,33 @@ impl<'a> FunctionUnit<'a> {
             entry,
             params,
             return_values,
+        })
+    }
+
+    fn whole_named_with_returns(
+        source: &'a Function,
+        name: String,
+        return_values: &[Value],
+    ) -> Result<Self> {
+        let blocks: Vec<Block> = source.layout.blocks().collect();
+        let entry = source
+            .layout
+            .entry_block()
+            .with_context(|| format!("function {} has no entry block", source.name))?;
+        let block_set = blocks.iter().copied().collect::<HashSet<_>>();
+        let insts_by_block = build_insts_by_block(source, &blocks);
+        let preds_by_block = build_preds_by_block(source, &blocks, &block_set);
+        let params = collect_function_params(source);
+        Ok(Self {
+            name,
+            source,
+            blocks,
+            block_set,
+            preds_by_block,
+            insts_by_block,
+            entry,
+            params,
+            return_values: dedup_values(return_values),
         })
     }
 
@@ -283,6 +327,17 @@ impl<'a> FunctionUnit<'a> {
     fn insts(&self, block: Block) -> &[Inst] {
         self.insts_by_block.get(&block).map(Vec::as_slice).unwrap_or(&[])
     }
+}
+
+fn dedup_values(values: &[Value]) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(values.len());
+    for &value in values {
+        if seen.insert(value) {
+            out.push(value);
+        }
+    }
+    out
 }
 
 fn build_insts_by_block(function: &Function, blocks: &[Block]) -> HashMap<Block, Vec<Inst>> {
