@@ -17,6 +17,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("verilog_file")
     parser.add_argument("-o", "--output")
+    parser.add_argument("--dump-lir", action="store_true")
     args = parser.parse_args()
 
     verilog_file = Path(args.verilog_file).expanduser().resolve()
@@ -63,6 +64,8 @@ def main() -> int:
         str(output),
         str(verilog_file),
     ]
+    if args.dump_lir:
+        cmd.insert(-1, "--dump-lir")
 
     return subprocess.run(cmd, cwd=workspace_root, env=env).returncode
 

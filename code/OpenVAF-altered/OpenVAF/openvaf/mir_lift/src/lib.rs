@@ -1,5 +1,8 @@
+#![allow(dead_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use lasso::Resolver;
@@ -10,7 +13,30 @@ use mir::{
 use mir_reader::parse_functions;
 use serde::Deserialize;
 
+pub mod lir;
+
+mod lir_backward;
+mod lir_forward;
+mod lir_simplify;
+mod lir_structure;
+mod lir_to_python;
+mod mir_forward;
+mod mir_to_lir;
+
 pub fn lift_text(input: &str, metadata_json: Option<&str>) -> Result<String> {
+    lift_text_with_options(input, metadata_json, LiftOptions::default())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LiftOptions {
+    pub dump_lir: bool,
+}
+
+pub fn lift_text_with_options(
+    input: &str,
+    metadata_json: Option<&str>,
+    options: LiftOptions,
+) -> Result<String> {
     let normalized = normalize_mir_input(input);
     let (functions, interner) = parse_functions(&normalized).map_err(|err| anyhow!("{err}"))?;
     let metadata = metadata_json
@@ -21,9 +47,7 @@ pub fn lift_text(input: &str, metadata_json: Option<&str>) -> Result<String> {
     let units = build_units(&functions, &metadata)?;
 
     let mut out = String::new();
-    out.push_str("import math\n\n\n");
-    out.push_str("def mir_unlifted(text):\n");
-    out.push_str("    return f\"<unlifted:{text}>\"\n\n\n");
+    emit_python_prelude(&mut out);
 
     for (index, unit) in units.iter().enumerate() {
         if index != 0 {
@@ -31,9 +55,31 @@ pub fn lift_text(input: &str, metadata_json: Option<&str>) -> Result<String> {
             out.push('\n');
         }
         let resolver: &dyn Resolver = &interner;
-        emit_unit(&mut out, unit, resolver)?;
+        emit_lir_unit(&mut out, unit, resolver, options)?;
     }
 
+    Ok(out)
+}
+
+pub fn dump_lir_text(input: &str, metadata_json: Option<&str>) -> Result<String> {
+    let normalized = normalize_mir_input(input);
+    let (functions, interner) = parse_functions(&normalized).map_err(|err| anyhow!("{err}"))?;
+    let metadata = metadata_json
+        .map(serde_json::from_str::<CompilationDb>)
+        .transpose()
+        .context("failed to parse compilation metadata JSON")?
+        .unwrap_or_default();
+    let units = build_units(&functions, &metadata)?;
+
+    let mut out = String::new();
+    for (index, unit) in units.iter().enumerate() {
+        if index != 0 {
+            out.push('\n');
+        }
+        let resolver: &dyn Resolver = &interner;
+        let lir = lower_simplified_lir(unit, resolver)?;
+        write!(&mut out, "{lir}")?;
+    }
     Ok(out)
 }
 
@@ -51,13 +97,72 @@ pub fn lift_function_with_returns(
     emit_function_unit(&unit, resolver)
 }
 
+pub fn dump_function_lir_with_returns(
+    function: &Function,
+    return_values: &[Value],
+    resolver: &dyn Resolver,
+) -> Result<String> {
+    let unit = FunctionUnit::whole_with_returns(function, return_values)?;
+    let lir = lower_simplified_lir(&unit, resolver)?;
+    Ok(lir.to_string())
+}
+
 fn emit_function_unit(unit: &FunctionUnit<'_>, resolver: &dyn Resolver) -> Result<String> {
     let mut out = String::new();
+    emit_python_prelude(&mut out);
+    emit_lir_unit(&mut out, unit, resolver, LiftOptions::default())?;
+    Ok(out)
+}
+
+fn emit_lir_unit(
+    out: &mut String,
+    unit: &FunctionUnit<'_>,
+    resolver: &dyn Resolver,
+    options: LiftOptions,
+) -> Result<()> {
+    let timing = timing_enabled();
+    let start = Instant::now();
+    let lir = lower_simplified_lir(unit, resolver)?;
+    log_timing(timing, &unit.name, "lower+simplify", start);
+    if options.dump_lir {
+        eprintln!("{lir}");
+    }
+    let start = Instant::now();
+    out.push_str(&lir_to_python::emit_function(&lir)?);
+    log_timing(timing, &unit.name, "emit-python", start);
+    Ok(())
+}
+
+fn lower_simplified_lir(unit: &FunctionUnit<'_>, resolver: &dyn Resolver) -> Result<lir::Function> {
+    let timing = timing_enabled();
+    let start = Instant::now();
+    let lir = mir_to_lir::lower_unit(unit, resolver)?;
+    log_timing(timing, &unit.name, "mir-to-lir", start);
+    let start = Instant::now();
+    let lir = lir_simplify::simplify(lir);
+    log_timing(timing, &unit.name, "lir-simplify", start);
+    Ok(lir)
+}
+
+fn timing_enabled() -> bool {
+    std::env::var_os("MIR_LIFT_TIMING").is_some()
+}
+
+fn log_timing(enabled: bool, function: &str, stage: &str, start: Instant) {
+    if enabled {
+        eprintln!("mir-lift timing: {function} {stage} {:?}", start.elapsed());
+    }
+}
+
+fn emit_python_prelude(out: &mut String) {
     out.push_str("import math\n\n\n");
+    out.push_str("inf = math.inf\n\n\n");
     out.push_str("def mir_unlifted(text):\n");
     out.push_str("    return f\"<unlifted:{text}>\"\n\n\n");
-    emit_unit(&mut out, unit, resolver)?;
-    Ok(out)
+    out.push_str("def mir_call(name, *args):\n");
+    out.push_str("    if name == \"simparam_opt\" and len(args) >= 2:\n");
+    out.push_str("        return args[1]\n");
+    out.push_str("    return None\n\n\n");
 }
 
 fn normalize_mir_input(input: &str) -> String {
@@ -69,7 +174,8 @@ fn normalize_mir_input(input: &str) -> String {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('@') {
-            let hex_len = rest.chars().take_while(|ch| ch.is_ascii_hexdigit() || *ch == '-').count();
+            let hex_len =
+                rest.chars().take_while(|ch| ch.is_ascii_hexdigit() || *ch == '-').count();
             if hex_len > 0 {
                 let rest = &rest[hex_len..];
                 let rest = rest.trim_start();
@@ -181,7 +287,10 @@ struct ExprAlias {
     arg: Value,
 }
 
-fn build_units<'a>(functions: &'a [Function], metadata: &CompilationDb) -> Result<Vec<FunctionUnit<'a>>> {
+fn build_units<'a>(
+    functions: &'a [Function],
+    metadata: &CompilationDb,
+) -> Result<Vec<FunctionUnit<'a>>> {
     if metadata.functions.is_empty() {
         let mut units = Vec::with_capacity(functions.len());
         let mut used_names = HashSet::new();
@@ -287,10 +396,9 @@ impl<'a> FunctionUnit<'a> {
 
         let mut blocks = Vec::new();
         for raw in &spec.blocks {
-            let block = named_blocks
-                .get(raw)
-                .copied()
-                .with_context(|| format!("metadata references unknown block {raw} in MIR function {}", source.name))?;
+            let block = named_blocks.get(raw).copied().with_context(|| {
+                format!("metadata references unknown block {raw} in MIR function {}", source.name)
+            })?;
             blocks.push(block);
         }
 
@@ -436,11 +544,7 @@ fn emit_unit(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn Resolver)
         out,
         "def {}({}):",
         unit.name,
-        unit.params
-            .iter()
-            .map(|value| value_name(*value))
-            .collect::<Vec<_>>()
-            .join(", ")
+        unit.params.iter().map(|value| value_name(*value)).collect::<Vec<_>>().join(", ")
     )?;
 
     emit_grouped_body(out, unit, resolver)?;
@@ -448,7 +552,11 @@ fn emit_unit(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn Resolver)
     Ok(())
 }
 
-fn emit_grouped_body(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn Resolver) -> Result<()> {
+fn emit_grouped_body(
+    out: &mut String,
+    unit: &FunctionUnit<'_>,
+    resolver: &dyn Resolver,
+) -> Result<()> {
     let groups = build_block_groups(unit);
     let groups_by_id: Vec<&BlockGroup> = groups.iter().collect();
     let group_by_block: HashMap<Block, usize> = groups
@@ -458,15 +566,21 @@ fn emit_grouped_body(out: &mut String, unit: &FunctionUnit<'_>, resolver: &dyn R
     let inlineable = compute_inlineable_groups(unit, &groups, &group_by_block);
     let copy_aliases = compute_copy_aliases(unit);
     let expr_aliases = compute_expr_aliases(unit);
-    let cross_group_values = cross_group_materialized_values(unit, &group_by_block, &copy_aliases, &expr_aliases);
-    let localized_roots = localized_return_roots(unit, &cross_group_values, &copy_aliases, &expr_aliases);
+    let cross_group_values =
+        cross_group_materialized_values(unit, &group_by_block, &copy_aliases, &expr_aliases);
+    let localized_roots =
+        localized_return_roots(unit, &cross_group_values, &copy_aliases, &expr_aliases);
     let state_values = shared_state_values(&cross_group_values);
 
     if !localized_roots.is_empty() {
         writeln!(out, "    _ret = {{}}")?;
     }
 
-    for value in state_values.iter().copied().filter(|value| !matches!(unit.source.dfg.value_def(*value), ValueDef::Param(_))) {
+    for value in state_values
+        .iter()
+        .copied()
+        .filter(|value| !matches!(unit.source.dfg.value_def(*value), ValueDef::Param(_)))
+    {
         writeln!(out, "    {} = None", value_name(value))?;
     }
     if !state_values.is_empty() || !localized_roots.is_empty() {
@@ -569,22 +683,16 @@ fn emit_group_function(
 ) -> Result<()> {
     let state_set: HashSet<Value> = state_values.iter().copied().collect();
     let phi_results = group_phi_results(unit, group.blocks[0]);
-    let params = phi_results
-        .iter()
-        .map(|value| phi_param_name(*value))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let params =
+        phi_results.iter().map(|value| phi_param_name(*value)).collect::<Vec<_>>().join(", ");
     writeln!(out, "    def _fn_{}({params}):", group.id)?;
-    let nonlocals = group_nonlocals(unit, group, groups_by_id, group_by_block, inlineable, state_values);
+    let nonlocals =
+        group_nonlocals(unit, group, groups_by_id, group_by_block, inlineable, state_values);
     if !nonlocals.is_empty() {
         writeln!(
             out,
             "        nonlocal {}",
-            nonlocals
-                .iter()
-                .map(|value| value_name(*value))
-                .collect::<Vec<_>>()
-                .join(", ")
+            nonlocals.iter().map(|value| value_name(*value)).collect::<Vec<_>>().join(", ")
         )?;
     }
     let mut aliases = HashMap::new();
@@ -592,10 +700,25 @@ fn emit_group_function(
         let param = phi_param_name(value);
         if state_set.contains(&value) {
             writeln!(out, "        {} = {}", value_name(value), param)?;
-            maybe_store_localized_root(out, value, &value_name(value), copy_aliases, localized_roots, 2)?;
+            maybe_store_localized_root(
+                out,
+                value,
+                &value_name(value),
+                copy_aliases,
+                localized_roots,
+                2,
+            )?;
         } else {
             aliases.insert(value, param);
-            maybe_store_localized_alias(out, value, copy_aliases, expr_aliases, &aliases, localized_roots, 2)?;
+            maybe_store_localized_alias(
+                out,
+                value,
+                copy_aliases,
+                expr_aliases,
+                &aliases,
+                localized_roots,
+                2,
+            )?;
         }
     }
 
@@ -643,7 +766,8 @@ fn group_nonlocals(
         }
     }
 
-    let mut needed: Vec<Value> = assigned.into_iter().filter(|value| state_values.contains(value)).collect();
+    let mut needed: Vec<Value> =
+        assigned.into_iter().filter(|value| state_values.contains(value)).collect();
     needed.sort_by_key(|value| format!("{value}"));
     needed
 }
@@ -659,8 +783,21 @@ fn cross_group_materialized_values(
         let group = group_by_block[&block];
         for &inst in unit.insts(block) {
             for &arg in unit.source.dfg.insts[inst].arguments(&unit.source.dfg.insts.value_lists) {
-                if crosses_group_boundary(unit, arg, group, group_by_block, copy_aliases, expr_aliases) {
-                    collect_materialized_values(unit.source, arg, copy_aliases, expr_aliases, &mut shared);
+                if crosses_group_boundary(
+                    unit,
+                    arg,
+                    group,
+                    group_by_block,
+                    copy_aliases,
+                    expr_aliases,
+                ) {
+                    collect_materialized_values(
+                        unit.source,
+                        arg,
+                        copy_aliases,
+                        expr_aliases,
+                        &mut shared,
+                    );
                 }
             }
         }
@@ -676,7 +813,14 @@ fn localized_return_roots(
 ) -> HashSet<Value> {
     let mut localized = HashSet::new();
     for &value in &unit.return_values {
-        collect_localized_roots(unit.source, value, cross_group_values, copy_aliases, expr_aliases, &mut localized);
+        collect_localized_roots(
+            unit.source,
+            value,
+            cross_group_values,
+            copy_aliases,
+            expr_aliases,
+            &mut localized,
+        );
     }
     localized
 }
@@ -688,8 +832,7 @@ fn shared_state_values(cross_group_values: &HashSet<Value>) -> Vec<Value> {
 }
 
 fn group_phi_results(unit: &FunctionUnit<'_>, block: Block) -> Vec<Value> {
-    unit
-        .insts(block)
+    unit.insts(block)
         .iter()
         .copied()
         .take_while(|inst| matches!(unit.source.dfg.insts[*inst], InstructionData::PhiNode(_)))
@@ -752,7 +895,9 @@ fn compute_inlineable_groups(
             continue;
         }
         let caller = *caller_groups[group.id].iter().next().unwrap();
-        if group_reaches(group.id, caller, &succs) || group_reaches_successor(group.id, group.id, &succs) {
+        if group_reaches(group.id, caller, &succs)
+            || group_reaches_successor(group.id, group.id, &succs)
+        {
             continue;
         }
         inlineable.insert(group.id);
@@ -788,7 +933,8 @@ fn group_has_internal_cycle(
         if let Some(inst) = unit.source.layout.block_terminator(block) {
             match unit.source.dfg.insts[inst] {
                 InstructionData::Jump { destination } => {
-                    if unit.contains_block(destination) && group_by_block[&destination] == group_id {
+                    if unit.contains_block(destination) && group_by_block[&destination] == group_id
+                    {
                         if visit(unit, group_id, destination, group_by_block, marks) {
                             return true;
                         }
@@ -796,7 +942,9 @@ fn group_has_internal_cycle(
                 }
                 InstructionData::Branch { then_dst, else_dst, .. } => {
                     for destination in [then_dst, else_dst] {
-                        if unit.contains_block(destination) && group_by_block[&destination] == group_id {
+                        if unit.contains_block(destination)
+                            && group_by_block[&destination] == group_id
+                        {
                             if visit(unit, group_id, destination, group_by_block, marks) {
                                 return true;
                             }
@@ -951,11 +1099,7 @@ fn emit_group_block(
         )?;
     }
 
-    match unit
-        .source
-        .layout
-        .block_terminator(block)
-        .map(|inst| unit.source.dfg.insts[inst].clone())
+    match unit.source.layout.block_terminator(block).map(|inst| unit.source.dfg.insts[inst].clone())
     {
         Some(InstructionData::Jump { destination }) if unit.contains_block(destination) => {
             if group_by_block[&destination] == group.id {
@@ -1136,23 +1280,19 @@ fn transition_to_group(
             let InstructionData::PhiNode(phi) = &unit.source.dfg.insts[inst] else {
                 return None;
             };
-            unit.source
-                .dfg
-                .phi_edge_val(phi, pred)
-                .map(|value| {
-                    value_expr(
-                        unit.source,
-                        value,
-                        resolver,
-                        copy_aliases,
-                        expr_aliases,
-                        localized_roots,
-                        aliases,
-                    )
-                })
+            unit.source.dfg.phi_edge_val(phi, pred).map(|value| {
+                value_expr(
+                    unit.source,
+                    value,
+                    resolver,
+                    copy_aliases,
+                    expr_aliases,
+                    localized_roots,
+                    aliases,
+                )
+            })
         })
-        .collect::<Vec<_>>()
-        ;
+        .collect::<Vec<_>>();
     let destination_group = group_by_block[&destination];
     if inlineable.contains(&destination_group) {
         debug_assert!(
@@ -1160,13 +1300,29 @@ fn transition_to_group(
             "inlineable group {} unexpectedly requires fallback emission",
             destination_group
         );
-        for (result, arg) in group_phi_results(unit, destination).into_iter().zip(args.into_iter()) {
+        for (result, arg) in group_phi_results(unit, destination).into_iter().zip(args.into_iter())
+        {
             if state_set.contains(&result) {
                 writeln!(out, "{}{} = {}", pad(indent), value_name(result), arg)?;
-                maybe_store_localized_root(out, result, arg.as_str(), copy_aliases, localized_roots, indent)?;
+                maybe_store_localized_root(
+                    out,
+                    result,
+                    arg.as_str(),
+                    copy_aliases,
+                    localized_roots,
+                    indent,
+                )?;
             } else {
                 aliases.insert(result, arg);
-                maybe_store_localized_alias(out, result, copy_aliases, expr_aliases, aliases, localized_roots, indent)?;
+                maybe_store_localized_alias(
+                    out,
+                    result,
+                    copy_aliases,
+                    expr_aliases,
+                    aliases,
+                    localized_roots,
+                    indent,
+                )?;
             }
         }
         return emit_group_block(
@@ -1188,13 +1344,7 @@ fn transition_to_group(
         );
     }
     let args = args.join(", ");
-    writeln!(
-        out,
-        "{}return _fn_{}({})",
-        pad(indent),
-        destination_group,
-        args
-    )?;
+    writeln!(out, "{}return _fn_{}({})", pad(indent), destination_group, args)?;
     Ok(())
 }
 
@@ -1238,10 +1388,25 @@ fn emit_inst(
                     || can_inline_expr_alias(&data, &expr))
             {
                 aliases.insert(results[0], expr);
-                maybe_store_localized_alias(out, results[0], copy_aliases, expr_aliases, aliases, localized_roots, indent)?;
+                maybe_store_localized_alias(
+                    out,
+                    results[0],
+                    copy_aliases,
+                    expr_aliases,
+                    aliases,
+                    localized_roots,
+                    indent,
+                )?;
             } else {
                 writeln!(out, "{}{} = {}", pad(indent), value_name(results[0]), expr)?;
-                maybe_store_localized_root(out, results[0], &value_name(results[0]), copy_aliases, localized_roots, indent)?;
+                maybe_store_localized_root(
+                    out,
+                    results[0],
+                    &value_name(results[0]),
+                    copy_aliases,
+                    localized_roots,
+                    indent,
+                )?;
             }
         }
         Some(expr) if results.is_empty() => {
@@ -1286,12 +1451,36 @@ fn lift_inst(
 ) -> Option<String> {
     match data {
         InstructionData::Unary { opcode, arg } => {
-            let arg = value_expr(function, *arg, resolver, copy_aliases, expr_aliases, localized_roots, aliases);
+            let arg = value_expr(
+                function,
+                *arg,
+                resolver,
+                copy_aliases,
+                expr_aliases,
+                localized_roots,
+                aliases,
+            );
             unary_expr(*opcode, arg)
         }
         InstructionData::Binary { opcode, args } => {
-            let lhs = value_expr(function, args[0], resolver, copy_aliases, expr_aliases, localized_roots, aliases);
-            let rhs = value_expr(function, args[1], resolver, copy_aliases, expr_aliases, localized_roots, aliases);
+            let lhs = value_expr(
+                function,
+                args[0],
+                resolver,
+                copy_aliases,
+                expr_aliases,
+                localized_roots,
+                aliases,
+            );
+            let rhs = value_expr(
+                function,
+                args[1],
+                resolver,
+                copy_aliases,
+                expr_aliases,
+                localized_roots,
+                aliases,
+            );
             binary_expr(*opcode, lhs, rhs)
         }
         InstructionData::Call { func_ref, args } => {
@@ -1314,7 +1503,9 @@ fn lift_inst(
                 .join(", ");
             Some(format!("{target}({args})"))
         }
-        InstructionData::Jump { .. } | InstructionData::Branch { .. } | InstructionData::PhiNode(_) => None,
+        InstructionData::Jump { .. }
+        | InstructionData::Branch { .. }
+        | InstructionData::PhiNode(_) => None,
         InstructionData::Exit => {
             let _ = inst;
             None
@@ -1441,7 +1632,15 @@ fn return_value_expr(
         return alias.clone();
     }
     if let Some(alias) = expr_aliases.get(&value) {
-        let arg = return_value_expr(function, alias.arg, resolver, copy_aliases, expr_aliases, localized_roots, aliases);
+        let arg = return_value_expr(
+            function,
+            alias.arg,
+            resolver,
+            copy_aliases,
+            expr_aliases,
+            localized_roots,
+            aliases,
+        );
         return unary_expr(alias.opcode, arg).unwrap_or_else(|| value_name(value));
     }
     value_expr_no_alias(function, value, resolver)
@@ -1470,7 +1669,15 @@ fn value_expr(
     }
     let value = canonical_value(value, copy_aliases);
     if let Some(alias) = expr_aliases.get(&value) {
-        let arg = value_expr(function, alias.arg, resolver, copy_aliases, expr_aliases, localized_roots, aliases);
+        let arg = value_expr(
+            function,
+            alias.arg,
+            resolver,
+            copy_aliases,
+            expr_aliases,
+            localized_roots,
+            aliases,
+        );
         return unary_expr(alias.opcode, arg).unwrap_or_else(|| value_name(value));
     }
     let _ = localized_roots;
@@ -1579,7 +1786,14 @@ fn crosses_group_boundary(
 ) -> bool {
     let value = canonical_value(value, copy_aliases);
     if let Some(alias) = expr_aliases.get(&value) {
-        return crosses_group_boundary(unit, alias.arg, group, group_by_block, copy_aliases, expr_aliases);
+        return crosses_group_boundary(
+            unit,
+            alias.arg,
+            group,
+            group_by_block,
+            copy_aliases,
+            expr_aliases,
+        );
     }
     let ValueDef::Result(def_inst, _) = unit.source.dfg.value_def(value) else {
         return false;
@@ -1620,7 +1834,14 @@ fn collect_localized_roots(
 ) {
     let value = canonical_value(value, copy_aliases);
     if let Some(alias) = expr_aliases.get(&value) {
-        collect_localized_roots(function, alias.arg, cross_group_values, copy_aliases, expr_aliases, out);
+        collect_localized_roots(
+            function,
+            alias.arg,
+            cross_group_values,
+            copy_aliases,
+            expr_aliases,
+            out,
+        );
         return;
     }
     match function.dfg.value_def(value) {
@@ -1692,8 +1913,7 @@ fn can_inline_expr_alias(data: &InstructionData, expr: &str) -> bool {
     matches!(
         data,
         InstructionData::Unary {
-            opcode:
-                Opcode::Inot
+            opcode: Opcode::Inot
                 | Opcode::Bnot
                 | Opcode::Fneg
                 | Opcode::Ineg
@@ -1759,12 +1979,17 @@ mod tests {
         let input = include_str!("../../test_data/mir/case.mir");
         let lifted = lift_text(input, None).unwrap();
         assert!(lifted.contains("def lifted("));
-        assert!(lifted.contains("def _fn_0("));
-        assert!(lifted.contains("_fn_0()"));
+        assert!(!lifted.contains("while True:"));
+        assert!(!lifted.contains("_pc"));
+        assert!(!lifted.contains(" = None\n"));
+        assert!(!lifted.contains("nonlocal "));
+        assert!(lifted.contains("def _lifted_bb_"));
         assert!(lifted.contains("math.sin"));
+        assert!(!lifted.contains("phi_v19_from_block2"));
         assert!(!lifted.contains("v36 = v35"));
-        assert!(lifted.contains(r#"_ret["v19"] = phi_v19"#));
-        assert!(lifted.contains(r#""v36": _ret["v35"]"#));
+        assert!(lifted.contains("if (v16) < (0):"));
+        assert!(lifted.contains("v31 = (float(v16)) / (3.141)"));
+        assert!(lifted.contains(r#""v36": v36"#));
     }
 
     #[test]
@@ -1778,5 +2003,14 @@ mod tests {
         let lifted = lift_text(input, Some(metadata)).unwrap();
         assert!(lifted.contains("def piece("));
         assert!(lifted.contains("def piece(v16, v20):"));
+    }
+
+    #[test]
+    fn dumps_lir_text() {
+        let input = include_str!("../../test_data/mir/case.mir");
+        let dumped = super::dump_lir_text(input, None).unwrap();
+        assert!(dumped.contains("fn lifted("));
+        assert!(dumped.contains("bb0:"));
+        assert!(dumped.contains("return {"));
     }
 }
