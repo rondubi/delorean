@@ -18,6 +18,13 @@ pub(crate) fn run_backward_passes(
     structured: &mut StructuredFunction,
 ) -> BackwardFacts {
     let mut facts = BackwardFacts::default();
+    if std::env::var_os("MIR_LIFT_DISABLE_LIR_OPTS").is_some() {
+        let mut pass = Box::<HelperLiveIns>::default();
+        let mut cx = BackwardPassCx { function, structured, facts: &mut facts };
+        pass.run(&mut cx);
+        return facts;
+    }
+
     for _ in 0..CLEANUP_ROUNDS {
         let mut passes: Vec<Box<dyn BackwardLirPass>> = vec![
             Box::<HelperForwarding>::default(),

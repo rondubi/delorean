@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import ctypes
 import importlib.util
-import json
 import math
 import os
 import random
@@ -123,17 +122,15 @@ def main() -> int:
     work.mkdir(parents=True, exist_ok=True)
     osdi = work / f"{module}.osdi"
     py = work / f"{module}.py"
-    metadata = Path(f"{py}.compile.json")
 
     compile_osdi(root, verilog, osdi)
     lift_python(root, verilog, py)
 
-    osdi_results = run_osdi(osdi, args.cases)
-    python_results = run_python(py, module, args.cases, metadata)
+    osdi_results, python_cases = run_osdi(osdi, args.cases)
+    python_results = run_python(py, module, python_cases)
 
     print(f"osdi: {osdi}")
     print(f"python: {py}")
-    print(f"metadata: {metadata}")
     print(f"osdi cases: {len(osdi_results)}")
     print(f"python calls: {len(python_results)}")
 
@@ -150,7 +147,7 @@ def main() -> int:
     return 0
 
 
-def run_osdi(path: Path, cases: int) -> list[dict[str, object]]:
+def run_osdi(path: Path, cases: int) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     lib = ctypes.CDLL(str(path))
     patch_osdi_log(lib)
     patch_lim_table(lib)
@@ -182,10 +179,22 @@ def run_osdi(path: Path, cases: int) -> list[dict[str, object]]:
     prev_state = (ctypes.c_double * max(1, desc.num_states))()
     next_state = (ctypes.c_double * max(1, desc.num_states))()
     out = []
+    python_cases = []
     for _ in range(cases):
         for i in range(nsolve):
             solve[i] = random.uniform(-1.0, 1.0)
-        info = OsdiSimInfo(sim_paras, 0.0, solve, prev_state, next_state, 2048 | 4 | 8 | 64 | 128 | 512)
+        flags = 2048 | 4 | 8 | 64 | 128 | 512
+        case = {
+            "abstime": 0.0,
+            "prev_solve": list(solve),
+            "prev_state": list(prev_state),
+            "next_state": list(next_state),
+            "flags": flags,
+            "connected_terminals": int(desc.num_terminals),
+            "num_terminals": int(desc.num_terminals),
+        }
+        python_cases.append(case)
+        info = OsdiSimInfo(sim_paras, case["abstime"], solve, prev_state, next_state, flags)
         flags = desc.eval(handle_ptr, ctypes.byref(inst), ctypes.byref(model), ctypes.byref(info))
         residual_len = max(1, desc.num_nodes)
         jacobian_len = max(1, desc.num_jacobian_entries)
@@ -212,32 +221,24 @@ def run_osdi(path: Path, cases: int) -> list[dict[str, object]]:
                 "jacobian_react": list(jacobian_react),
             }
         )
-    return out
+    return out, python_cases
 
 
-def run_python(path: Path, module: str, cases: int, metadata: Path) -> list[object]:
+def run_python(path: Path, module: str, cases: list[dict[str, object]]) -> list[object]:
     spec = importlib.util.spec_from_file_location("lifted", path)
     if spec is None or spec.loader is None:
         raise SystemExit(f"cannot load {path}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    if not metadata.exists():
-        raise SystemExit(f"missing lift metadata: {metadata}")
-    return run_python_with_metadata(mod, metadata, cases)
-
-
-def run_python_with_metadata(mod: object, metadata: Path, cases: int) -> list[dict[str, object]]:
-    db = json.loads(metadata.read_text())
-    if not db.get("modules"):
-        raise SystemExit(f"metadata has no modules: {metadata}")
-    eval_meta = db["modules"][0]["eval"]
-    func = getattr(mod, eval_meta["function"])
-    params = eval_meta["params"]
-    outputs = eval_meta["outputs"]
+    func = getattr(mod, f"{module}_eval")
+    setup_model = getattr(mod, f"{module}_setup_model")
+    setup_instance = getattr(mod, f"{module}_setup_instance")
+    model = setup_model()
+    instance = setup_instance(model, 300.0)
     out = []
-    for _ in range(cases):
+    for case in cases:
         try:
-            result = func(*[0.5 for _ in params])
+            result = func(instance, model, case)
         except Exception as err:
             last = traceback.extract_tb(err.__traceback__)[-1]
             raise SystemExit(
@@ -245,16 +246,33 @@ def run_python_with_metadata(mod: object, metadata: Path, cases: int) -> list[di
             ) from None
         if result is None:
             result = {}
-        out.append(
-            {
-                "flags": 0,
-                **{
-                    name: [0.0 if value is None else result.get(value, 0.0) for value in values]
-                    for name, values in outputs.items()
-                },
-            }
-        )
+        if not isinstance(result, dict):
+            raise SystemExit(f"lifted Python eval returned {type(result).__name__}, expected dict")
+        none_paths = find_none_values(result)
+        if none_paths:
+            raise SystemExit(
+                "lifted Python returned None at ABI output path(s): "
+                + ", ".join(none_paths[:16])
+                + (" ..." if len(none_paths) > 16 else "")
+            )
+        out.append(result)
     return out
+
+
+def find_none_values(value: object, prefix: str = "") -> list[str]:
+    if value is None:
+        return [prefix or "<root>"]
+    if isinstance(value, dict):
+        out = []
+        for key, item in value.items():
+            out.extend(find_none_values(item, f"{prefix}.{key}" if prefix else str(key)))
+        return out
+    if isinstance(value, list):
+        out = []
+        for idx, item in enumerate(value):
+            out.extend(find_none_values(item, f"{prefix}[{idx}]"))
+        return out
+    return []
 
 
 def patch_osdi_log(lib: ctypes.CDLL) -> None:

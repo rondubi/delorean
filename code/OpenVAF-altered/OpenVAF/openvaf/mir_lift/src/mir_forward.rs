@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use mir::{Block, Inst, InstructionData, Opcode, Value};
+use mir::{Block, Inst, InstructionData, Opcode, Param, Value, ValueDef};
 
 use crate::FunctionUnit;
 
@@ -29,6 +29,7 @@ pub(crate) fn run_forward_passes(unit: &FunctionUnit<'_>) -> ForwardFacts {
 }
 
 pub(crate) trait ForwardMirPass {
+    fn visit_param(&mut self, _cx: &mut ForwardPassCx<'_>, _param: Param, _value: Value) {}
     fn visit_phi_result(&mut self, _cx: &mut ForwardPassCx<'_>, _block: Block, _result: Value) {}
     fn visit_inst(
         &mut self,
@@ -121,6 +122,11 @@ impl ForwardPassCx<'_> {
 }
 
 fn run_forward_pass(cx: &mut ForwardPassCx<'_>, pass: &mut dyn ForwardMirPass) {
+    for &value in &cx.unit.params {
+        if let ValueDef::Param(param) = cx.unit.source.dfg.value_def(value) {
+            pass.visit_param(cx, param, value);
+        }
+    }
     for &block in &cx.unit.blocks {
         for &inst in cx.unit.insts(block) {
             let data = &cx.unit.source.dfg.insts[inst];
@@ -134,6 +140,26 @@ fn run_forward_pass(cx: &mut ForwardPassCx<'_>, pass: &mut dyn ForwardMirPass) {
         }
     }
     pass.finish(cx);
+}
+
+pub(crate) fn collect_live_param_refs(unit: &FunctionUnit<'_>) -> Vec<Param> {
+    let mut cx = ForwardPassCx { unit, facts: ForwardFacts::default() };
+    let mut pass = LiveParamRefs::default();
+    run_forward_pass(&mut cx, &mut pass);
+    pass.params
+}
+
+#[derive(Default)]
+struct LiveParamRefs {
+    params: Vec<Param>,
+}
+
+impl ForwardMirPass for LiveParamRefs {
+    fn visit_param(&mut self, cx: &mut ForwardPassCx<'_>, param: Param, value: Value) {
+        if cx.use_count_in_unit(value) != 0 {
+            self.params.push(param);
+        }
+    }
 }
 
 struct CopyAndInlineValues;

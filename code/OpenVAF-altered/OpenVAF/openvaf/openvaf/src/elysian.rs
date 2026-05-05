@@ -1,9 +1,9 @@
 // NOTE: pun on "elision", named after an excellent beer brand from Seattle
-use std::collections::HashMap;
-use std::io::{self, BufRead};
-use std::fs::File;
-use camino::Utf8PathBuf;
 use basedb::{CliParamDefault, CliParamDefaultValue};
+use camino::Utf8PathBuf;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, BufRead};
 use syntax::name::Name;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -26,7 +26,7 @@ pub fn parse_file(path: &Utf8PathBuf) -> io::Result<HashMap<String, NumericValue
     for (i, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
@@ -55,13 +55,10 @@ pub fn parse_file(path: &Utf8PathBuf) -> io::Result<HashMap<String, NumericValue
         map.insert(var, value);
     }
 
-
     Ok(map)
 }
 
-pub fn to_cli_defaults(
-    params: &HashMap<String, NumericValue>,
-) -> Vec<CliParamDefault> {
+pub fn to_cli_defaults(params: &HashMap<String, NumericValue>) -> Vec<CliParamDefault> {
     params
         .iter()
         .map(|(name, value)| {
@@ -73,4 +70,3 @@ pub fn to_cli_defaults(
         })
         .collect()
 }
-

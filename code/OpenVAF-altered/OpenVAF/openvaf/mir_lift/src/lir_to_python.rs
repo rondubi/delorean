@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use crate::lir::{
     BinaryOp, ConstValue, Expr, Function, Label, LocalId, MathBinary, MathUnary, Stmt, UnaryOp,
@@ -37,9 +37,21 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
         writeln!(out)?;
     }
 
-    writeln!(out, "def {}({}):", function_name, names.params(function))?;
+    let entry_name = entry_helper_name(&function_name);
+    writeln!(out, "def {}({}):", entry_name, names.params(function))?;
     let mut defined = function.params.iter().copied().collect::<HashSet<_>>();
     emit_structured_body(&mut out, &structured.body, &cx, 1, &mut defined)?;
+    writeln!(out)?;
+
+    writeln!(out, "def {}({}):", function_name, names.params(function))?;
+    writeln!(out, "    _lir_target = {}", entry_name)?;
+    writeln!(out, "    _lir_args = {}", params_tuple(names.params(function)))?;
+    writeln!(out, "    while True:")?;
+    writeln!(out, "        _lir_result = _lir_target(*_lir_args)")?;
+    writeln!(out, "        if _lir_result[0] == \"return\":")?;
+    writeln!(out, "            return _lir_result[1]")?;
+    writeln!(out, "        _lir_target = _lir_result[1]")?;
+    writeln!(out, "        _lir_args = _lir_result[2]")?;
 
     Ok(out)
 }
@@ -47,27 +59,20 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
 fn emit_stmt(out: &mut String, stmt: &Stmt, names: &NameTable, indent: usize) -> Result<()> {
     match stmt {
         Stmt::Assign { dst, value } => {
-            writeln!(out, "{}{} = {}", pad(indent), names.local(*dst), expr(value, names))?;
+            writeln!(out, "{}{} = {}", pad(indent), names.local(*dst), expr(value, names)?)?;
         }
         Stmt::Expr(value) => {
-            writeln!(out, "{}{}", pad(indent), expr(value, names))?;
+            writeln!(out, "{}{}", pad(indent), expr(value, names)?)?;
         }
-        Stmt::Unsupported { dsts, text } if dsts.is_empty() => {
-            writeln!(out, "{}mir_unlifted({text:?})", pad(indent))?;
-        }
-        Stmt::Unsupported { dsts, text } if dsts.len() == 1 => {
-            writeln!(out, "{}{} = mir_unlifted({text:?})", pad(indent), names.local(dsts[0]))?;
-        }
-        Stmt::Unsupported { dsts, text } => {
-            let lhs = dsts.iter().map(|dst| names.local(*dst)).collect::<Vec<_>>().join(", ");
-            writeln!(out, "{}{} = mir_unlifted({text:?})", pad(indent), lhs)?;
+        Stmt::Unsupported { text, .. } => {
+            bail!("unsupported LIR statement: {text}");
         }
     }
     Ok(())
 }
 
-fn expr(value: &Expr, names: &NameTable) -> String {
-    match value {
+fn expr(value: &Expr, names: &NameTable) -> Result<String> {
+    Ok(match value {
         Expr::Local(local) => names.local(*local),
         Expr::Const(ConstValue::Bool(true)) => "True".to_owned(),
         Expr::Const(ConstValue::Bool(false)) => "False".to_owned(),
@@ -75,18 +80,19 @@ fn expr(value: &Expr, names: &NameTable) -> String {
         Expr::Const(ConstValue::Real(value)) => value.to_string(),
         Expr::Const(ConstValue::Str(value)) => format!("{value:?}"),
         Expr::Const(ConstValue::None) => "None".to_owned(),
-        Expr::Unary { op, arg } => unary_expr(*op, expr(arg, names)),
-        Expr::Binary { op, lhs, rhs } => binary_expr(*op, expr(lhs, names), expr(rhs, names)),
+        Expr::Unary { op, arg } => unary_expr(*op, expr(arg, names)?),
+        Expr::Binary { op, lhs, rhs } => binary_expr(*op, expr(lhs, names)?, expr(rhs, names)?),
         Expr::Call { target, args } => {
-            let args = args.iter().map(|arg| expr(arg, names)).collect::<Vec<_>>().join(", ");
+            let args =
+                args.iter().map(|arg| expr(arg, names)).collect::<Result<Vec<_>>>()?.join(", ");
             if args.is_empty() {
                 format!("mir_call({target:?})")
             } else {
                 format!("mir_call({target:?}, {args})")
             }
         }
-        Expr::Unsupported { text, .. } => format!("mir_unlifted({text:?})"),
-    }
+        Expr::Unsupported { text, .. } => bail!("unsupported LIR expression: {text}"),
+    })
 }
 
 fn emit_structured_body(
@@ -97,7 +103,7 @@ fn emit_structured_body(
     defined: &mut HashSet<LocalId>,
 ) -> Result<()> {
     if body.is_empty() {
-        writeln!(out, "{}pass", pad(indent))?;
+        writeln!(out, "{}raise RuntimeError(\"empty LIR body\")", pad(indent))?;
         return Ok(());
     }
 
@@ -120,7 +126,7 @@ fn emit_structured_stmt(
             mark_stmt_defs(stmt, defined);
         }
         StructuredStmt::If { cond, then_body, else_body } => {
-            writeln!(out, "{}if {}:", pad(indent), expr(cond, cx.names))?;
+            writeln!(out, "{}if {}:", pad(indent), expr(cond, cx.names)?)?;
             let mut then_defined = defined.clone();
             emit_structured_body(out, then_body, cx, indent + 1, &mut then_defined)?;
             writeln!(out, "{}else:", pad(indent))?;
@@ -130,24 +136,10 @@ fn emit_structured_stmt(
             *defined = then_defined;
         }
         StructuredStmt::CallHelper(label) => {
-            let args =
-                cx.helper_params
-                    .get(label)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|arg| {
-                        if defined.contains(&arg) {
-                            cx.names.local(arg)
-                        } else {
-                            "None".to_owned()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            let args = helper_args_tuple(*label, cx, defined);
             writeln!(
                 out,
-                "{}return {}({args})",
+                "{}return (\"call\", {}, {args})",
                 pad(indent),
                 helper_name(cx.helper_prefix, *label)
             )?;
@@ -157,18 +149,44 @@ fn emit_structured_stmt(
                 .iter()
                 .map(|value| match value {
                     crate::lir::ReturnValue::Named { key, value } => {
-                        format!("{key:?}: {}", expr(value, cx.names))
+                        Ok(format!("{key:?}: {}", expr(value, cx.names)?))
                     }
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>>>()?
                 .join(", ");
-            writeln!(out, "{}return {{{entries}}}", pad(indent))?;
+            writeln!(out, "{}return (\"return\", {{{entries}}})", pad(indent))?;
         }
         StructuredStmt::Raise(message) => {
             writeln!(out, "{}raise RuntimeError({message:?})", pad(indent))?;
         }
     }
     Ok(())
+}
+
+fn helper_args_tuple(label: Label, cx: &EmitCx<'_>, defined: &HashSet<LocalId>) -> String {
+    let args = cx
+        .helper_params
+        .get(&label)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|arg| if defined.contains(&arg) { cx.names.local(arg) } else { "None".to_owned() })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if args.is_empty() {
+        "()".to_owned()
+    } else {
+        format!("({args},)")
+    }
+}
+
+fn params_tuple(params: String) -> String {
+    if params.is_empty() {
+        "()".to_owned()
+    } else {
+        format!("({params},)")
+    }
 }
 
 fn mark_stmt_defs(stmt: &Stmt, defined: &mut HashSet<LocalId>) {
@@ -285,6 +303,10 @@ impl NameTable {
 
 fn helper_name(function_name: &str, label: Label) -> String {
     format!("_{function_name}_bb_{}", label.0)
+}
+
+fn entry_helper_name(function_name: &str) -> String {
+    format!("_{function_name}_entry")
 }
 
 fn sanitize_ident(name: &str) -> String {

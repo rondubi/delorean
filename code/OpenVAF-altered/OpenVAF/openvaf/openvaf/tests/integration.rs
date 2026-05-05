@@ -6,7 +6,7 @@ use expect_test::expect_file;
 use float_cmp::assert_approx_eq;
 use llvm::OptLevel;
 use mini_harness::{harness, Result};
-use openvaf::{CompilationDestination, CompilationTermination};
+use openvaf::{CodegenBackend, CompilationDestination, CompilationTermination};
 use stdx::{ignore_dev_tests, openvaf_test_data, project_root};
 use target::spec::Target;
 
@@ -27,11 +27,15 @@ fn compile_and_load(root_file: &Utf8Path) -> &'static OsdiDescriptor {
         opt_lvl: OptLevel::Aggressive,
         target: Target::host_target().unwrap(),
         target_cpu: "native".to_owned(),
+        backend: CodegenBackend::Llvm,
         dry_run: false,
-        dump_mir: false, 
-        dump_unopt_mir: false, 
-        dump_ir: false, 
-        dump_unopt_ir: false, 
+        dump_mir: false,
+        dump_unopt_mir: false,
+        dump_ir: false,
+        dump_unopt_ir: false,
+        dump_lir: false,
+        params_to_leave: Vec::new(),
+        param_defaults: Vec::new(),
     };
 
     let res = openvaf::compile(&openvaf_opts).unwrap();

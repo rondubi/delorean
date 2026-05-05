@@ -107,6 +107,11 @@ pub fn dump_function_lir_with_returns(
     Ok(lir.to_string())
 }
 
+pub fn collect_live_param_refs_forward(function: &Function) -> Result<Vec<Param>> {
+    let unit = FunctionUnit::whole(function)?;
+    Ok(mir_forward::collect_live_param_refs(&unit))
+}
+
 fn emit_function_unit(unit: &FunctionUnit<'_>, resolver: &dyn Resolver) -> Result<String> {
     let mut out = String::new();
     emit_python_prelude(&mut out);
@@ -157,12 +162,12 @@ fn log_timing(enabled: bool, function: &str, stage: &str, start: Instant) {
 fn emit_python_prelude(out: &mut String) {
     out.push_str("import math\n\n\n");
     out.push_str("inf = math.inf\n\n\n");
-    out.push_str("def mir_unlifted(text):\n");
-    out.push_str("    return f\"<unlifted:{text}>\"\n\n\n");
     out.push_str("def mir_call(name, *args):\n");
     out.push_str("    if name == \"simparam_opt\" and len(args) >= 2:\n");
     out.push_str("        return args[1]\n");
-    out.push_str("    return None\n\n\n");
+    out.push_str("    if name.startswith(\"Display\"):\n");
+    out.push_str("        return None\n");
+    out.push_str("    raise RuntimeError(f\"unimplemented MIR call {name!r}\")\n\n\n");
 }
 
 fn normalize_mir_input(input: &str) -> String {
@@ -375,6 +380,7 @@ impl<'a> FunctionUnit<'a> {
         let insts_by_block = build_insts_by_block(source, &blocks);
         let preds_by_block = build_preds_by_block(source, &blocks, &block_set);
         let params = collect_function_params(source);
+        let return_values = live_return_values(source, &blocks, return_values);
         Ok(Self {
             name,
             source,
@@ -384,7 +390,7 @@ impl<'a> FunctionUnit<'a> {
             insts_by_block,
             entry,
             params,
-            return_values: dedup_values(return_values),
+            return_values,
         })
     }
 
@@ -446,6 +452,17 @@ fn dedup_values(values: &[Value]) -> Vec<Value> {
         }
     }
     out
+}
+
+fn live_return_values(function: &Function, blocks: &[Block], values: &[Value]) -> Vec<Value> {
+    let insts =
+        blocks.iter().flat_map(|block| function.layout.block_insts(*block)).collect::<HashSet<_>>();
+    let values = values.iter().copied().filter(|value| match function.dfg.value_def(*value) {
+        ValueDef::Param(_) | ValueDef::Const(_) => true,
+        ValueDef::Result(inst, _) => insts.contains(&inst),
+        ValueDef::Invalid => false,
+    });
+    dedup_values(&values.collect::<Vec<_>>())
 }
 
 fn build_insts_by_block(function: &Function, blocks: &[Block]) -> HashMap<Block, Vec<Inst>> {
@@ -1979,8 +1996,9 @@ mod tests {
         let input = include_str!("../../test_data/mir/case.mir");
         let lifted = lift_text(input, None).unwrap();
         assert!(lifted.contains("def lifted("));
-        assert!(!lifted.contains("while True:"));
         assert!(!lifted.contains("_pc"));
+        assert!(lifted.contains("_lir_target = _lifted_entry"));
+        assert!(lifted.contains("_lir_target = _lir_result[1]"));
         assert!(!lifted.contains(" = None\n"));
         assert!(!lifted.contains("nonlocal "));
         assert!(lifted.contains("def _lifted_bb_"));

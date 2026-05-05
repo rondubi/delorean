@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use lasso::Resolver;
 use mir::{Block, Const, FuncRef, Function, Inst, InstructionData, Opcode, Value, ValueDef};
 
@@ -75,7 +75,7 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             .collect();
 
         for &block in &self.unit.blocks {
-            self.lower_block(block);
+            self.lower_block(block)?;
         }
 
         Ok(crate::lir::Function {
@@ -88,23 +88,17 @@ impl<'a, 'r> LowerCx<'a, 'r> {
         })
     }
 
-    fn lower_block(&mut self, block: Block) {
+    fn lower_block(&mut self, block: Block) -> Result<()> {
         let mut stmts = Vec::new();
         for &inst in self.unit.insts(block) {
             let data = self.unit.source.dfg.insts[inst].clone();
             if data.is_phi() || data.is_terminator() {
                 continue;
             }
-            self.lower_inst(inst, data, &mut stmts);
+            self.lower_inst(inst, data, &mut stmts)?;
         }
 
-        let term = match self
-            .unit
-            .source
-            .layout
-            .block_terminator(block)
-            .map(|inst| self.unit.source.dfg.insts[inst].clone())
-        {
+        let term = match self.real_block_terminator(block) {
             Some(InstructionData::Jump { destination })
                 if self.unit.contains_block(destination) =>
             {
@@ -121,24 +115,38 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             }
             Some(InstructionData::Exit) | None => Terminator::Return(self.return_values()),
             Some(other) => {
-                stmts.push(Stmt::Unsupported { dsts: Vec::new(), text: format!("{other:?}") });
-                Terminator::Return(self.return_values())
+                bail!("unsupported MIR terminator in {}: {other:?}", self.unit.name);
             }
         };
 
         self.blocks.push(crate::lir::Block { label: self.labels_by_block[&block], stmts, term });
+        Ok(())
     }
 
-    fn lower_inst(&mut self, inst: Inst, data: InstructionData, stmts: &mut Vec<Stmt>) {
+    fn real_block_terminator(&self, block: Block) -> Option<InstructionData> {
+        self.unit
+            .insts(block)
+            .iter()
+            .rev()
+            .map(|inst| self.unit.source.dfg.insts[*inst].clone())
+            .find(|data| data.is_terminator())
+    }
+
+    fn lower_inst(
+        &mut self,
+        inst: Inst,
+        data: InstructionData,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<()> {
         let rendered = self.unit.source.dfg.display_inst(inst).to_string();
         let results = self.unit.source.dfg.inst_results(inst).to_vec();
         if results.len() == 1 {
             if self.facts.aliases.exprs.contains_key(&results[0]) {
-                return;
+                return Ok(());
             }
             if let Some(source) = direct_copy_source(&data) {
                 if self.canonical_value(source) == self.canonical_value(results[0]) {
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -151,17 +159,16 @@ impl<'a, 'r> LowerCx<'a, 'r> {
                 stmts.push(Stmt::Expr(expr));
             }
             Some(expr) => {
-                let dsts = results.iter().map(|value| self.local_for_value(*value)).collect();
-                stmts.push(Stmt::Unsupported {
-                    dsts,
-                    text: format!("{rendered} lowered to multi-result expression {expr:?}"),
-                });
+                bail!(
+                    "unsupported multi-result MIR instruction in {}: {rendered} lowered to {expr:?}",
+                    self.unit.name
+                );
             }
             None => {
-                let dsts = results.iter().map(|value| self.local_for_value(*value)).collect();
-                stmts.push(Stmt::Unsupported { dsts, text: rendered });
+                bail!("unsupported MIR instruction in {}: {rendered}", self.unit.name);
             }
         }
+        Ok(())
     }
 
     fn expr_for_inst(&mut self, data: &InstructionData) -> Option<Expr> {
