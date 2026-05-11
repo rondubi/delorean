@@ -47,6 +47,7 @@ pub struct Block {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
     Assign { dst: LocalId, value: Expr },
+    Capture { key: String, value: Expr },
     Expr(Expr),
     Unsupported { dsts: Vec<LocalId>, text: String },
 }
@@ -201,6 +202,7 @@ impl fmt::Display for Stmt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Stmt::Assign { dst, value } => write!(f, "{dst} = {value};"),
+            Stmt::Capture { key, value } => write!(f, "capture {key:?} = {value};"),
             Stmt::Expr(value) => write!(f, "{value};"),
             Stmt::Unsupported { dsts, text } if dsts.is_empty() => {
                 write!(f, "unsupported {text:?};")

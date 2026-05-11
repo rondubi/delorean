@@ -97,12 +97,43 @@ pub fn lift_function_with_returns(
     emit_function_unit(&unit, resolver)
 }
 
+pub fn lift_function_with_returns_and_captures(
+    function: &Function,
+    return_values: &[Value],
+    capture_values: &[Value],
+    resolver: &dyn Resolver,
+) -> Result<String> {
+    let unit = FunctionUnit::whole_named_with_returns_and_captures(
+        function,
+        sanitize_ident(&function.name),
+        return_values,
+        capture_values,
+    )?;
+    emit_function_unit(&unit, resolver)
+}
+
 pub fn dump_function_lir_with_returns(
     function: &Function,
     return_values: &[Value],
     resolver: &dyn Resolver,
 ) -> Result<String> {
     let unit = FunctionUnit::whole_with_returns(function, return_values)?;
+    let lir = lower_simplified_lir(&unit, resolver)?;
+    Ok(lir.to_string())
+}
+
+pub fn dump_function_lir_with_returns_and_captures(
+    function: &Function,
+    return_values: &[Value],
+    capture_values: &[Value],
+    resolver: &dyn Resolver,
+) -> Result<String> {
+    let unit = FunctionUnit::whole_named_with_returns_and_captures(
+        function,
+        sanitize_ident(&function.name),
+        return_values,
+        capture_values,
+    )?;
     let lir = lower_simplified_lir(&unit, resolver)?;
     Ok(lir.to_string())
 }
@@ -167,7 +198,10 @@ fn emit_python_prelude(out: &mut String) {
     out.push_str("        return args[1]\n");
     out.push_str("    if name.startswith(\"Display\"):\n");
     out.push_str("        return None\n");
+    out.push_str("    if name in MIR_IGNORED_CALLS:\n");
+    out.push_str("        return None\n");
     out.push_str("    raise RuntimeError(f\"unimplemented MIR call {name!r}\")\n\n\n");
+    out.push_str("MIR_IGNORED_CALLS = set()\n\n\n");
 }
 
 fn normalize_mir_input(input: &str) -> String {
@@ -279,6 +313,7 @@ struct FunctionUnit<'a> {
     entry: Block,
     params: Vec<Value>,
     return_values: Vec<Value>,
+    capture_values: Vec<Value>,
 }
 
 struct BlockGroup {
@@ -363,6 +398,7 @@ impl<'a> FunctionUnit<'a> {
             entry,
             params,
             return_values,
+            capture_values: Vec::new(),
         })
     }
 
@@ -370,6 +406,15 @@ impl<'a> FunctionUnit<'a> {
         source: &'a Function,
         name: String,
         return_values: &[Value],
+    ) -> Result<Self> {
+        Self::whole_named_with_returns_and_captures(source, name, return_values, &[])
+    }
+
+    fn whole_named_with_returns_and_captures(
+        source: &'a Function,
+        name: String,
+        return_values: &[Value],
+        capture_values: &[Value],
     ) -> Result<Self> {
         let blocks: Vec<Block> = source.layout.blocks().collect();
         let entry = source
@@ -381,6 +426,7 @@ impl<'a> FunctionUnit<'a> {
         let preds_by_block = build_preds_by_block(source, &blocks, &block_set);
         let params = collect_function_params(source);
         let return_values = live_return_values(source, &blocks, return_values);
+        let capture_values = live_return_values(source, &blocks, capture_values);
         Ok(Self {
             name,
             source,
@@ -391,6 +437,7 @@ impl<'a> FunctionUnit<'a> {
             entry,
             params,
             return_values,
+            capture_values,
         })
     }
 
@@ -427,6 +474,7 @@ impl<'a> FunctionUnit<'a> {
             entry,
             params,
             return_values,
+            capture_values: Vec::new(),
         })
     }
 
@@ -1989,7 +2037,9 @@ fn pad(indent: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::lift_text;
+    use mir::{Function, Value};
+
+    use super::{dump_function_lir_with_returns_and_captures, lift_text, normalize_mir_input};
 
     #[test]
     fn lifts_sample_mir_to_python() {
@@ -2007,7 +2057,7 @@ mod tests {
         assert!(!lifted.contains("v36 = v35"));
         assert!(lifted.contains("if (v16) < (0):"));
         assert!(lifted.contains("v31 = (float(v16)) / (3.141)"));
-        assert!(lifted.contains(r#""v36": v36"#));
+        assert!(lifted.contains(r#""v36": v36"#) || lifted.contains(r#"_lir_return["v36"] = v36"#));
     }
 
     #[test]
@@ -2030,5 +2080,68 @@ mod tests {
         assert!(dumped.contains("fn lifted("));
         assert!(dumped.contains("bb0:"));
         assert!(dumped.contains("return {"));
+    }
+
+    #[test]
+    fn captures_phi_values_on_incoming_edges() {
+        let input = r#"
+function %phi_capture(v0, v1, v2) {
+                                block0:
+                                    br v0, block1, block2
+
+                                block1:
+                                    jmp block3
+
+                                block2:
+                                    jmp block3
+
+                                block3:
+                                    v3 = phi [v1, block1], [v2, block2]
+                                    jmp block4
+
+                                block4:
+}
+"#;
+        let (functions, interner) =
+            mir_reader::parse_functions(&normalize_mir_input(input)).unwrap();
+        let function = &functions[0];
+        let capture = value_by_name(function, "v3");
+        let lir = dump_function_lir_with_returns_and_captures(function, &[], &[capture], &interner)
+            .unwrap();
+
+        assert_eq!(lir.matches("capture \"v3\"").count(), 2);
+    }
+
+    #[test]
+    fn captures_entry_defined_params_and_constants() {
+        let input = r#"
+function %entry_capture(v0) {
+    v1 = iconst 2
+                                block0:
+}
+"#;
+        let (functions, interner) =
+            mir_reader::parse_functions(&normalize_mir_input(input)).unwrap();
+        let function = &functions[0];
+        let param = value_by_name(function, "v0");
+        let constant = value_by_name(function, "v1");
+        let lir = dump_function_lir_with_returns_and_captures(
+            function,
+            &[],
+            &[param, constant],
+            &interner,
+        )
+        .unwrap();
+
+        assert!(lir.contains("capture \"v0\""));
+        assert!(lir.contains("capture \"v1\" = 2"));
+    }
+
+    fn value_by_name(function: &Function, name: &str) -> Value {
+        function
+            .dfg
+            .values()
+            .find(|value| value.to_string() == name)
+            .unwrap_or_else(|| panic!("missing MIR value {name}"))
     }
 }

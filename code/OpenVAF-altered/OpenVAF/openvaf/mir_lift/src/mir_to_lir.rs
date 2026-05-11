@@ -57,7 +57,7 @@ impl<'a, 'r> LowerCx<'a, 'r> {
                     if self.facts.aliases.exprs.contains_key(&result) {
                         continue;
                     }
-                    self.local_for_value(result);
+                    self.local_for_result(result);
                 }
             }
         }
@@ -90,6 +90,9 @@ impl<'a, 'r> LowerCx<'a, 'r> {
 
     fn lower_block(&mut self, block: Block) -> Result<()> {
         let mut stmts = Vec::new();
+        if block == self.unit.entry {
+            self.capture_entry_values(&mut stmts);
+        }
         for &inst in self.unit.insts(block) {
             let data = self.unit.source.dfg.insts[inst].clone();
             if data.is_phi() || data.is_terminator() {
@@ -113,6 +116,9 @@ impl<'a, 'r> LowerCx<'a, 'r> {
                     else_label: self.edge_label_or_block(block, else_dst),
                 }
             }
+            Some(InstructionData::Jump { .. } | InstructionData::Branch { .. }) => {
+                Terminator::Return(self.return_values())
+            }
             Some(InstructionData::Exit) | None => Terminator::Return(self.return_values()),
             Some(other) => {
                 bail!("unsupported MIR terminator in {}: {other:?}", self.unit.name);
@@ -121,6 +127,18 @@ impl<'a, 'r> LowerCx<'a, 'r> {
 
         self.blocks.push(crate::lir::Block { label: self.labels_by_block[&block], stmts, term });
         Ok(())
+    }
+
+    fn capture_entry_values(&mut self, stmts: &mut Vec<Stmt>) {
+        for &value in &self.unit.capture_values {
+            match self.unit.source.dfg.value_def(value) {
+                ValueDef::Param(_) | ValueDef::Const(_) => {
+                    let expr = self.expr_for_value(value);
+                    self.capture_value_from_expr(value, expr, stmts);
+                }
+                ValueDef::Result(_, _) | ValueDef::Invalid => {}
+            }
+        }
     }
 
     fn real_block_terminator(&self, block: Block) -> Option<InstructionData> {
@@ -141,19 +159,24 @@ impl<'a, 'r> LowerCx<'a, 'r> {
         let rendered = self.unit.source.dfg.display_inst(inst).to_string();
         let results = self.unit.source.dfg.inst_results(inst).to_vec();
         if results.len() == 1 {
-            if self.facts.aliases.exprs.contains_key(&results[0]) {
+            if let Some(alias) = self.facts.aliases.exprs.get(&results[0]).copied() {
+                let value = self.expr_for_inst_data(alias);
+                self.capture_value_from_expr(results[0], value, stmts);
                 return Ok(());
             }
             if let Some(source) = direct_copy_source(&data) {
                 if self.canonical_value(source) == self.canonical_value(results[0]) {
+                    let value = self.expr_for_value(source);
+                    self.capture_value_from_expr(results[0], value, stmts);
                     return Ok(());
                 }
             }
         }
         match self.expr_for_inst(&data) {
             Some(expr) if results.len() == 1 => {
-                let dst = self.local_for_value(results[0]);
+                let dst = self.local_for_result(results[0]);
                 stmts.push(Stmt::Assign { dst, value: expr });
+                self.capture_value_from_expr(results[0], Expr::Local(dst), stmts);
             }
             Some(expr) if results.is_empty() => {
                 stmts.push(Stmt::Expr(expr));
@@ -169,6 +192,13 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             }
         }
         Ok(())
+    }
+
+    fn capture_value_from_expr(&self, result: Value, value: Expr, stmts: &mut Vec<Stmt>) {
+        if !self.unit.capture_values.contains(&result) {
+            return;
+        }
+        stmts.push(Stmt::Capture { key: value_name(result), value });
     }
 
     fn expr_for_inst(&mut self, data: &InstructionData) -> Option<Expr> {
@@ -213,7 +243,7 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             let Some(incoming) = self.phi_edge_value(result, pred) else {
                 continue;
             };
-            let dst = self.local_for_value(result);
+            let dst = self.local_for_result(result);
             copies.push((result, incoming, dst));
         }
 
@@ -240,14 +270,16 @@ impl<'a, 'r> LowerCx<'a, 'r> {
                     LirType::Unknown,
                 );
                 stmts.push(Stmt::Assign { dst: tmp, value: self.expr_for_value(incoming) });
-                temp_copies.push((dst, tmp));
+                temp_copies.push((result, dst, tmp));
             }
-            for (dst, tmp) in temp_copies {
+            for (result, dst, tmp) in temp_copies {
                 stmts.push(Stmt::Assign { dst, value: Expr::Local(tmp) });
+                self.capture_value_from_expr(result, Expr::Local(dst), &mut stmts);
             }
         } else {
-            for (_, incoming, dst) in copies {
+            for (result, incoming, dst) in copies {
                 stmts.push(Stmt::Assign { dst, value: self.expr_for_value(incoming) });
+                self.capture_value_from_expr(result, Expr::Local(dst), &mut stmts);
             }
         }
 
@@ -320,8 +352,19 @@ impl<'a, 'r> LowerCx<'a, 'r> {
         }
     }
 
+    fn local_for_result(&mut self, value: Value) -> LocalId {
+        if self.unit.capture_values.contains(&value) {
+            return self.local_for_exact_value(value);
+        }
+        self.local_for_value(value)
+    }
+
     fn local_for_value(&mut self, value: Value) -> LocalId {
         let value = self.canonical_value(value);
+        self.local_for_exact_value(value)
+    }
+
+    fn local_for_exact_value(&mut self, value: Value) -> LocalId {
         if let Some(&id) = self.locals_by_value.get(&value) {
             return id;
         }

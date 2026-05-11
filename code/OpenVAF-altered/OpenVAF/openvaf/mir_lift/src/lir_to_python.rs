@@ -22,15 +22,31 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
         .iter()
         .map(|helper| (helper.label, helper.params.clone()))
         .collect::<HashMap<_, _>>();
+    let captures_outputs = function
+        .blocks
+        .iter()
+        .flat_map(|block| block.stmts.iter())
+        .any(|stmt| matches!(stmt, Stmt::Capture { .. }));
     let mut out = String::new();
-    let cx = EmitCx { names: &names, helper_params, helper_prefix: &function_name };
+    let cx = EmitCx {
+        names: &names,
+        helper_params,
+        optional_helper_live_ins: &structured.facts.optional_helper_live_ins,
+        helper_prefix: &function_name,
+        captures_outputs,
+    };
+
+    if !structured.facts.optional_helper_live_ins.is_empty() || captures_outputs {
+        writeln!(out, "_LIR_UNDEF = object()")?;
+        writeln!(out)?;
+    }
 
     for helper in &structured.helpers {
         writeln!(
             out,
             "def {}({}):",
             helper_name(&function_name, helper.label),
-            helper.params.iter().map(|param| names.local(*param)).collect::<Vec<_>>().join(", ")
+            helper_params_signature(&names, helper.params.as_slice(), captures_outputs)
         )?;
         let mut defined = helper.params.iter().copied().collect::<HashSet<_>>();
         emit_structured_body(&mut out, &helper.body, &cx, 1, &mut defined)?;
@@ -38,14 +54,26 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
     }
 
     let entry_name = entry_helper_name(&function_name);
-    writeln!(out, "def {}({}):", entry_name, names.params(function))?;
+    writeln!(
+        out,
+        "def {}({}):",
+        entry_name,
+        helper_params_signature(&names, function.params.as_slice(), captures_outputs)
+    )?;
     let mut defined = function.params.iter().copied().collect::<HashSet<_>>();
     emit_structured_body(&mut out, &structured.body, &cx, 1, &mut defined)?;
     writeln!(out)?;
 
     writeln!(out, "def {}({}):", function_name, names.params(function))?;
+    if captures_outputs {
+        writeln!(out, "    _lir_outputs = {{}}")?;
+    }
     writeln!(out, "    _lir_target = {}", entry_name)?;
-    writeln!(out, "    _lir_args = {}", params_tuple(names.params(function)))?;
+    writeln!(
+        out,
+        "    _lir_args = {}",
+        entry_args_tuple(names.params(function), captures_outputs)
+    )?;
     writeln!(out, "    while True:")?;
     writeln!(out, "        _lir_result = _lir_target(*_lir_args)")?;
     writeln!(out, "        if _lir_result[0] == \"return\":")?;
@@ -61,6 +89,9 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, names: &NameTable, indent: usize) ->
         Stmt::Assign { dst, value } => {
             writeln!(out, "{}{} = {}", pad(indent), names.local(*dst), expr(value, names)?)?;
         }
+        Stmt::Capture { key, value } => {
+            emit_capture(out, key, value, names, indent)?;
+        }
         Stmt::Expr(value) => {
             writeln!(out, "{}{}", pad(indent), expr(value, names)?)?;
         }
@@ -68,6 +99,31 @@ fn emit_stmt(out: &mut String, stmt: &Stmt, names: &NameTable, indent: usize) ->
             bail!("unsupported LIR statement: {text}");
         }
     }
+    Ok(())
+}
+
+fn emit_capture(
+    out: &mut String,
+    key: &str,
+    value: &Expr,
+    names: &NameTable,
+    indent: usize,
+) -> Result<()> {
+    let locals = expr_local_ids(value);
+    if locals.is_empty() {
+        writeln!(out, "{}_lir_outputs[{key:?}] = {}", pad(indent), expr(value, names)?)?;
+        return Ok(());
+    }
+
+    let guard = locals
+        .iter()
+        .map(|local| format!("{} is not _LIR_UNDEF", names.local(*local)))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    writeln!(out, "{}if {guard}:", pad(indent))?;
+    writeln!(out, "{}_lir_outputs[{key:?}] = {}", pad(indent + 1), expr(value, names)?)?;
+    writeln!(out, "{}else:", pad(indent))?;
+    writeln!(out, "{}_lir_outputs.pop({key:?}, None)", pad(indent + 1))?;
     Ok(())
 }
 
@@ -136,7 +192,7 @@ fn emit_structured_stmt(
             *defined = then_defined;
         }
         StructuredStmt::CallHelper(label) => {
-            let args = helper_args_tuple(*label, cx, defined);
+            let args = helper_args_tuple(*label, cx, defined)?;
             writeln!(
                 out,
                 "{}return (\"call\", {}, {args})",
@@ -145,16 +201,7 @@ fn emit_structured_stmt(
             )?;
         }
         StructuredStmt::Return(values) => {
-            let entries = values
-                .iter()
-                .map(|value| match value {
-                    crate::lir::ReturnValue::Named { key, value } => {
-                        Ok(format!("{key:?}: {}", expr(value, cx.names)?))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?
-                .join(", ");
-            writeln!(out, "{}return (\"return\", {{{entries}}})", pad(indent))?;
+            emit_return(out, values, cx, indent)?;
         }
         StructuredStmt::Raise(message) => {
             writeln!(out, "{}raise RuntimeError({message:?})", pad(indent))?;
@@ -163,22 +210,111 @@ fn emit_structured_stmt(
     Ok(())
 }
 
-fn helper_args_tuple(label: Label, cx: &EmitCx<'_>, defined: &HashSet<LocalId>) -> String {
-    let args = cx
-        .helper_params
-        .get(&label)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|arg| if defined.contains(&arg) { cx.names.local(arg) } else { "None".to_owned() })
-        .collect::<Vec<_>>()
-        .join(", ");
+fn helper_args_tuple(label: Label, cx: &EmitCx<'_>, defined: &HashSet<LocalId>) -> Result<String> {
+    let mut args = if cx.captures_outputs { vec!["_lir_outputs".to_owned()] } else { Vec::new() };
+    args.extend(
+        cx.helper_params
+            .get(&label)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|arg| -> Result<String> {
+                if !defined.contains(&arg) && !cx.optional_helper_live_ins.contains(&(label, arg)) {
+                    bail!(
+                        "structured LIR helper {} requires {} before it is defined",
+                        helper_name(cx.helper_prefix, label),
+                        cx.names.local(arg)
+                    );
+                }
+                if defined.contains(&arg) {
+                    Ok(cx.names.local(arg))
+                } else {
+                    Ok("_LIR_UNDEF".to_owned())
+                }
+            })
+            .collect::<Result<Vec<_>>>()?,
+    );
+    let args = args.join(", ");
 
     if args.is_empty() {
-        "()".to_owned()
+        Ok("()".to_owned())
     } else {
-        format!("({args},)")
+        Ok(format!("({args},)"))
     }
+}
+
+fn emit_return(
+    out: &mut String,
+    values: &[crate::lir::ReturnValue],
+    cx: &EmitCx<'_>,
+    indent: usize,
+) -> Result<()> {
+    if cx.optional_helper_live_ins.is_empty() {
+        if cx.captures_outputs {
+            writeln!(out, "{}_lir_return = dict(_lir_outputs)", pad(indent))?;
+            for value in values {
+                match value {
+                    crate::lir::ReturnValue::Named { key, value } => {
+                        writeln!(
+                            out,
+                            "{}_lir_return[{key:?}] = {}",
+                            pad(indent),
+                            expr(value, cx.names)?
+                        )?;
+                    }
+                }
+            }
+            writeln!(out, "{}return (\"return\", _lir_return)", pad(indent))?;
+            return Ok(());
+        }
+        let entries = values
+            .iter()
+            .map(|value| match value {
+                crate::lir::ReturnValue::Named { key, value } => {
+                    Ok(format!("{key:?}: {}", expr(value, cx.names)?))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?
+            .join(", ");
+        writeln!(out, "{}return (\"return\", {{{entries}}})", pad(indent))?;
+        return Ok(());
+    }
+
+    if cx.captures_outputs {
+        writeln!(out, "{}_lir_return = dict(_lir_outputs)", pad(indent))?;
+    } else {
+        writeln!(out, "{}_lir_return = {{}}", pad(indent))?;
+    }
+    for value in values {
+        match value {
+            crate::lir::ReturnValue::Named { key, value } => {
+                let locals = expr_local_ids(value);
+                if locals.is_empty() {
+                    writeln!(
+                        out,
+                        "{}_lir_return[{key:?}] = {}",
+                        pad(indent),
+                        expr(value, cx.names)?
+                    )?;
+                } else {
+                    let guard = locals
+                        .iter()
+                        .map(|local| format!("{} is not _LIR_UNDEF", cx.names.local(*local)))
+                        .collect::<Vec<_>>()
+                        .join(" and ");
+                    writeln!(out, "{}if {guard}:", pad(indent))?;
+                    writeln!(
+                        out,
+                        "{}_lir_return[{key:?}] = {}",
+                        pad(indent + 1),
+                        expr(value, cx.names)?
+                    )?;
+                }
+            }
+        }
+    }
+    writeln!(out, "{}return (\"return\", _lir_return)", pad(indent))?;
+    Ok(())
 }
 
 fn params_tuple(params: String) -> String {
@@ -197,14 +333,61 @@ fn mark_stmt_defs(stmt: &Stmt, defined: &mut HashSet<LocalId>) {
         Stmt::Unsupported { dsts, .. } => {
             defined.extend(dsts.iter().copied());
         }
-        Stmt::Expr(_) => {}
+        Stmt::Capture { .. } | Stmt::Expr(_) => {}
+    }
+}
+
+fn expr_local_ids(expr: &Expr) -> Vec<LocalId> {
+    let mut locals = Vec::new();
+    collect_expr_local_ids(expr, &mut locals);
+    locals.sort();
+    locals.dedup();
+    locals
+}
+
+fn collect_expr_local_ids(expr: &Expr, locals: &mut Vec<LocalId>) {
+    match expr {
+        Expr::Local(local) => locals.push(*local),
+        Expr::Const(_) => {}
+        Expr::Unary { arg, .. } => collect_expr_local_ids(arg, locals),
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_local_ids(lhs, locals);
+            collect_expr_local_ids(rhs, locals);
+        }
+        Expr::Call { args, .. } | Expr::Unsupported { args, .. } => {
+            for arg in args {
+                collect_expr_local_ids(arg, locals);
+            }
+        }
     }
 }
 
 struct EmitCx<'a> {
     names: &'a NameTable,
     helper_params: HashMap<Label, Vec<LocalId>>,
+    optional_helper_live_ins: &'a HashSet<(Label, LocalId)>,
     helper_prefix: &'a str,
+    captures_outputs: bool,
+}
+
+fn helper_params_signature(
+    names: &NameTable,
+    params: &[LocalId],
+    captures_outputs: bool,
+) -> String {
+    let mut rendered = if captures_outputs { vec!["_lir_outputs".to_owned()] } else { Vec::new() };
+    rendered.extend(params.iter().map(|param| names.local(*param)));
+    rendered.join(", ")
+}
+
+fn entry_args_tuple(params: String, captures_outputs: bool) -> String {
+    let mut args = if captures_outputs { vec!["_lir_outputs".to_owned()] } else { Vec::new() };
+    args.extend(params.split(", ").filter(|param| !param.is_empty()).map(str::to_owned));
+    if args.is_empty() {
+        "()".to_owned()
+    } else {
+        format!("({},)", args.join(", "))
+    }
 }
 
 fn unary_expr(op: UnaryOp, arg: String) -> String {
@@ -329,4 +512,79 @@ fn sanitize_ident(name: &str) -> String {
 
 fn pad(indent: usize) -> String {
     "    ".repeat(indent)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+
+    use super::emit_function;
+    use crate::lir::{
+        Block, ConstValue, Expr, Function, Label, LirType, Local, LocalId, Stmt, Terminator,
+    };
+
+    #[test]
+    fn guarded_capture_clears_stale_output_when_input_is_undefined() {
+        let cond = LocalId(0);
+        let stale = LocalId(1);
+        let maybe = LocalId(2);
+        let function = Function {
+            name: "stale_capture".to_owned(),
+            params: vec![cond],
+            locals: vec![
+                Local { id: cond, name_hint: "cond".to_owned(), ty: LirType::Bool },
+                Local { id: stale, name_hint: "stale".to_owned(), ty: LirType::Int },
+                Local { id: maybe, name_hint: "maybe".to_owned(), ty: LirType::Int },
+            ],
+            entry: Label(0),
+            blocks: vec![
+                Block {
+                    label: Label(0),
+                    stmts: vec![
+                        Stmt::Assign { dst: stale, value: Expr::Const(ConstValue::Int(7)) },
+                        Stmt::Capture { key: "slot".to_owned(), value: Expr::Local(stale) },
+                    ],
+                    term: Terminator::Branch {
+                        cond: Expr::Local(cond),
+                        then_label: Label(1),
+                        else_label: Label(2),
+                    },
+                },
+                Block {
+                    label: Label(1),
+                    stmts: vec![Stmt::Capture {
+                        key: "slot".to_owned(),
+                        value: Expr::Local(maybe),
+                    }],
+                    term: Terminator::Return(Vec::new()),
+                },
+                Block {
+                    label: Label(2),
+                    stmts: vec![Stmt::Assign {
+                        dst: maybe,
+                        value: Expr::Const(ConstValue::Int(9)),
+                    }],
+                    term: Terminator::Goto(Label(1)),
+                },
+            ],
+            returns: Vec::new(),
+        };
+
+        let emitted = emit_function(&function).unwrap();
+        assert!(emitted.contains(r#"_lir_outputs.pop("slot", None)"#), "{emitted}");
+
+        let script = format!(
+            "{emitted}\n\
+             assert stale_capture(True) == {{}}, stale_capture(True)\n\
+             assert stale_capture(False) == {{'slot': 9}}, stale_capture(False)\n"
+        );
+        let output =
+            Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
+        assert!(
+            output.status.success(),
+            "python failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

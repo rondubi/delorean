@@ -31,6 +31,17 @@ GIVEN_FLAG_INSTANCE = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p, ctypes.
 WRITE_JACOBIAN = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_double))
 LOAD_JACOBIAN_OFFSET = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
 
+CALC_RESIST_RESIDUAL = 1
+CALC_REACT_RESIDUAL = 2
+CALC_RESIST_JACOBIAN = 4
+CALC_REACT_JACOBIAN = 8
+CALC_RESIST_LIM_RHS = 64
+CALC_REACT_LIM_RHS = 128
+INIT_LIM = 512
+ANALYSIS_DC = 2048
+JACOBIAN_ENTRY_RESIST = 4
+JACOBIAN_ENTRY_REACT = 8
+
 
 class OsdiSimParas(ctypes.Structure):
     _fields_ = [
@@ -52,6 +63,18 @@ class OsdiSimInfo(ctypes.Structure):
         ("prev_solve", ctypes.POINTER(ctypes.c_double)),
         ("prev_state", ctypes.POINTER(ctypes.c_double)),
         ("next_state", ctypes.POINTER(ctypes.c_double)),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class OsdiNodePair(ctypes.Structure):
+    _fields_ = [("node_1", ctypes.c_uint32), ("node_2", ctypes.c_uint32)]
+
+
+class OsdiJacobianEntry(ctypes.Structure):
+    _fields_ = [
+        ("nodes", OsdiNodePair),
+        ("react_ptr_off", ctypes.c_uint32),
         ("flags", ctypes.c_uint32),
     ]
 
@@ -126,8 +149,8 @@ def main() -> int:
     compile_osdi(root, verilog, osdi)
     lift_python(root, verilog, py)
 
-    osdi_results, python_cases = run_osdi(osdi, args.cases)
-    python_results = run_python(py, module, python_cases)
+    osdi_results, python_cases, shape = run_osdi(osdi, args.cases)
+    python_results = run_python(py, module, python_cases, shape)
 
     print(f"osdi: {osdi}")
     print(f"python: {py}")
@@ -147,7 +170,9 @@ def main() -> int:
     return 0
 
 
-def run_osdi(path: Path, cases: int) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+def run_osdi(
+    path: Path, cases: int
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, list[int]]]:
     lib = ctypes.CDLL(str(path))
     patch_osdi_log(lib)
     patch_lim_table(lib)
@@ -173,6 +198,8 @@ def run_osdi(path: Path, cases: int) -> tuple[list[dict[str, object]], list[dict
         ctypes.byref(init),
     )
     check_init(init)
+    initialize_instance_layout(desc, inst)
+    shape = osdi_output_shape(desc)
 
     nsolve = max(1, desc.num_nodes)
     solve = (ctypes.c_double * nsolve)()
@@ -183,7 +210,16 @@ def run_osdi(path: Path, cases: int) -> tuple[list[dict[str, object]], list[dict
     for _ in range(cases):
         for i in range(nsolve):
             solve[i] = random.uniform(-1.0, 1.0)
-        flags = 2048 | 4 | 8 | 64 | 128 | 512
+        flags = (
+            ANALYSIS_DC
+            | CALC_RESIST_RESIDUAL
+            | CALC_REACT_RESIDUAL
+            | CALC_RESIST_JACOBIAN
+            | CALC_REACT_JACOBIAN
+            | CALC_RESIST_LIM_RHS
+            | CALC_REACT_LIM_RHS
+            | INIT_LIM
+        )
         case = {
             "abstime": 0.0,
             "prev_solve": list(solve),
@@ -197,13 +233,14 @@ def run_osdi(path: Path, cases: int) -> tuple[list[dict[str, object]], list[dict
         info = OsdiSimInfo(sim_paras, case["abstime"], solve, prev_state, next_state, flags)
         flags = desc.eval(handle_ptr, ctypes.byref(inst), ctypes.byref(model), ctypes.byref(info))
         residual_len = max(1, desc.num_nodes)
-        jacobian_len = max(1, desc.num_jacobian_entries)
+        jacobian_resist_len = int(desc.num_resistive_jacobian_entries)
+        jacobian_react_len = int(desc.num_reactive_jacobian_entries)
         residual_resist = (ctypes.c_double * residual_len)()
         residual_react = (ctypes.c_double * residual_len)()
         limit_rhs_resist = (ctypes.c_double * residual_len)()
         limit_rhs_react = (ctypes.c_double * residual_len)()
-        jacobian_resist = (ctypes.c_double * jacobian_len)()
-        jacobian_react = (ctypes.c_double * jacobian_len)()
+        jacobian_resist = (ctypes.c_double * max(1, jacobian_resist_len))()
+        jacobian_react = (ctypes.c_double * max(1, jacobian_react_len))()
         desc.load_residual_resist(ctypes.byref(inst), ctypes.byref(model), residual_resist)
         desc.load_residual_react(ctypes.byref(inst), ctypes.byref(model), residual_react)
         desc.load_limit_rhs_resist(ctypes.byref(inst), ctypes.byref(model), limit_rhs_resist)
@@ -217,14 +254,57 @@ def run_osdi(path: Path, cases: int) -> tuple[list[dict[str, object]], list[dict
                 "residual_react": list(residual_react),
                 "limit_rhs_resist": list(limit_rhs_resist),
                 "limit_rhs_react": list(limit_rhs_react),
-                "jacobian_resist": list(jacobian_resist),
-                "jacobian_react": list(jacobian_react),
+                "jacobian_resist": list(jacobian_resist)[:jacobian_resist_len],
+                "jacobian_react": list(jacobian_react)[:jacobian_react_len],
             }
         )
-    return out, python_cases
+    return out, python_cases, shape
 
 
-def run_python(path: Path, module: str, cases: list[dict[str, object]]) -> list[object]:
+def initialize_instance_layout(desc: OsdiDescriptor, inst: ctypes.Array[ctypes.c_char]) -> None:
+    base = ctypes.addressof(inst)
+    node_mapping = (ctypes.c_uint32 * int(desc.num_nodes)).from_address(
+        base + int(desc.node_mapping_offset)
+    )
+    for idx in range(int(desc.num_nodes)):
+        node_mapping[idx] = idx
+
+    state_idx = (ctypes.c_uint32 * int(desc.num_states)).from_address(
+        base + int(desc.state_idx_off)
+    )
+    for idx in range(int(desc.num_states)):
+        state_idx[idx] = idx
+
+
+def osdi_output_shape(desc: OsdiDescriptor) -> dict[str, list[int]]:
+    entries = ctypes.cast(
+        desc.jacobian_entries,
+        ctypes.POINTER(OsdiJacobianEntry),
+    )
+    resist = []
+    react = []
+    for idx in range(int(desc.num_jacobian_entries)):
+        flags = entries[idx].flags
+        if flags & JACOBIAN_ENTRY_RESIST:
+            resist.append(idx)
+        if flags & JACOBIAN_ENTRY_REACT:
+            react.append(idx)
+    if len(resist) != int(desc.num_resistive_jacobian_entries):
+        raise SystemExit(
+            "OSDI descriptor resistive jacobian metadata mismatch: "
+            f"flags describe {len(resist)}, descriptor says {desc.num_resistive_jacobian_entries}"
+        )
+    if len(react) != int(desc.num_reactive_jacobian_entries):
+        raise SystemExit(
+            "OSDI descriptor reactive jacobian metadata mismatch: "
+            f"flags describe {len(react)}, descriptor says {desc.num_reactive_jacobian_entries}"
+        )
+    return {"jacobian_resist": resist, "jacobian_react": react}
+
+
+def run_python(
+    path: Path, module: str, cases: list[dict[str, object]], shape: dict[str, list[int]]
+) -> list[object]:
     spec = importlib.util.spec_from_file_location("lifted", path)
     if spec is None or spec.loader is None:
         raise SystemExit(f"cannot load {path}")
@@ -255,8 +335,25 @@ def run_python(path: Path, module: str, cases: list[dict[str, object]]) -> list[
                 + ", ".join(none_paths[:16])
                 + (" ..." if len(none_paths) > 16 else "")
             )
-        out.append(result)
+        out.append(project_python_result(result, shape))
     return out
+
+
+def project_python_result(
+    result: dict[str, object], shape: dict[str, list[int]]
+) -> dict[str, object]:
+    projected = dict(result)
+    for key, indices in shape.items():
+        values = result.get(key, [])
+        if not isinstance(values, list):
+            raise SystemExit(f"lifted Python {key} is {type(values).__name__}, expected list")
+        try:
+            projected[key] = [values[idx] for idx in indices]
+        except IndexError as err:
+            raise SystemExit(
+                f"lifted Python {key} has length {len(values)}, cannot project OSDI index {err}"
+            ) from None
+    return projected
 
 
 def find_none_values(value: object, prefix: str = "") -> list[str]:

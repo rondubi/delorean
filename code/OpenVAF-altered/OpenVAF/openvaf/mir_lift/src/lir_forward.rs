@@ -107,6 +107,7 @@ fn rewrite_stmt(stmt: &mut Stmt, env: &mut ConstEnv) {
                 clear_const(env, *dst);
             }
         }
+        Stmt::Capture { value, .. } => *value = rewrite_expr(value.clone(), env),
         Stmt::Expr(value) => *value = rewrite_expr(value.clone(), env),
         Stmt::Unsupported { dsts, .. } => {
             for dst in dsts {
@@ -154,6 +155,7 @@ fn transfer_block<'a>(
                     clear_const(&mut env, *dst);
                 }
             }
+            Stmt::Capture { .. } => {}
             Stmt::Expr(_) => {}
             Stmt::Unsupported { dsts, .. } => {
                 for dst in dsts {

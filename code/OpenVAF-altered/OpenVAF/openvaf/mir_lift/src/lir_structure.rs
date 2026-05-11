@@ -10,6 +10,7 @@ use crate::lir_backward;
 pub(crate) struct StructuredFunction {
     pub helpers: Vec<StructuredHelper>,
     pub body: Vec<StructuredStmt>,
+    pub facts: lir_backward::BackwardFacts,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -73,9 +74,9 @@ pub(crate) fn structure(function: &Function) -> Result<StructuredFunction> {
         eprintln!("mir-lift timing: {} structure-body {:?}", function.name, start.elapsed());
     }
 
-    let mut structured = StructuredFunction { helpers, body };
+    let mut structured = StructuredFunction { helpers, body, facts: Default::default() };
     let start = Instant::now();
-    lir_backward::run_backward_passes(function, &mut structured);
+    structured.facts = lir_backward::run_backward_passes(function, &mut structured);
     validate_helper_calls(&structured)?;
     if timing {
         eprintln!("mir-lift timing: {} structure-backward {:?}", function.name, start.elapsed());
