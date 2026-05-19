@@ -26,6 +26,7 @@ def main() -> int:
         if args.output
         else verilog_file.with_suffix(".py")
     )
+    before_mtime = output.stat().st_mtime_ns if output.exists() else None
 
     env = os.environ.copy()
     env["PATH"] = ":".join(
@@ -67,7 +68,17 @@ def main() -> int:
     if args.dump_lir:
         cmd.insert(-1, "--dump-lir")
 
-    return subprocess.run(cmd, cwd=workspace_root, env=env).returncode
+    status = subprocess.run(cmd, cwd=workspace_root, env=env).returncode
+    if status != 0:
+        return status
+    if not output.exists():
+        print(f"mir_lift_runner: expected output was not written: {output}")
+        return 1
+    after_mtime = output.stat().st_mtime_ns
+    if before_mtime is not None and after_mtime == before_mtime:
+        print(f"mir_lift_runner: output was not updated: {output}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

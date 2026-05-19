@@ -353,8 +353,9 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_hir_returns(
+                mir_lift::dump_function_lir_with_hir_returns_and_captures(
                     &compiled.model_param_setup,
+                    &[],
                     &model_output_values,
                     &literals,
                     &compiled.model_param_intern,
@@ -363,8 +364,9 @@ fn compile_with_mir_lift(
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_hir_returns(
+            &mir_lift::lift_function_with_hir_returns_and_captures(
                 &compiled.model_param_setup,
+                &[],
                 &model_output_values,
                 &literals,
                 &compiled.model_param_intern,
@@ -560,6 +562,15 @@ enum SetupPhase {
     Instance,
 }
 
+impl SetupPhase {
+    fn name(self) -> &'static str {
+        match self {
+            SetupPhase::Model => "model setup",
+            SetupPhase::Instance => "instance setup",
+        }
+    }
+}
+
 fn python_osdi_setup_args(
     db: &CompilationDB,
     compiled: &sim_back::CompiledModule<'_>,
@@ -586,12 +597,23 @@ fn python_osdi_setup_args(
 
     params
         .into_iter()
-        .map(|(_, param)| {
-            intern.params.get_index(param).map_or("0.0".to_owned(), |(kind, _)| {
-                python_osdi_setup_param_expr(db, compiled, kind, phase)
-            })
+        .map(|(index, param)| {
+            intern.params.get_index(param).map_or_else(
+                || {
+                    python_osdi_unsupported_expr(format!(
+                        "{} raw parameter p{} is not mapped to a supported wrapper input",
+                        phase.name(),
+                        index
+                    ))
+                },
+                |(kind, _)| python_osdi_setup_param_expr(db, compiled, kind, phase),
+            )
         })
         .collect()
+}
+
+fn python_osdi_unsupported_expr(message: impl AsRef<str>) -> String {
+    format!("_pyosdi_unsupported({:?})", message.as_ref())
 }
 
 fn python_osdi_setup_param_expr(
@@ -603,15 +625,19 @@ fn python_osdi_setup_param_expr(
     match *kind {
         hir_lower::ParamKind::Param(param) => match phase {
             SetupPhase::Model => {
-                format!("_pyosdi_dict_get(params, {:?}, 0.0)", param.name(db).to_string())
+                format!(
+                    "_pyosdi_setup_param(params, given, {:?}, {})",
+                    param.name(db).to_string(),
+                    python_osdi_param_placeholder(db, param)
+                )
             }
             SetupPhase::Instance => {
-                format!("_pyosdi_param(instance, model, {:?}, 0.0)", param.name(db).to_string())
+                format!("_pyosdi_param(instance, model, {:?})", param.name(db).to_string())
             }
         },
         hir_lower::ParamKind::ParamGiven { param } => match phase {
             SetupPhase::Model => {
-                format!("bool(_pyosdi_dict_get(given, {:?}, False))", param.name(db).to_string())
+                format!("_pyosdi_given_value(given, {:?})", param.name(db).to_string())
             }
             SetupPhase::Instance => {
                 format!("_pyosdi_given(instance, model, {:?})", param.name(db).to_string())
@@ -620,7 +646,7 @@ fn python_osdi_setup_param_expr(
         hir_lower::ParamKind::ParamSysFun(param) => match phase {
             SetupPhase::Model => {
                 format!(
-                    "_pyosdi_dict_get(builtin_params, {:?}, {:?})",
+                    "_pyosdi_builtin_default(builtin_params, {:?}, {:?})",
                     format!("{param:?}"),
                     param.default_value()
                 )
@@ -639,10 +665,8 @@ fn python_osdi_setup_param_expr(
                 .dae_system
                 .unknowns
                 .index(&sim_back::SimUnknownKind::KirchoffLaw(port))
-                .map(usize::from);
-            format!(
-                "_pyosdi_connected({{\"connected_terminals\": connected_terminals}}, {index:?})"
-            )
+                .map_or_else(|| "None".to_owned(), |index| usize::from(index).to_string());
+            format!("_pyosdi_connected({{\"connected_terminals\": connected_terminals}}, {index})")
         }
         hir_lower::ParamKind::Voltage { .. }
         | hir_lower::ParamKind::Current(_)
@@ -651,13 +675,23 @@ fn python_osdi_setup_param_expr(
         | hir_lower::ParamKind::EnableIntegration
         | hir_lower::ParamKind::EnableLim
         | hir_lower::ParamKind::PrevState(_)
-        | hir_lower::ParamKind::NewState(_) => "0.0".to_owned(),
+        | hir_lower::ParamKind::NewState(_) => {
+            python_osdi_unsupported_expr(format!("{} cannot read {:?}", phase.name(), kind))
+        }
         hir_lower::ParamKind::HiddenState(var) => match phase {
             SetupPhase::Model => format!("_pyosdi_missing_hidden({:?})", var.name(db).to_string()),
             SetupPhase::Instance => {
                 format!("_pyosdi_hidden(instance, {:?})", var.name(db).to_string())
             }
         },
+    }
+}
+
+fn python_osdi_param_placeholder(db: &CompilationDB, param: hir::Parameter) -> &'static str {
+    match param.ty(db) {
+        hir::Type::Integer | hir::Type::Bool => "0",
+        hir::Type::String => "''",
+        _ => "0.0",
     }
 }
 
@@ -694,28 +728,64 @@ fn python_osdi_eval_args(
     db: &CompilationDB,
     compiled: &sim_back::CompiledModule<'_>,
 ) -> Vec<String> {
-    let mut params: Vec<(usize, mir::Param)> = compiled
+    let required_values = python_osdi_eval_required_values(compiled);
+    let mut params: Vec<(mir::Value, usize, mir::Param)> = compiled
         .eval
         .dfg
         .values()
         .filter_map(|value| match compiled.eval.dfg.value_def(value) {
-            mir::ValueDef::Param(param) => Some((usize::from(param), param)),
+            mir::ValueDef::Param(param) => Some((value, usize::from(param), param)),
             _ => None,
         })
         .collect();
-    params.sort_by_key(|(index, _)| *index);
+    params.sort_by_key(|(_, index, _)| *index);
 
     params
         .into_iter()
-        .map(|(index, param)| {
+        .map(|(value, index, param)| {
+            if compiled.eval.dfg.value_dead(value) && !required_values.contains(&value) {
+                return "_LIR_UNDEF".to_owned();
+            }
             if let Some((kind, _)) = compiled.intern.params.get_index(param) {
                 python_osdi_param_expr(db, compiled, kind)
             } else {
-                let cache_index = index.saturating_sub(compiled.intern.params.len());
-                format!("_pyosdi_get(instance.get(\"cache\", []), {cache_index}, 0.0)")
+                if index < compiled.intern.params.len() {
+                    python_osdi_unsupported_expr(format!(
+                        "eval raw parameter p{} is not mapped to a supported wrapper input",
+                        index
+                    ))
+                } else {
+                    let cache_index = index - compiled.intern.params.len();
+                    format!("_pyosdi_cache(instance, {cache_index})")
+                }
             }
         })
         .collect()
+}
+
+fn python_osdi_eval_required_values(
+    compiled: &sim_back::CompiledModule<'_>,
+) -> std::collections::HashSet<mir::Value> {
+    let eval = &compiled.eval;
+    let mut values = std::collections::HashSet::new();
+    for value in compiled
+        .dae_system
+        .residual
+        .iter()
+        .flat_map(|residual| {
+            [residual.resist, residual.react, residual.resist_lim_rhs, residual.react_lim_rhs]
+        })
+        .chain(compiled.dae_system.jacobian.iter().flat_map(|entry| [entry.resist, entry.react]))
+    {
+        values.insert(mir::strip_optbarrier(eval, value));
+    }
+    for value in compiled.intern.outputs.iter().filter_map(|(kind, value)| match kind {
+        hir_lower::PlaceKind::Var(_) => value.expand(),
+        _ => None,
+    }) {
+        values.insert(mir::strip_optbarrier(eval, value));
+    }
+    values
 }
 
 fn python_osdi_builtin_params(compiled: &sim_back::CompiledModule<'_>) -> Vec<(String, f64)> {
@@ -765,9 +835,10 @@ fn python_osdi_collect_hidden_state_refs(
     intern: &hir_lower::HirInterner,
     slots: &mut std::collections::BTreeSet<String>,
 ) {
-    let params = mir_lift::collect_live_param_refs_forward(func)
-        .expect("compiled MIR function used for Python OSDI hidden-state discovery must be valid");
-    for param in params {
+    for param in func.dfg.values().filter_map(|value| match func.dfg.value_def(value) {
+        mir::ValueDef::Param(param) => Some(param),
+        _ => None,
+    }) {
         if let Some((hir_lower::ParamKind::HiddenState(var), _)) = intern.params.get_index(param) {
             slots.insert(var.name(db).to_string());
         }
@@ -795,15 +866,15 @@ fn python_osdi_param_expr(
 ) -> String {
     match *kind {
         hir_lower::ParamKind::Param(param) => {
-            format!("_pyosdi_param(instance, model, {:?}, 0.0)", param.name(db).to_string())
+            format!("_pyosdi_param(instance, model, {:?})", param.name(db).to_string())
         }
-        hir_lower::ParamKind::Abstime => "float(sim_info.get(\"abstime\", 0.0))".to_owned(),
+        hir_lower::ParamKind::Abstime => "float(_pyosdi_sim_info(sim_info, \"abstime\"))".to_owned(),
         hir_lower::ParamKind::EnableIntegration => {
-            "((int(sim_info.get(\"flags\", 0)) & 8) != 0 and (int(sim_info.get(\"flags\", 0)) & 16384) == 0)"
+            "((int(_pyosdi_sim_info(sim_info, \"flags\")) & 8) != 0 and (int(_pyosdi_sim_info(sim_info, \"flags\")) & 16384) == 0)"
                 .to_owned()
         }
         hir_lower::ParamKind::EnableLim => {
-            "((int(sim_info.get(\"flags\", 0)) & 256) != 0)".to_owned()
+            "((int(_pyosdi_sim_info(sim_info, \"flags\")) & 256) != 0)".to_owned()
         }
         hir_lower::ParamKind::PrevState(state) => {
             format!(
@@ -826,11 +897,15 @@ fn python_osdi_param_expr(
                 hi
             }
         }
-        hir_lower::ParamKind::Current(hir_lower::CurrentKind::Port(_)) => "0.0".to_owned(),
+        hir_lower::ParamKind::Current(hir_lower::CurrentKind::Port(kind)) => {
+            python_osdi_unsupported_expr(format!("eval cannot read port current {:?}", kind))
+        }
         hir_lower::ParamKind::Current(kind) => {
             python_osdi_solve_expr(compiled, sim_back::SimUnknownKind::Current(kind))
         }
-        hir_lower::ParamKind::Temperature => "float(instance.get(\"temperature\", 300.0))".to_owned(),
+        hir_lower::ParamKind::Temperature => {
+            "float(_pyosdi_instance_value(instance, \"temperature\"))".to_owned()
+        }
         hir_lower::ParamKind::ParamGiven { param } => {
             format!("_pyosdi_given(instance, model, {:?})", param.name(db).to_string())
         }
@@ -839,8 +914,8 @@ fn python_osdi_param_expr(
                 .dae_system
                 .unknowns
                 .index(&sim_back::SimUnknownKind::KirchoffLaw(port))
-                .map(usize::from);
-            format!("_pyosdi_connected(sim_info, {index:?})")
+                .map_or_else(|| "None".to_owned(), |index| usize::from(index).to_string());
+            format!("_pyosdi_connected(sim_info, {index})")
         }
         hir_lower::ParamKind::ParamSysFun(param) => {
             format!("_pyosdi_builtin(instance, {:?}, {:?})", format!("{param:?}"), param.default_value())
@@ -860,7 +935,7 @@ fn python_osdi_solve_expr(
 ) -> String {
     match compiled.dae_system.unknowns.index(&unknown).map(usize::from) {
         Some(index) => format!("_pyosdi_solve(sim_info, {index})"),
-        None => "0.0".to_owned(),
+        None => python_osdi_unsupported_expr(format!("no solve index for {:?}", unknown)),
     }
 }
 
@@ -888,45 +963,126 @@ fn python_osdi_group(
 fn append_python_osdi_module(out: &mut String, module: &PythonOsdiModule) {
     out.push_str("\n\n");
     out.push_str(
-        r#"def _pyosdi_get(seq, idx, default=0.0):
+        r#"_PYOSDI_UNSET = object()
+
+
+def _pyosdi_unsupported(message):
+    raise RuntimeError(message)
+
+
+def _pyosdi_missing(context, key):
+    raise RuntimeError(f"missing {context} {key!r}")
+
+
+def _pyosdi_get_required(seq, idx, context):
     try:
         return seq[idx]
-    except Exception:
-        return default
+    except IndexError:
+        raise RuntimeError(f"missing {context} at index {idx}") from None
+    except TypeError:
+        raise RuntimeError(f"{context} is not indexable") from None
 
 
 def _pyosdi_solve(sim_info, idx):
     if idx is None:
-        return 0.0
-    return _pyosdi_get(sim_info.get("prev_solve", []), idx, 0.0)
+        raise RuntimeError("missing solve index")
+    return _pyosdi_get_required(_pyosdi_sim_info(sim_info, "prev_solve"), idx, "prev_solve")
 
 
-def _pyosdi_dict_get(items, key, default=0.0):
+def _pyosdi_dict_get(items, key, context):
     if items is None:
-        return default
-    return items.get(key, default)
-
-
-def _pyosdi_raw_get(items, key, default=0.0):
-    val = items.get(key, default)
+        _pyosdi_missing(context, key)
+    if key not in items:
+        _pyosdi_missing(context, key)
+    val = items[key]
     if val is None:
-        return default
+        _pyosdi_missing(context, key)
+    return val
+
+
+def _pyosdi_effective_given(params, given):
+    effective = dict(given or {})
+    for key, val in (params or {}).items():
+        if key not in effective and val is not None:
+            effective[key] = True
+    return effective
+
+
+def _pyosdi_given_value(given, name):
+    return bool((given or {}).get(name, False))
+
+
+def _pyosdi_setup_param(params, given, name, default):
+    if _pyosdi_given_value(given, name):
+        return _pyosdi_dict_get(params, name, "model setup parameter")
+    return default
+
+
+def _pyosdi_given_params(params, given):
+    params = params or {}
+    return {
+        key: _pyosdi_dict_get(params, key, "parameter")
+        for key, is_given in (given or {}).items()
+        if is_given
+    }
+
+
+def _pyosdi_merge_given_params(base, params, given):
+    merged = dict(base)
+    merged.update(_pyosdi_given_params(params, given))
+    return merged
+
+
+def _pyosdi_raw_get(items, key, context):
+    if items is None:
+        _pyosdi_missing(context, key)
+    if key not in items:
+        _pyosdi_missing(context, key)
+    val = items[key]
+    if val is None or val is _PYOSDI_UNSET:
+        _pyosdi_missing(context, key)
+    return val
+
+
+def _pyosdi_sim_info(sim_info, key):
+    return _pyosdi_dict_get(sim_info, key, "sim_info")
+
+
+def _pyosdi_instance_value(instance, key):
+    return _pyosdi_dict_get(instance, key, "instance")
+
+
+def _pyosdi_model_value(model, key):
+    return _pyosdi_dict_get(model, key, "model")
+
+
+def _pyosdi_cache(instance, idx):
+    val = _pyosdi_get_required(_pyosdi_instance_value(instance, "cache"), idx, "cache")
+    if val is _PYOSDI_UNSET or val is None:
+        raise RuntimeError(f"missing cache value at index {idx}")
     return val
 
 
 def _pyosdi_state(sim_info, which, idx):
-    return _pyosdi_get(sim_info.get(which, []), idx, 0.0)
+    return _pyosdi_get_required(_pyosdi_sim_info(sim_info, which), idx, which)
 
 
 def _pyosdi_state_idx(instance, idx):
-    return _pyosdi_get(instance.get("state_idx", []), idx, idx)
+    return _pyosdi_get_required(_pyosdi_instance_value(instance, "state_idx"), idx, "state_idx")
 
 
-def _pyosdi_param(instance, model, name, default=0.0):
-    inst_params = instance.get("params", {})
-    if name in inst_params:
+def _pyosdi_param(instance, model, name):
+    inst_params = _pyosdi_instance_value(instance, "params")
+    if name in inst_params and inst_params[name] is not None:
         return inst_params[name]
-    return model.get("params", {}).get(name, default)
+    if name in inst_params:
+        _pyosdi_missing("parameter", name)
+    model_params = _pyosdi_model_value(model, "params")
+    if name in model_params and model_params[name] is not None:
+        return model_params[name]
+    if name in model_params:
+        _pyosdi_missing("parameter", name)
+    _pyosdi_missing("parameter", name)
 
 
 def _pyosdi_given(instance, model, name):
@@ -937,21 +1093,39 @@ def _pyosdi_given(instance, model, name):
 
 
 def _pyosdi_builtin(instance, name, default):
-    return instance.get("builtin_params", {}).get(name, default)
+    return _pyosdi_builtin_default(_pyosdi_instance_value(instance, "builtin_params"), name, default)
+
+
+def _pyosdi_builtin_default(items, name, default):
+    if items is None or name not in items:
+        return default
+    val = items[name]
+    if val is None:
+        _pyosdi_missing("builtin parameter", name)
+    return val
 
 
 def _pyosdi_connected(sim_info, idx):
     if idx is None:
-        return False
-    connected = sim_info.get("connected_terminals", sim_info.get("num_terminals", 0))
+        raise RuntimeError("missing connected terminal index")
+    connected = _pyosdi_sim_info(sim_info, "connected_terminals")
     return idx < connected
 
 
 def _pyosdi_hidden(instance, name):
-    hidden = instance.setdefault("hidden", {})
+    hidden = _pyosdi_instance_value(instance, "hidden")
     if name not in hidden:
-        hidden[name] = 0.0
+        _pyosdi_missing("hidden state", name)
+    if hidden[name] is _PYOSDI_UNSET or hidden[name] is None:
+        _pyosdi_missing("hidden state", name)
     return hidden[name]
+
+
+def _pyosdi_return_flags(raw):
+    state = raw.get("_lir_state") if isinstance(raw, dict) else None
+    if isinstance(state, dict) and state.get("invalid_params"):
+        raise RuntimeError(f"unsupported invalid parameter flag(s): {state['invalid_params']!r}")
+    return int(state.get("ret_flags", 0)) if isinstance(state, dict) else 0
 
 
 def _pyosdi_missing_hidden(name):
@@ -970,6 +1144,7 @@ def _pyosdi_missing_hidden(name):
     out.push_str("        given = {}\n");
     out.push_str("    if builtin_params is None:\n");
     out.push_str("        builtin_params = {}\n");
+    out.push_str("    given = _pyosdi_effective_given(params, given)\n");
     out.push_str("    _raw_args = [\n");
     for arg in &module.model_args {
         out.push_str("        ");
@@ -978,17 +1153,21 @@ def _pyosdi_missing_hidden(name):
     }
     out.push_str("    ]\n");
     out.push_str(&format!("    _raw = {}(*_raw_args)\n", module.raw_model_function));
-    out.push_str("    _params = dict(params)\n");
+    out.push_str("    _params = _pyosdi_given_params(params, given)\n");
     out.push_str("    _inst_defaults = {}\n");
     for (name, value) in &module.model_params {
+        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
         out.push_str(&format!(
-            "    _params[{name:?}] = _pyosdi_raw_get(_raw, {:?}, _params.get({name:?}, 0.0))\n",
+            "        _params[{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
+            value.to_string(),
             value.to_string()
         ));
     }
     for (name, value) in &module.model_instance_defaults {
+        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
         out.push_str(&format!(
-            "    _inst_defaults[{name:?}] = _pyosdi_raw_get(_raw, {:?}, _pyosdi_dict_get(params, {name:?}, 0.0))\n",
+            "        _inst_defaults[{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
+            value.to_string(),
             value.to_string()
         ));
     }
@@ -999,7 +1178,7 @@ def _pyosdi_missing_hidden(name):
 
     out.push_str("\n\n");
     out.push_str(&format!(
-        "def {}(model=None, temperature=300.0, params=None, given=None, connected_terminals=0):\n",
+        "def {}(model=None, temperature=300.0, params=None, given=None, connected_terminals=None):\n",
         module.setup_instance_function
     ));
     out.push_str("    if model is None:\n");
@@ -1012,10 +1191,8 @@ def _pyosdi_missing_hidden(name):
         out.push_str(&format!("{name:?}: {default:?}"));
     }
     out.push_str("}\n");
-    out.push_str("    _params = dict(model.get(\"inst_defaults\", {}))\n");
-    out.push_str("    if params:\n");
-    out.push_str("        _params.update(params)\n");
-    out.push_str("    _given = dict(given or {})\n");
+    out.push_str("    _given = _pyosdi_effective_given(params, given)\n");
+    out.push_str("    _params = _pyosdi_merge_given_params(_pyosdi_model_value(model, \"inst_defaults\"), params, _given)\n");
     out.push_str("    _hidden = {");
     for (idx, name) in module.hidden_slots.iter().enumerate() {
         if idx != 0 {
@@ -1039,24 +1216,30 @@ def _pyosdi_missing_hidden(name):
     out.push_str(&format!("    _raw = {}(*_raw_args)\n", module.raw_init_function));
     out.push_str("    instance[\"raw\"] = _raw\n");
     for (name, value) in &module.instance_params {
+        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
         out.push_str(&format!(
-            "    instance[\"params\"][{name:?}] = _pyosdi_raw_get(_raw, {:?}, instance[\"params\"].get({name:?}, 0.0))\n",
+            "        instance[\"params\"][{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
+            value.to_string(),
             value.to_string()
         ));
     }
     out.push_str("    _cache = instance[\"cache\"]\n");
     for (idx, value) in module.cache_values.iter().enumerate() {
         if let Some(value) = value {
+            out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
             out.push_str(&format!(
-                "    _cache[{idx}] = _pyosdi_raw_get(_raw, {:?}, _cache[{idx}])\n",
+                "        _cache[{idx}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
+                value.to_string(),
                 value.to_string()
             ));
         }
     }
     out.push_str("    _hidden = instance[\"hidden\"]\n");
     for (name, value) in &module.init_hidden_values {
+        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
         out.push_str(&format!(
-            "    _hidden[{name:?}] = _pyosdi_raw_get(_raw, {:?}, _hidden.get({name:?}, 0.0))\n",
+            "        _hidden[{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
+            value.to_string(),
             value.to_string()
         ));
     }
@@ -1070,7 +1253,7 @@ def _pyosdi_missing_hidden(name):
     out.push_str("    if instance is None:\n");
     out.push_str(&format!("        instance = {}(model)\n", module.setup_instance_function));
     out.push_str("    if model is None:\n");
-    out.push_str("        model = instance.get(\"model\", {})\n");
+    out.push_str("        model = _pyosdi_instance_value(instance, \"model\")\n");
     out.push_str("    if sim_info is None:\n");
     out.push_str("        sim_info = {}\n");
     out.push_str("    _raw_args = [\n");
@@ -1091,7 +1274,11 @@ def _pyosdi_missing_hidden(name):
                 out.push_str(", ");
             }
             match value {
-                Some(value) => out.push_str(&format!("_raw[{:?}]", value.to_string())),
+                Some(value) => out.push_str(&format!(
+                    "_pyosdi_raw_get(_raw, {:?}, {:?})",
+                    value.to_string(),
+                    value.to_string()
+                )),
                 None => out.push_str("0.0"),
             }
         }
@@ -1099,20 +1286,23 @@ def _pyosdi_missing_hidden(name):
     }
     out.push_str("    }\n");
     out.push_str("    instance[\"outputs\"] = _outputs\n");
-    out.push_str("    _hidden = instance.setdefault(\"hidden\", {})\n");
+    out.push_str("    _hidden = _pyosdi_instance_value(instance, \"hidden\")\n");
     for (name, value) in &module.eval_hidden_values {
+        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
         out.push_str(&format!(
-            "    _hidden[{name:?}] = _pyosdi_raw_get(_raw, {:?}, _hidden.get({name:?}, 0.0))\n",
+            "        _hidden[{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
+            value.to_string(),
             value.to_string()
         ));
     }
-    out.push_str("    return {\"flags\": 0, **_outputs}\n");
+    out.push_str("    return {\"flags\": _pyosdi_return_flags(_raw), **_outputs}\n");
 
     for group in &module.outputs {
         out.push_str("\n\n");
         out.push_str(&format!("def {0}_load_{1}(instance):\n", module.name, group.name));
         out.push_str(&format!(
-            "    return instance.get(\"outputs\", {{}}).get({:?}, [])\n",
+            "    return _pyosdi_raw_get(_pyosdi_instance_value(instance, \"outputs\"), {:?}, {:?})\n",
+            group.name,
             group.name
         ));
     }
