@@ -48,8 +48,16 @@ pub struct Block {
 pub enum Stmt {
     Assign { dst: LocalId, value: Expr },
     Capture { key: String, value: Expr },
+    CallEffect(CallEffect),
     Expr(Expr),
     Unsupported { dsts: Vec<LocalId>, text: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CallEffect {
+    Diagnostic { target: String, args: Vec<Expr> },
+    SetInvalidParam { param: String },
+    CollapseHint { hi: String, lo: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +74,7 @@ pub enum Expr {
     Const(ConstValue),
     Unary { op: UnaryOp, arg: Box<Expr> },
     Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr> },
+    SimparamOpt { name: Box<Expr>, default: Box<Expr> },
     Call { target: String, args: Vec<Expr> },
     Unsupported { text: String, args: Vec<Expr> },
 }
@@ -203,6 +212,7 @@ impl fmt::Display for Stmt {
         match self {
             Stmt::Assign { dst, value } => write!(f, "{dst} = {value};"),
             Stmt::Capture { key, value } => write!(f, "capture {key:?} = {value};"),
+            Stmt::CallEffect(effect) => write!(f, "{effect};"),
             Stmt::Expr(value) => write!(f, "{value};"),
             Stmt::Unsupported { dsts, text } if dsts.is_empty() => {
                 write!(f, "unsupported {text:?};")
@@ -215,6 +225,32 @@ impl fmt::Display for Stmt {
                     write!(f, "{dst}")?;
                 }
                 write!(f, " = unsupported {text:?};")
+            }
+        }
+    }
+}
+
+impl fmt::Display for CallEffect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CallEffect::Diagnostic { target, args } => {
+                write!(f, "diagnostic {target:?}(")?;
+                for (index, arg) in args.iter().enumerate() {
+                    if index != 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{arg}")?;
+                }
+                write!(f, ")")
+            }
+            CallEffect::SetInvalidParam { param } => {
+                write!(f, "set_invalid_param({param})")
+            }
+            CallEffect::CollapseHint { hi, lo: Some(lo) } => {
+                write!(f, "collapse_hint({hi}, {lo})")
+            }
+            CallEffect::CollapseHint { hi, lo: None } => {
+                write!(f, "collapse_hint({hi}, none)")
             }
         }
     }
@@ -251,6 +287,9 @@ impl fmt::Display for Expr {
             Expr::Const(value) => write!(f, "{value}"),
             Expr::Unary { op, arg } => write!(f, "{op}({arg})"),
             Expr::Binary { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
+            Expr::SimparamOpt { name, default } => {
+                write!(f, "simparam_opt({name}, {default})")
+            }
             Expr::Call { target, args } => {
                 write!(f, "{target}(")?;
                 for (index, arg) in args.iter().enumerate() {

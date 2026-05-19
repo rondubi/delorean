@@ -892,6 +892,7 @@ name = "mir_lift"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "hir_lower",
  "lasso",
  "mir",
  "mir_reader",

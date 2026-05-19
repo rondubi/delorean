@@ -1,6 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::lir::{BinaryOp, ConstValue, Expr, Function, Label, LocalId, Stmt, Terminator, UnaryOp};
+use crate::lir::{
+    BinaryOp, CallEffect, ConstValue, Expr, Function, Label, LocalId, Stmt, Terminator, UnaryOp,
+};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ForwardFacts {
@@ -108,6 +110,7 @@ fn rewrite_stmt(stmt: &mut Stmt, env: &mut ConstEnv) {
             }
         }
         Stmt::Capture { value, .. } => *value = rewrite_expr(value.clone(), env),
+        Stmt::CallEffect(effect) => rewrite_call_effect(effect, env),
         Stmt::Expr(value) => *value = rewrite_expr(value.clone(), env),
         Stmt::Unsupported { dsts, .. } => {
             for dst in dsts {
@@ -156,6 +159,7 @@ fn transfer_block<'a>(
                 }
             }
             Stmt::Capture { .. } => {}
+            Stmt::CallEffect(_) => {}
             Stmt::Expr(_) => {}
             Stmt::Unsupported { dsts, .. } => {
                 for dst in dsts {
@@ -189,6 +193,10 @@ fn rewrite_expr(expr: Expr, env: &ConstEnv) -> Expr {
             lhs: Box::new(rewrite_expr(*lhs, env)),
             rhs: Box::new(rewrite_expr(*rhs, env)),
         },
+        Expr::SimparamOpt { name, default } => Expr::SimparamOpt {
+            name: Box::new(rewrite_expr(*name, env)),
+            default: Box::new(rewrite_expr(*default, env)),
+        },
         Expr::Call { target, args } => Expr::Call {
             target,
             args: args.into_iter().map(|arg| rewrite_expr(arg, env)).collect(),
@@ -200,6 +208,17 @@ fn rewrite_expr(expr: Expr, env: &ConstEnv) -> Expr {
         Expr::Const(_) => expr,
     };
     fold_expr(expr)
+}
+
+fn rewrite_call_effect(effect: &mut CallEffect, env: &ConstEnv) {
+    match effect {
+        CallEffect::Diagnostic { args, .. } => {
+            for arg in args {
+                *arg = rewrite_expr(arg.clone(), env);
+            }
+        }
+        CallEffect::SetInvalidParam { .. } | CallEffect::CollapseHint { .. } => {}
+    }
 }
 
 fn fold_expr(expr: Expr) -> Expr {

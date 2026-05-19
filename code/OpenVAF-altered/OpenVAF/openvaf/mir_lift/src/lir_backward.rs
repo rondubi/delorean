@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::lir::{ConstValue, Expr, Function, Label, LocalId, ReturnValue, Stmt};
+use crate::lir::{CallEffect, ConstValue, Expr, Function, Label, LocalId, ReturnValue, Stmt};
 use crate::lir_structure::{StructuredFunction, StructuredStmt};
 
 const CLEANUP_ROUNDS: usize = 4;
@@ -482,6 +482,7 @@ fn stmt_text_cost(function: &Function, stmt: &Stmt) -> usize {
             local_text_cost(function, *dst) + 4 + expr_text_cost(function, value)
         }
         Stmt::Capture { key, value } => 24 + key.len() + expr_text_cost(function, value),
+        Stmt::CallEffect(_) => 8,
         Stmt::Expr(value) => expr_text_cost(function, value),
         Stmt::Unsupported { dsts, text } => {
             16 + text.len() + dsts.iter().map(|dst| local_text_cost(function, *dst)).sum::<usize>()
@@ -506,6 +507,9 @@ fn expr_text_cost(function: &Function, expr: &Expr) -> usize {
         Expr::Unary { arg, .. } => 8 + expr_text_cost(function, arg),
         Expr::Binary { lhs, rhs, .. } => {
             8 + expr_text_cost(function, lhs) + expr_text_cost(function, rhs)
+        }
+        Expr::SimparamOpt { name, default } => {
+            16 + expr_text_cost(function, name) + expr_text_cost(function, default)
         }
         Expr::Call { target, args } => {
             12 + target.len()
@@ -1074,7 +1078,7 @@ fn mark_stmt_defs_for_definedness(stmt: &Stmt, defined: &mut HashSet<LocalId>) {
         Stmt::Unsupported { dsts, .. } => {
             defined.extend(dsts.iter().copied());
         }
-        Stmt::Capture { .. } | Stmt::Expr(_) => {}
+        Stmt::Capture { .. } | Stmt::CallEffect(_) | Stmt::Expr(_) => {}
     }
 }
 
@@ -1168,6 +1172,7 @@ fn apply_liveness_transfer(
             collect_expr_locals(value, live);
         }
         StructuredStmt::Stmt(Stmt::Capture { value, .. }) => collect_expr_locals(value, live),
+        StructuredStmt::Stmt(Stmt::CallEffect(effect)) => collect_call_effect_locals(effect, live),
         StructuredStmt::Stmt(Stmt::Expr(value)) => collect_expr_locals(value, live),
         StructuredStmt::Stmt(Stmt::Unsupported { dsts, .. }) => {
             for dst in dsts {
@@ -1198,6 +1203,9 @@ fn expr_has_side_effects(expr: &Expr) -> bool {
         Expr::Call { .. } | Expr::Unsupported { .. } => true,
         Expr::Unary { arg, .. } => expr_has_side_effects(arg),
         Expr::Binary { lhs, rhs, .. } => expr_has_side_effects(lhs) || expr_has_side_effects(rhs),
+        Expr::SimparamOpt { name, default } => {
+            expr_has_side_effects(name) || expr_has_side_effects(default)
+        }
         Expr::Local(_) | Expr::Const(_) => false,
     }
 }
@@ -1265,6 +1273,9 @@ fn live_in_stmt_static(
             collect_expr_locals(value, &mut live);
         }
         StructuredStmt::Stmt(Stmt::Capture { value, .. }) => collect_expr_locals(value, &mut live),
+        StructuredStmt::Stmt(Stmt::CallEffect(effect)) => {
+            collect_call_effect_locals(effect, &mut live)
+        }
         StructuredStmt::Stmt(Stmt::Expr(value)) => collect_expr_locals(value, &mut live),
         StructuredStmt::Stmt(Stmt::Unsupported { dsts, .. }) => {
             for dst in dsts {
@@ -1321,6 +1332,9 @@ impl BackwardPassCx<'_> {
             }
             StructuredStmt::Stmt(Stmt::Capture { value, .. }) => {
                 collect_expr_locals(value, &mut live)
+            }
+            StructuredStmt::Stmt(Stmt::CallEffect(effect)) => {
+                collect_call_effect_locals(effect, &mut live)
             }
             StructuredStmt::Stmt(Stmt::Expr(value)) => collect_expr_locals(value, &mut live),
             StructuredStmt::Stmt(Stmt::Unsupported { dsts, .. }) => {
@@ -1416,11 +1430,26 @@ fn collect_expr_locals(expr: &Expr, locals: &mut LiveSet) {
             collect_expr_locals(lhs, locals);
             collect_expr_locals(rhs, locals);
         }
+        Expr::SimparamOpt { name, default } => {
+            collect_expr_locals(name, locals);
+            collect_expr_locals(default, locals);
+        }
         Expr::Call { args, .. } | Expr::Unsupported { args, .. } => {
             for arg in args {
                 collect_expr_locals(arg, locals);
             }
         }
+    }
+}
+
+fn collect_call_effect_locals(effect: &CallEffect, locals: &mut LiveSet) {
+    match effect {
+        CallEffect::Diagnostic { args, .. } => {
+            for arg in args {
+                collect_expr_locals(arg, locals);
+            }
+        }
+        CallEffect::SetInvalidParam { .. } | CallEffect::CollapseHint { .. } => {}
     }
 }
 
@@ -1430,6 +1459,9 @@ fn collect_structured_stmt_uses(stmt: &StructuredStmt, locals: &mut Vec<LocalId>
         | StructuredStmt::Stmt(Stmt::Capture { value, .. })
         | StructuredStmt::Stmt(Stmt::Expr(value)) => {
             collect_expr_local_ids(value, locals);
+        }
+        StructuredStmt::Stmt(Stmt::CallEffect(effect)) => {
+            collect_call_effect_local_ids(effect, locals);
         }
         StructuredStmt::Stmt(Stmt::Unsupported { .. }) => {}
         StructuredStmt::If { cond, then_body, else_body } => {
@@ -1461,11 +1493,26 @@ fn collect_expr_local_ids(expr: &Expr, locals: &mut Vec<LocalId>) {
             collect_expr_local_ids(lhs, locals);
             collect_expr_local_ids(rhs, locals);
         }
+        Expr::SimparamOpt { name, default } => {
+            collect_expr_local_ids(name, locals);
+            collect_expr_local_ids(default, locals);
+        }
         Expr::Call { args, .. } | Expr::Unsupported { args, .. } => {
             for arg in args {
                 collect_expr_local_ids(arg, locals);
             }
         }
+    }
+}
+
+fn collect_call_effect_local_ids(effect: &CallEffect, locals: &mut Vec<LocalId>) {
+    match effect {
+        CallEffect::Diagnostic { args, .. } => {
+            for arg in args {
+                collect_expr_local_ids(arg, locals);
+            }
+        }
+        CallEffect::SetInvalidParam { .. } | CallEffect::CollapseHint { .. } => {}
     }
 }
 

@@ -342,8 +342,8 @@ fn compile_with_mir_lift(
             .values()
             .copied()
             .filter_map(|value| value.expand())
-            .chain(compiled.init.cached_vals.keys().copied())
             .collect::<Vec<_>>();
+        let init_capture_values = compiled.init.cached_vals.keys().copied().collect::<Vec<_>>();
         let python_osdi = PythonOsdiModule::new(base_name.to_string(), db, &compiled);
         let eval_output_values = python_osdi.return_values();
 
@@ -353,19 +353,21 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_returns(
+                mir_lift::dump_function_lir_with_hir_returns(
                     &compiled.model_param_setup,
                     &model_output_values,
                     &literals,
+                    &compiled.model_param_intern,
                 )?
             )?;
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_returns(
+            &mir_lift::lift_function_with_hir_returns(
                 &compiled.model_param_setup,
                 &model_output_values,
                 &literals,
+                &compiled.model_param_intern,
             )?,
             &mut first_unit,
         )?;
@@ -375,19 +377,23 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_returns(
+                mir_lift::dump_function_lir_with_hir_returns_and_captures(
                     &compiled.init.func,
                     &init_output_values,
+                    &init_capture_values,
                     &literals,
+                    &compiled.init.intern,
                 )?
             )?;
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_returns(
+            &mir_lift::lift_function_with_hir_returns_and_captures(
                 &compiled.init.func,
                 &init_output_values,
+                &init_capture_values,
                 &literals,
+                &compiled.init.intern,
             )?,
             &mut first_unit,
         )?;
@@ -397,16 +403,22 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_returns(
+                mir_lift::dump_function_lir_with_hir_returns(
                     &compiled.eval,
                     &eval_output_values,
                     &literals,
+                    &compiled.intern,
                 )?
             )?;
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_returns(&compiled.eval, &eval_output_values, &literals)?,
+            &mir_lift::lift_function_with_hir_returns(
+                &compiled.eval,
+                &eval_output_values,
+                &literals,
+                &compiled.intern,
+            )?,
             &mut first_unit,
         )?;
         append_python_osdi_module(&mut python, &python_osdi);
@@ -429,6 +441,7 @@ struct PythonOsdiModule {
     init_args: Vec<String>,
     eval_args: Vec<String>,
     model_params: Vec<(String, mir::Value)>,
+    model_instance_defaults: Vec<(String, mir::Value)>,
     instance_params: Vec<(String, mir::Value)>,
     cache_values: Vec<Option<mir::Value>>,
     builtin_params: Vec<(String, f64)>,
@@ -468,8 +481,19 @@ impl PythonOsdiModule {
                 SetupPhase::Instance,
             ),
             eval_args: python_osdi_eval_args(db, compiled),
-            model_params: python_osdi_param_outputs(db, &compiled.model_param_intern),
-            instance_params: python_osdi_param_outputs(db, &compiled.init.intern),
+            model_params: python_osdi_param_outputs(
+                db,
+                compiled,
+                &compiled.model_param_intern,
+                false,
+            ),
+            model_instance_defaults: python_osdi_param_outputs(
+                db,
+                compiled,
+                &compiled.model_param_intern,
+                true,
+            ),
+            instance_params: python_osdi_param_outputs(db, compiled, &compiled.init.intern, true),
             cache_values: python_osdi_cache_values(compiled),
             builtin_params: python_osdi_builtin_params(compiled),
             hidden_slots: python_osdi_hidden_slots(db, compiled),
@@ -630,20 +654,27 @@ fn python_osdi_setup_param_expr(
         | hir_lower::ParamKind::NewState(_) => "0.0".to_owned(),
         hir_lower::ParamKind::HiddenState(var) => match phase {
             SetupPhase::Model => format!("_pyosdi_missing_hidden({:?})", var.name(db).to_string()),
-            SetupPhase::Instance => format!("_pyosdi_hidden(instance, {:?})", var.name(db).to_string()),
+            SetupPhase::Instance => {
+                format!("_pyosdi_hidden(instance, {:?})", var.name(db).to_string())
+            }
         },
     }
 }
 
 fn python_osdi_param_outputs(
     db: &CompilationDB,
+    compiled: &sim_back::CompiledModule<'_>,
     intern: &hir_lower::HirInterner,
+    want_instance: bool,
 ) -> Vec<(String, mir::Value)> {
     intern
         .outputs
         .iter()
         .filter_map(|(kind, value)| match kind {
             hir_lower::PlaceKind::Param(param) => {
+                if compiled.info.params[param].is_instance != want_instance {
+                    return None;
+                }
                 Some((param.name(db).to_string(), value.expand()?))
             }
             _ => None,
@@ -712,7 +743,12 @@ fn python_osdi_hidden_slots(
         &compiled.model_param_intern,
         &mut slots,
     );
-    python_osdi_collect_hidden_state_refs(db, &compiled.init.func, &compiled.init.intern, &mut slots);
+    python_osdi_collect_hidden_state_refs(
+        db,
+        &compiled.init.func,
+        &compiled.init.intern,
+        &mut slots,
+    );
     python_osdi_collect_hidden_state_refs(db, &compiled.eval, &compiled.intern, &mut slots);
     for (name, _) in python_osdi_hidden_outputs(db, &compiled.init.intern) {
         slots.insert(name);
@@ -943,14 +979,21 @@ def _pyosdi_missing_hidden(name):
     out.push_str("    ]\n");
     out.push_str(&format!("    _raw = {}(*_raw_args)\n", module.raw_model_function));
     out.push_str("    _params = dict(params)\n");
+    out.push_str("    _inst_defaults = {}\n");
     for (name, value) in &module.model_params {
         out.push_str(&format!(
             "    _params[{name:?}] = _pyosdi_raw_get(_raw, {:?}, _params.get({name:?}, 0.0))\n",
             value.to_string()
         ));
     }
+    for (name, value) in &module.model_instance_defaults {
+        out.push_str(&format!(
+            "    _inst_defaults[{name:?}] = _pyosdi_raw_get(_raw, {:?}, _pyosdi_dict_get(params, {name:?}, 0.0))\n",
+            value.to_string()
+        ));
+    }
     out.push_str(&format!(
-        "    return {{\"module\": {:?}, \"raw\": _raw, \"params\": _params, \"given\": dict(given), \"inst_defaults\": {{}}, \"builtin_params\": dict(builtin_params)}}\n",
+        "    return {{\"module\": {:?}, \"raw\": _raw, \"params\": _params, \"given\": dict(given), \"inst_defaults\": _inst_defaults, \"builtin_params\": dict(builtin_params)}}\n",
         module.name
     ));
 

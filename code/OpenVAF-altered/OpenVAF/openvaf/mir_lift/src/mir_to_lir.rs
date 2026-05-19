@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Result};
+use hir_lower::{CallBackKind, ParamInfoKind};
 use lasso::Resolver;
 use mir::{Block, Const, FuncRef, Function, Inst, InstructionData, Opcode, Value, ValueDef};
 
 use crate::lir::{
-    BinaryOp, ConstValue, Expr, Label, LirType, Local, LocalId, MathBinary, MathUnary, ReturnSlot,
-    ReturnValue, Stmt, Terminator, UnaryOp,
+    BinaryOp, CallEffect, ConstValue, Expr, Label, LirType, Local, LocalId, MathBinary, MathUnary,
+    ReturnSlot, ReturnValue, Stmt, Terminator, UnaryOp,
 };
 use crate::mir_forward::{direct_copy_source, run_forward_passes, AliasExpr, ForwardFacts};
 use crate::FunctionUnit;
@@ -172,6 +173,9 @@ impl<'a, 'r> LowerCx<'a, 'r> {
                 }
             }
         }
+        if let InstructionData::Call { func_ref, args } = &data {
+            return self.lower_call_inst(*func_ref, args.clone(), &results, &rendered, stmts);
+        }
         match self.expr_for_inst(&data) {
             Some(expr) if results.len() == 1 => {
                 let dst = self.local_for_result(results[0]);
@@ -189,6 +193,65 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             }
             None => {
                 bail!("unsupported MIR instruction in {}: {rendered}", self.unit.name);
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_call_inst(
+        &mut self,
+        func_ref: FuncRef,
+        args: mir::ValueList,
+        results: &[Value],
+        rendered: &str,
+        stmts: &mut Vec<Stmt>,
+    ) -> Result<()> {
+        let target = call_name(self.unit.source, func_ref);
+        let args = args
+            .as_slice(&self.unit.source.dfg.insts.value_lists)
+            .iter()
+            .map(|arg| self.expr_for_value(*arg))
+            .collect::<Vec<_>>();
+
+        let lowered = match self.unit.callbacks {
+            Some(intern) => {
+                if usize::from(func_ref) >= intern.callbacks.len() {
+                    bail!(
+                        "MIR call {target:?} in {} has no HIR callback metadata: {rendered}",
+                        self.unit.name
+                    );
+                }
+                classify_hir_callback(&intern.callbacks[func_ref], args)
+            }
+            None => classify_signature_call(&target, args),
+        };
+
+        match lowered {
+            LoweredCall::Expr(expr) if results.len() == 1 => {
+                let dst = self.local_for_result(results[0]);
+                stmts.push(Stmt::Assign { dst, value: expr });
+                self.capture_value_from_expr(results[0], Expr::Local(dst), stmts);
+            }
+            LoweredCall::Expr(_) => {
+                bail!(
+                    "MIR call {target:?} in {} must produce exactly one result: {rendered}",
+                    self.unit.name
+                );
+            }
+            LoweredCall::Effect(effect) if results.is_empty() => {
+                stmts.push(Stmt::CallEffect(effect));
+            }
+            LoweredCall::Effect(_) => {
+                bail!(
+                    "MIR call {target:?} in {} has side-effect semantics but also returns values: {rendered}",
+                    self.unit.name
+                );
+            }
+            LoweredCall::Unsupported => {
+                bail!(
+                    "unsupported MIR call target in {}: {target:?} from {rendered}",
+                    self.unit.name
+                );
             }
         }
         Ok(())
@@ -218,14 +281,7 @@ impl<'a, 'r> LowerCx<'a, 'r> {
                 lhs: Box::new(self.expr_for_value(args[0])),
                 rhs: Box::new(self.expr_for_value(args[1])),
             }),
-            InstructionData::Call { func_ref, args } => Some(Expr::Call {
-                target: call_name(self.unit.source, *func_ref),
-                args: args
-                    .as_slice(&self.unit.source.dfg.insts.value_lists)
-                    .iter()
-                    .map(|arg| self.expr_for_value(*arg))
-                    .collect(),
-            }),
+            InstructionData::Call { .. } => None,
             _ => None,
         }
     }
@@ -572,10 +628,212 @@ fn call_name(function: &Function, func_ref: FuncRef) -> String {
     }
 }
 
+#[derive(Debug)]
+enum LoweredCall {
+    Expr(Expr),
+    Effect(CallEffect),
+    Unsupported,
+}
+
+fn classify_hir_callback(callback: &CallBackKind, args: Vec<Expr>) -> LoweredCall {
+    match callback {
+        CallBackKind::SimParamOpt => {
+            if args.len() == 2 {
+                LoweredCall::Expr(Expr::SimparamOpt {
+                    name: Box::new(args[0].clone()),
+                    default: Box::new(args[1].clone()),
+                })
+            } else {
+                LoweredCall::Unsupported
+            }
+        }
+        CallBackKind::Print { kind, .. } => {
+            LoweredCall::Effect(CallEffect::Diagnostic { target: format!("{kind:?}"), args })
+        }
+        CallBackKind::ParamInfo(ParamInfoKind::Invalid, param) => {
+            LoweredCall::Effect(CallEffect::SetInvalidParam { param: format!("{param:?}") })
+        }
+        CallBackKind::CollapseHint(hi, lo) => LoweredCall::Effect(CallEffect::CollapseHint {
+            hi: format!("{hi:?}"),
+            lo: lo.map(|node| format!("{node:?}")),
+        }),
+        _ => LoweredCall::Unsupported,
+    }
+}
+
+// Temporary adapter for MIR text that has lost HirInterner callback identity.
+// OpenVAF production lowering passes structured CallBackKind above; this accepts only
+// signature encodings produced by hir_lower::CallBackKind::signature plus the sanitized
+// spelling produced by normalize_mir_input for legacy text dumps.
+fn classify_signature_call(target: &str, args: Vec<Expr>) -> LoweredCall {
+    if target == "simparam_opt" {
+        if args.len() == 2 {
+            return LoweredCall::Expr(Expr::SimparamOpt {
+                name: Box::new(args[0].clone()),
+                default: Box::new(args[1].clone()),
+            });
+        }
+        return LoweredCall::Unsupported;
+    }
+
+    if diagnostic_target_kind(target).is_some() {
+        return LoweredCall::Effect(CallEffect::Diagnostic { target: target.to_owned(), args });
+    }
+
+    if let Some(param) = parse_invalid_param_target(target) {
+        return LoweredCall::Effect(CallEffect::SetInvalidParam { param });
+    }
+
+    if let Some((hi, lo)) = parse_collapse_hint_target(target) {
+        return LoweredCall::Effect(CallEffect::CollapseHint { hi, lo });
+    }
+
+    LoweredCall::Unsupported
+}
+
+fn diagnostic_target_kind(target: &str) -> Option<&str> {
+    const KINDS: [&str; 7] =
+        ["Debug)", "Display)", "Info)", "Warn)", "Error)", "Fatal)", "Monitor)"];
+    KINDS.iter().copied().find(|kind| *kind == target)
+}
+
+fn parse_invalid_param_target(target: &str) -> Option<String> {
+    if let Some(raw) = target.strip_prefix("set_Invalid(").and_then(|rest| rest.strip_suffix(')')) {
+        if raw.starts_with("Parameter { id: ParamId(") && raw.ends_with(") }") {
+            return Some(raw.to_owned());
+        }
+    }
+
+    let rest = target.strip_prefix("set_Invalid_Parameter___id__ParamId_")?;
+    let id = rest.strip_suffix("____")?;
+    if id.chars().all(|ch| ch.is_ascii_digit()) {
+        Some(format!("Parameter {{ id: ParamId({id}) }}"))
+    } else {
+        None
+    }
+}
+
+fn parse_collapse_hint_target(target: &str) -> Option<(String, Option<String>)> {
+    let (hi_digits, rest) = split_leading_digits(target.strip_prefix("collapse_node")?)?;
+    let hi = format!("node{hi_digits}");
+    if rest == "_None" {
+        return Some((hi, None));
+    }
+    let lo_digits = rest
+        .strip_prefix("_Some(node")
+        .and_then(|lo| lo.strip_suffix(')'))
+        .or_else(|| rest.strip_prefix("_Some_node").and_then(|lo| lo.strip_suffix('_')))?;
+    if lo_digits.chars().all(|ch| ch.is_ascii_digit()) {
+        Some((hi, Some(format!("node{lo_digits}"))))
+    } else {
+        None
+    }
+}
+
+fn split_leading_digits(input: &str) -> Option<(&str, &str)> {
+    let len = input.chars().take_while(|ch| ch.is_ascii_digit()).map(char::len_utf8).sum();
+    if len == 0 {
+        None
+    } else {
+        Some(input.split_at(len))
+    }
+}
+
 fn value_name(value: Value) -> String {
     format!("{value}").replace('.', "_")
 }
 
 fn block_name(block: Block) -> String {
     format!("{block}").replace('.', "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::lir::{CallEffect, ConstValue, Expr};
+
+    use super::{classify_signature_call, LoweredCall};
+
+    #[test]
+    fn adapter_classifies_known_signature_call_targets() {
+        match classify_signature_call(
+            "simparam_opt",
+            vec![
+                Expr::Const(ConstValue::Str("gmin".to_owned())),
+                Expr::Const(ConstValue::Real(1e-12)),
+            ],
+        ) {
+            LoweredCall::Expr(Expr::SimparamOpt { default, .. }) => {
+                assert_eq!(*default, Expr::Const(ConstValue::Real(1e-12)));
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+
+        match classify_signature_call(
+            "Display)",
+            vec![Expr::Const(ConstValue::Str("warn".to_owned()))],
+        ) {
+            LoweredCall::Effect(CallEffect::Diagnostic { target, args }) => {
+                assert_eq!(target, "Display)");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+
+        match classify_signature_call("set_Invalid(Parameter { id: ParamId(12) })", Vec::new()) {
+            LoweredCall::Effect(CallEffect::SetInvalidParam { param }) => {
+                assert_eq!(param, "Parameter { id: ParamId(12) }")
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+
+        match classify_signature_call("collapse_node3_Some(node10)", Vec::new()) {
+            LoweredCall::Effect(CallEffect::CollapseHint { hi, lo }) => {
+                assert_eq!(hi, "node3");
+                assert_eq!(lo.as_deref(), Some("node10"));
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+
+        match classify_signature_call("collapse_node3_Some_node10_", Vec::new()) {
+            LoweredCall::Effect(CallEffect::CollapseHint { hi, lo }) => {
+                assert_eq!(hi, "node3");
+                assert_eq!(lo.as_deref(), Some("node10"));
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+
+        match classify_signature_call("collapse_node2_None", Vec::new()) {
+            LoweredCall::Effect(CallEffect::CollapseHint { hi, lo }) => {
+                assert_eq!(hi, "node2");
+                assert_eq!(lo, None);
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adapter_accepts_normalized_invalid_param_name() {
+        match classify_signature_call("set_Invalid_Parameter___id__ParamId_7____", Vec::new()) {
+            LoweredCall::Effect(CallEffect::SetInvalidParam { param }) => {
+                assert_eq!(param, "Parameter { id: ParamId(7) }")
+            }
+            other => panic!("unexpected classification: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adapter_rejects_unknown_or_malformed_signature_call_targets() {
+        assert!(matches!(
+            classify_signature_call("not_implemented", Vec::new()),
+            LoweredCall::Unsupported
+        ));
+        assert!(matches!(
+            classify_signature_call("set_Invalid(Parameter { id: Missing })", Vec::new()),
+            LoweredCall::Unsupported
+        ));
+        assert!(matches!(
+            classify_signature_call("collapse_node_x_Some(node1)", Vec::new()),
+            LoweredCall::Unsupported
+        ));
+    }
 }

@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
+use hir_lower::HirInterner;
 use lasso::Resolver;
 use mir::{
     Block, Const, ControlFlowGraph, FuncRef, Function, Inst, InstructionData, Opcode, Param, Value,
@@ -97,6 +98,17 @@ pub fn lift_function_with_returns(
     emit_function_unit(&unit, resolver)
 }
 
+pub fn lift_function_with_hir_returns(
+    function: &Function,
+    return_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+) -> Result<String> {
+    let mut unit = FunctionUnit::whole_with_returns(function, return_values)?;
+    unit.callbacks = Some(intern);
+    emit_function_unit(&unit, resolver)
+}
+
 pub fn lift_function_with_returns_and_captures(
     function: &Function,
     return_values: &[Value],
@@ -112,12 +124,41 @@ pub fn lift_function_with_returns_and_captures(
     emit_function_unit(&unit, resolver)
 }
 
+pub fn lift_function_with_hir_returns_and_captures(
+    function: &Function,
+    return_values: &[Value],
+    capture_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+) -> Result<String> {
+    let mut unit = FunctionUnit::whole_named_with_returns_and_captures(
+        function,
+        sanitize_ident(&function.name),
+        return_values,
+        capture_values,
+    )?;
+    unit.callbacks = Some(intern);
+    emit_function_unit(&unit, resolver)
+}
+
 pub fn dump_function_lir_with_returns(
     function: &Function,
     return_values: &[Value],
     resolver: &dyn Resolver,
 ) -> Result<String> {
     let unit = FunctionUnit::whole_with_returns(function, return_values)?;
+    let lir = lower_simplified_lir(&unit, resolver)?;
+    Ok(lir.to_string())
+}
+
+pub fn dump_function_lir_with_hir_returns(
+    function: &Function,
+    return_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+) -> Result<String> {
+    let mut unit = FunctionUnit::whole_with_returns(function, return_values)?;
+    unit.callbacks = Some(intern);
     let lir = lower_simplified_lir(&unit, resolver)?;
     Ok(lir.to_string())
 }
@@ -134,6 +175,24 @@ pub fn dump_function_lir_with_returns_and_captures(
         return_values,
         capture_values,
     )?;
+    let lir = lower_simplified_lir(&unit, resolver)?;
+    Ok(lir.to_string())
+}
+
+pub fn dump_function_lir_with_hir_returns_and_captures(
+    function: &Function,
+    return_values: &[Value],
+    capture_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+) -> Result<String> {
+    let mut unit = FunctionUnit::whole_named_with_returns_and_captures(
+        function,
+        sanitize_ident(&function.name),
+        return_values,
+        capture_values,
+    )?;
+    unit.callbacks = Some(intern);
     let lir = lower_simplified_lir(&unit, resolver)?;
     Ok(lir.to_string())
 }
@@ -193,15 +252,6 @@ fn log_timing(enabled: bool, function: &str, stage: &str, start: Instant) {
 fn emit_python_prelude(out: &mut String) {
     out.push_str("import math\n\n\n");
     out.push_str("inf = math.inf\n\n\n");
-    out.push_str("def mir_call(name, *args):\n");
-    out.push_str("    if name == \"simparam_opt\" and len(args) >= 2:\n");
-    out.push_str("        return args[1]\n");
-    out.push_str("    if name.startswith(\"Display\"):\n");
-    out.push_str("        return None\n");
-    out.push_str("    if name in MIR_IGNORED_CALLS:\n");
-    out.push_str("        return None\n");
-    out.push_str("    raise RuntimeError(f\"unimplemented MIR call {name!r}\")\n\n\n");
-    out.push_str("MIR_IGNORED_CALLS = set()\n\n\n");
 }
 
 fn normalize_mir_input(input: &str) -> String {
@@ -314,6 +364,7 @@ struct FunctionUnit<'a> {
     params: Vec<Value>,
     return_values: Vec<Value>,
     capture_values: Vec<Value>,
+    callbacks: Option<&'a HirInterner>,
 }
 
 struct BlockGroup {
@@ -399,6 +450,7 @@ impl<'a> FunctionUnit<'a> {
             params,
             return_values,
             capture_values: Vec::new(),
+            callbacks: None,
         })
     }
 
@@ -438,6 +490,7 @@ impl<'a> FunctionUnit<'a> {
             params,
             return_values,
             capture_values,
+            callbacks: None,
         })
     }
 
@@ -475,6 +528,7 @@ impl<'a> FunctionUnit<'a> {
             params,
             return_values,
             capture_values: Vec::new(),
+            callbacks: None,
         })
     }
 
@@ -2047,8 +2101,11 @@ mod tests {
         let lifted = lift_text(input, None).unwrap();
         assert!(lifted.contains("def lifted("));
         assert!(!lifted.contains("_pc"));
-        assert!(lifted.contains("_lir_target = _lifted_entry"));
-        assert!(lifted.contains("_lir_target = _lir_result[1]"));
+        assert!(!lifted.contains("_lir_target"));
+        assert!(!lifted.contains("_lir_result[0]"));
+        assert!(!lifted.contains("(\"call\","));
+        assert!(!lifted.contains("(\"return\","));
+        assert!(lifted.contains("return _lifted_entry("));
         assert!(!lifted.contains(" = None\n"));
         assert!(!lifted.contains("nonlocal "));
         assert!(lifted.contains("def _lifted_bb_"));
