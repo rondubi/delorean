@@ -11,17 +11,58 @@ pub(crate) struct ForwardFacts {
 
 type ConstEnv = Vec<Option<ConstValue>>;
 
+const FORWARD_PASSES: &[ForwardPassKind] = &[ForwardPassKind::ConstantPropagation];
+
 pub(crate) fn run_forward_passes(function: Function) -> Function {
     let mut function = function;
-    let mut passes: Vec<Box<dyn ForwardLirPass>> = vec![Box::<ConstantPropagation>::default()];
-    for pass in &mut passes {
-        pass.run(&mut function);
-    }
+    ForwardPipeline { name: "lir-forward", passes: FORWARD_PASSES }.run(&mut function);
     function
 }
 
 pub(crate) trait ForwardLirPass {
     fn run(&mut self, function: &mut Function);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardPassKind {
+    ConstantPropagation,
+}
+
+impl ForwardPassKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ConstantPropagation => "constant-propagation",
+        }
+    }
+
+    fn run(self, function: &mut Function) {
+        match self {
+            Self::ConstantPropagation => run_forward_pass::<ConstantPropagation>(function),
+        }
+    }
+}
+
+struct ForwardPipeline {
+    name: &'static str,
+    passes: &'static [ForwardPassKind],
+}
+
+impl ForwardPipeline {
+    fn run(&self, function: &mut Function) {
+        let _pipeline_name = self.name;
+        for pass in self.passes {
+            let _pass_name = pass.name();
+            pass.run(function);
+        }
+    }
+}
+
+fn run_forward_pass<P>(function: &mut Function)
+where
+    P: ForwardLirPass + Default,
+{
+    let mut pass = P::default();
+    pass.run(function);
 }
 
 #[derive(Default)]

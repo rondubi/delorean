@@ -17,70 +17,65 @@ pub(crate) struct BackwardFacts {
     pub optional_helper_live_ins: HashSet<(Label, LocalId)>,
 }
 
+const DISABLED_PASSES: &[BackwardPassKind] = &[BackwardPassKind::HelperLiveIns];
+const CLEANUP_PASSES: &[BackwardPassKind] = &[
+    BackwardPassKind::HelperForwarding,
+    BackwardPassKind::CommonTailHelperSinking,
+    BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::CostBasedHelperInlining,
+    BackwardPassKind::StructuredSimplify,
+    BackwardPassKind::HelperComputationPushUp,
+    BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::DeadAssignments,
+    BackwardPassKind::HelperSignaturePruning,
+];
+const STRUCTURAL_PASSES: &[BackwardPassKind] = &[
+    BackwardPassKind::HelperForwarding,
+    BackwardPassKind::CommonTailHelperSinking,
+    BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::CostBasedHelperInlining,
+    BackwardPassKind::StructuredSimplify,
+    BackwardPassKind::HelperComputationPushUp,
+    BackwardPassKind::HelperSignaturePruning,
+];
+const FINAL_DCE_PASSES: &[BackwardPassKind] = &[
+    BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::DeadAssignments,
+    BackwardPassKind::HelperSignaturePruning,
+];
+const POST_DCE_CLEANUP_PASSES: &[BackwardPassKind] = CLEANUP_PASSES;
+const FINALIZATION_PASSES: &[BackwardPassKind] =
+    &[BackwardPassKind::HelperSignaturePruning, BackwardPassKind::OptionalHelperLiveIns];
+
 pub(crate) fn run_backward_passes(
     function: &Function,
     structured: &mut StructuredFunction,
 ) -> BackwardFacts {
     let mut facts = BackwardFacts::default();
     if std::env::var_os("MIR_LIFT_DISABLE_LIR_OPTS").is_some() {
-        let mut pass = Box::<HelperLiveIns>::default();
-        let mut cx = BackwardPassCx { function, structured, facts: &mut facts };
-        pass.run(&mut cx);
+        BackwardPipeline { name: "lir-backward-disabled", passes: DISABLED_PASSES }
+            .run(&mut BackwardPassCx { function, structured, facts: &mut facts });
         return facts;
     }
 
+    let cleanup_pipeline =
+        BackwardPipeline { name: "lir-backward-cleanup", passes: CLEANUP_PASSES };
+    let structural_pipeline =
+        BackwardPipeline { name: "lir-backward-structural", passes: STRUCTURAL_PASSES };
+    let final_dce_pipeline =
+        BackwardPipeline { name: "lir-backward-final-dce", passes: FINAL_DCE_PASSES };
+
     for _ in 0..CLEANUP_ROUNDS {
-        let mut passes: Vec<Box<dyn BackwardLirPass>> = vec![
-            Box::<HelperForwarding>::default(),
-            Box::<CommonTailHelperSinking>::default(),
-            Box::<HelperSignaturePruning>::default(),
-            Box::<CostBasedHelperInlining>::default(),
-            Box::<StructuredSimplify>::default(),
-            Box::<HelperComputationPushUp>::default(),
-            Box::<HelperSignaturePruning>::default(),
-            Box::<DeadAssignments>::default(),
-            Box::<HelperSignaturePruning>::default(),
-        ];
-
-        let mut changed = false;
-        for pass in &mut passes {
-            let mut cx = BackwardPassCx { function, structured, facts: &mut facts };
-            changed |= pass.run(&mut cx);
-        }
-
-        if !changed {
+        if !cleanup_pipeline.run(&mut BackwardPassCx { function, structured, facts: &mut facts }) {
             break;
         }
     }
 
-    let mut structural_passes: Vec<Box<dyn BackwardLirPass>> = vec![
-        Box::<HelperForwarding>::default(),
-        Box::<CommonTailHelperSinking>::default(),
-        Box::<HelperSignaturePruning>::default(),
-        Box::<CostBasedHelperInlining>::default(),
-        Box::<StructuredSimplify>::default(),
-        Box::<HelperComputationPushUp>::default(),
-        Box::<HelperSignaturePruning>::default(),
-    ];
-    for pass in &mut structural_passes {
-        let mut cx = BackwardPassCx { function, structured, facts: &mut facts };
-        pass.run(&mut cx);
-    }
+    structural_pipeline.run(&mut BackwardPassCx { function, structured, facts: &mut facts });
 
     for _ in 0..FINAL_DCE_ROUNDS {
-        let mut passes: Vec<Box<dyn BackwardLirPass>> = vec![
-            Box::<HelperSignaturePruning>::default(),
-            Box::<DeadAssignments>::default(),
-            Box::<HelperSignaturePruning>::default(),
-        ];
-
-        let mut changed = false;
-        for pass in &mut passes {
-            let mut cx = BackwardPassCx { function, structured, facts: &mut facts };
-            changed |= pass.run(&mut cx);
-        }
-
-        if !changed {
+        if !final_dce_pipeline.run(&mut BackwardPassCx { function, structured, facts: &mut facts })
+        {
             break;
         }
     }
@@ -91,12 +86,8 @@ pub(crate) fn run_backward_passes(
         }
     }
 
-    let mut pass = Box::<HelperSignaturePruning>::default();
-    let mut cx = BackwardPassCx { function, structured, facts: &mut facts };
-    pass.run(&mut cx);
-    let mut pass = Box::<OptionalHelperLiveIns>::default();
-    let mut cx = BackwardPassCx { function, structured, facts: &mut facts };
-    pass.run(&mut cx);
+    BackwardPipeline { name: "lir-backward-finalization", passes: FINALIZATION_PASSES }
+        .run(&mut BackwardPassCx { function, structured, facts: &mut facts });
 
     log_helper_stats(function, structured, &facts);
     facts
@@ -104,6 +95,74 @@ pub(crate) fn run_backward_passes(
 
 pub(crate) trait BackwardLirPass {
     fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackwardPassKind {
+    HelperForwarding,
+    CommonTailHelperSinking,
+    HelperSignaturePruning,
+    CostBasedHelperInlining,
+    StructuredSimplify,
+    HelperComputationPushUp,
+    HelperLiveIns,
+    OptionalHelperLiveIns,
+    DeadAssignments,
+}
+
+impl BackwardPassKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::HelperForwarding => "helper-forwarding",
+            Self::CommonTailHelperSinking => "common-tail-helper-sinking",
+            Self::HelperSignaturePruning => "helper-signature-pruning",
+            Self::CostBasedHelperInlining => "cost-based-helper-inlining",
+            Self::StructuredSimplify => "structured-simplify",
+            Self::HelperComputationPushUp => "helper-computation-push-up",
+            Self::HelperLiveIns => "helper-live-ins",
+            Self::OptionalHelperLiveIns => "optional-helper-live-ins",
+            Self::DeadAssignments => "dead-assignments",
+        }
+    }
+
+    fn run(self, cx: &mut BackwardPassCx<'_>) -> bool {
+        match self {
+            Self::HelperForwarding => run_backward_pass::<HelperForwarding>(cx),
+            Self::CommonTailHelperSinking => run_backward_pass::<CommonTailHelperSinking>(cx),
+            Self::HelperSignaturePruning => run_backward_pass::<HelperSignaturePruning>(cx),
+            Self::CostBasedHelperInlining => run_backward_pass::<CostBasedHelperInlining>(cx),
+            Self::StructuredSimplify => run_backward_pass::<StructuredSimplify>(cx),
+            Self::HelperComputationPushUp => run_backward_pass::<HelperComputationPushUp>(cx),
+            Self::HelperLiveIns => run_backward_pass::<HelperLiveIns>(cx),
+            Self::OptionalHelperLiveIns => run_backward_pass::<OptionalHelperLiveIns>(cx),
+            Self::DeadAssignments => run_backward_pass::<DeadAssignments>(cx),
+        }
+    }
+}
+
+struct BackwardPipeline {
+    name: &'static str,
+    passes: &'static [BackwardPassKind],
+}
+
+impl BackwardPipeline {
+    fn run(&self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let _pipeline_name = self.name;
+        let mut changed = false;
+        for pass in self.passes {
+            let _pass_name = pass.name();
+            changed |= pass.run(cx);
+        }
+        changed
+    }
+}
+
+fn run_backward_pass<P>(cx: &mut BackwardPassCx<'_>) -> bool
+where
+    P: BackwardLirPass + Default,
+{
+    let mut pass = P::default();
+    pass.run(cx)
 }
 
 pub(crate) struct BackwardPassCx<'a> {
@@ -1525,23 +1584,9 @@ fn run_metric_guarded_post_dce_cleanup(
     let before_facts = facts.clone();
     let before = CleanupMetrics::measure(function, structured, facts);
 
-    let mut passes: Vec<Box<dyn BackwardLirPass>> = vec![
-        Box::<HelperForwarding>::default(),
-        Box::<CommonTailHelperSinking>::default(),
-        Box::<HelperSignaturePruning>::default(),
-        Box::<CostBasedHelperInlining>::default(),
-        Box::<StructuredSimplify>::default(),
-        Box::<HelperComputationPushUp>::default(),
-        Box::<HelperSignaturePruning>::default(),
-        Box::<DeadAssignments>::default(),
-        Box::<HelperSignaturePruning>::default(),
-    ];
-
-    let mut changed = false;
-    for pass in &mut passes {
-        let mut cx = BackwardPassCx { function, structured, facts: &mut *facts };
-        changed |= pass.run(&mut cx);
-    }
+    let changed =
+        BackwardPipeline { name: "lir-backward-post-dce-cleanup", passes: POST_DCE_CLEANUP_PASSES }
+            .run(&mut BackwardPassCx { function, structured, facts: &mut *facts });
     if !changed {
         return false;
     }
