@@ -426,6 +426,7 @@ fn compile_with_mir_lift(
         append_python_osdi_module(&mut python, &python_osdi);
     }
 
+    strip_unused_lir_undef_sentinel(&mut python);
     writeln!(&mut stderr, "mir-lift: writing {}", lib_file)?;
     std::fs::write(lib_file, python).context("failed to write mir_lift output")?;
     Ok(())
@@ -744,7 +745,7 @@ fn python_osdi_eval_args(
         .into_iter()
         .map(|(value, index, param)| {
             if compiled.eval.dfg.value_dead(value) && !required_values.contains(&value) {
-                return "_LIR_UNDEF".to_owned();
+                return "None".to_owned();
             }
             if let Some((kind, _)) = compiled.intern.params.get_index(param) {
                 python_osdi_param_expr(db, compiled, kind)
@@ -1145,13 +1146,7 @@ def _pyosdi_missing_hidden(name):
     out.push_str("    if builtin_params is None:\n");
     out.push_str("        builtin_params = {}\n");
     out.push_str("    given = _pyosdi_effective_given(params, given)\n");
-    out.push_str("    _raw_args = [\n");
-    for arg in &module.model_args {
-        out.push_str("        ");
-        out.push_str(arg);
-        out.push_str(",\n");
-    }
-    out.push_str("    ]\n");
+    append_python_osdi_raw_args(out, &module.model_args);
     out.push_str(&format!("    _raw = {}(*_raw_args)\n", module.raw_model_function));
     out.push_str("    _params = _pyosdi_given_params(params, given)\n");
     out.push_str("    _inst_defaults = {}\n");
@@ -1178,11 +1173,13 @@ def _pyosdi_missing_hidden(name):
 
     out.push_str("\n\n");
     out.push_str(&format!(
-        "def {}(model=None, temperature=300.0, params=None, given=None, connected_terminals=None):\n",
+        "def {}(model=None, temperature=300.0, params=None, given=None, builtin_params=None, connected_terminals=None):\n",
         module.setup_instance_function
     ));
     out.push_str("    if model is None:\n");
     out.push_str(&format!("        model = {}()\n", module.setup_model_function));
+    out.push_str("    if builtin_params is None:\n");
+    out.push_str("        builtin_params = {}\n");
     out.push_str("    _builtin_params = {");
     for (idx, (name, default)) in module.builtin_params.iter().enumerate() {
         if idx != 0 {
@@ -1191,6 +1188,7 @@ def _pyosdi_missing_hidden(name):
         out.push_str(&format!("{name:?}: {default:?}"));
     }
     out.push_str("}\n");
+    out.push_str("    _builtin_params.update(builtin_params)\n");
     out.push_str("    _given = _pyosdi_effective_given(params, given)\n");
     out.push_str("    _params = _pyosdi_merge_given_params(_pyosdi_model_value(model, \"inst_defaults\"), params, _given)\n");
     out.push_str("    _hidden = {");
@@ -1206,13 +1204,7 @@ def _pyosdi_missing_hidden(name):
     out.push_str(")), \"cache\": [0.0] * ");
     out.push_str(&module.num_cache_slots.to_string());
     out.push_str("}\n");
-    out.push_str("    _raw_args = [\n");
-    for arg in &module.init_args {
-        out.push_str("        ");
-        out.push_str(arg);
-        out.push_str(",\n");
-    }
-    out.push_str("    ]\n");
+    append_python_osdi_raw_args(out, &module.init_args);
     out.push_str(&format!("    _raw = {}(*_raw_args)\n", module.raw_init_function));
     out.push_str("    instance[\"raw\"] = _raw\n");
     for (name, value) in &module.instance_params {
@@ -1256,13 +1248,7 @@ def _pyosdi_missing_hidden(name):
     out.push_str("        model = _pyosdi_instance_value(instance, \"model\")\n");
     out.push_str("    if sim_info is None:\n");
     out.push_str("        sim_info = {}\n");
-    out.push_str("    _raw_args = [\n");
-    for arg in &module.eval_args {
-        out.push_str("        ");
-        out.push_str(arg);
-        out.push_str(",\n");
-    }
-    out.push_str("    ]\n");
+    append_python_osdi_raw_args(out, &module.eval_args);
     out.push_str("    _raw = ");
     out.push_str(&module.raw_eval_function);
     out.push_str("(*_raw_args)\n");
@@ -1308,6 +1294,33 @@ def _pyosdi_missing_hidden(name):
     }
 }
 
+fn append_python_osdi_raw_args(out: &mut String, args: &[String]) {
+    out.push_str("    _raw_args = [\n");
+    let mut idx = 0;
+    while idx < args.len() {
+        if args[idx] == "None" {
+            let start = idx;
+            while idx < args.len() && args[idx] == "None" {
+                idx += 1;
+            }
+            let run_len = idx - start;
+            if run_len >= 4 {
+                out.push_str(&format!("        *([None] * {run_len}),\n"));
+            } else {
+                for _ in 0..run_len {
+                    out.push_str("        None,\n");
+                }
+            }
+            continue;
+        }
+        out.push_str("        ");
+        out.push_str(&args[idx]);
+        out.push_str(",\n");
+        idx += 1;
+    }
+    out.push_str("    ]\n");
+}
+
 fn sanitize_python_ident(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
@@ -1334,6 +1347,16 @@ fn append_lifted_python(out: &mut String, lifted: &str, first_unit: &mut bool) -
     out.push('\n');
     out.push_str(strip_lift_prelude(lifted));
     Ok(())
+}
+
+fn strip_unused_lir_undef_sentinel(python: &mut String) {
+    const SENTINEL: &str = "_LIR_UNDEF = object()\n\n";
+    if python.matches("_LIR_UNDEF").count() != 1 {
+        return;
+    }
+    if let Some(start) = python.find(SENTINEL) {
+        python.replace_range(start..start + SENTINEL.len(), "");
+    }
 }
 
 fn strip_lift_prelude(lifted: &str) -> &str {

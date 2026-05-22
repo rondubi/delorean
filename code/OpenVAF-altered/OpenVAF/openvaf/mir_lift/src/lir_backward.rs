@@ -19,6 +19,7 @@ pub(crate) struct BackwardFacts {
 
 const DISABLED_PASSES: &[BackwardPassKind] = &[BackwardPassKind::HelperLiveIns];
 const CLEANUP_PASSES: &[BackwardPassKind] = &[
+    BackwardPassKind::DropNonSemanticDiagnostics,
     BackwardPassKind::HelperForwarding,
     BackwardPassKind::CommonTailHelperSinking,
     BackwardPassKind::HelperSignaturePruning,
@@ -39,6 +40,7 @@ const STRUCTURAL_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::HelperSignaturePruning,
 ];
 const FINAL_DCE_PASSES: &[BackwardPassKind] = &[
+    BackwardPassKind::DropNonSemanticDiagnostics,
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
@@ -99,6 +101,7 @@ pub(crate) trait BackwardLirPass {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BackwardPassKind {
+    DropNonSemanticDiagnostics,
     HelperForwarding,
     CommonTailHelperSinking,
     HelperSignaturePruning,
@@ -113,6 +116,7 @@ enum BackwardPassKind {
 impl BackwardPassKind {
     fn name(self) -> &'static str {
         match self {
+            Self::DropNonSemanticDiagnostics => "drop-non-semantic-diagnostics",
             Self::HelperForwarding => "helper-forwarding",
             Self::CommonTailHelperSinking => "common-tail-helper-sinking",
             Self::HelperSignaturePruning => "helper-signature-pruning",
@@ -127,6 +131,7 @@ impl BackwardPassKind {
 
     fn run(self, cx: &mut BackwardPassCx<'_>) -> bool {
         match self {
+            Self::DropNonSemanticDiagnostics => run_backward_pass::<DropNonSemanticDiagnostics>(cx),
             Self::HelperForwarding => run_backward_pass::<HelperForwarding>(cx),
             Self::CommonTailHelperSinking => run_backward_pass::<CommonTailHelperSinking>(cx),
             Self::HelperSignaturePruning => run_backward_pass::<HelperSignaturePruning>(cx),
@@ -187,6 +192,50 @@ impl BackwardPassCx<'_> {
             }
         }
         changed
+    }
+}
+
+#[derive(Default)]
+struct DropNonSemanticDiagnostics;
+
+impl BackwardLirPass for DropNonSemanticDiagnostics {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let mut changed = drop_non_semantic_diagnostics_in_body(&mut cx.structured.body);
+        for helper in &mut cx.structured.helpers {
+            changed |= drop_non_semantic_diagnostics_in_body(&mut helper.body);
+        }
+        changed
+    }
+}
+
+fn drop_non_semantic_diagnostics_in_body(body: &mut Vec<StructuredStmt>) -> bool {
+    let mut changed = false;
+    let mut kept = Vec::with_capacity(body.len());
+
+    for mut stmt in body.drain(..) {
+        changed |= drop_non_semantic_diagnostics_in_stmt(&mut stmt);
+        if matches!(stmt, StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::Diagnostic { .. }))) {
+            changed = true;
+        } else {
+            kept.push(stmt);
+        }
+    }
+
+    *body = kept;
+    changed
+}
+
+fn drop_non_semantic_diagnostics_in_stmt(stmt: &mut StructuredStmt) -> bool {
+    match stmt {
+        StructuredStmt::If { then_body, else_body, .. } => {
+            let then_changed = drop_non_semantic_diagnostics_in_body(then_body);
+            let else_changed = drop_non_semantic_diagnostics_in_body(else_body);
+            then_changed || else_changed
+        }
+        StructuredStmt::Stmt(_)
+        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::Return(_)
+        | StructuredStmt::Raise(_) => false,
     }
 }
 
@@ -1131,14 +1180,24 @@ fn collect_optional_helper_live_ins(
 
 fn mark_stmt_defs_for_definedness(stmt: &Stmt, defined: &mut HashSet<LocalId>) {
     match stmt {
-        Stmt::Assign { dst, .. } => {
-            defined.insert(*dst);
+        Stmt::Assign { dst, value } => {
+            if expr_is_definitely_defined_by(value, defined) {
+                defined.insert(*dst);
+            } else {
+                defined.remove(dst);
+            }
         }
         Stmt::Unsupported { dsts, .. } => {
             defined.extend(dsts.iter().copied());
         }
         Stmt::Capture { .. } | Stmt::CallEffect(_) | Stmt::Expr(_) => {}
     }
+}
+
+fn expr_is_definitely_defined_by(expr: &Expr, defined: &HashSet<LocalId>) -> bool {
+    let mut locals = Vec::new();
+    collect_expr_local_ids(expr, &mut locals);
+    locals.into_iter().all(|local| defined.contains(&local))
 }
 
 #[derive(Default)]
@@ -1740,7 +1799,7 @@ fn percentile(sorted: &[usize], pct: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lir::{BinaryOp, ConstValue, Function, LirType, Local, ReturnValue};
+    use crate::lir::{BinaryOp, CallEffect, ConstValue, Function, LirType, Local, ReturnValue};
 
     #[test]
     fn sinks_common_tail_helper_after_branch_assignments() {
@@ -1859,6 +1918,67 @@ mod tests {
         assert_eq!(facts.helper_live_ins.get(&live), Some(&Vec::new()));
         assert!(!facts.helper_live_ins.contains_key(&dead));
         assert!(facts.optional_helper_live_ins.is_empty());
+    }
+
+    #[test]
+    fn drops_only_non_semantic_diagnostic_effects() {
+        let mut body = vec![
+            StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::Diagnostic {
+                target: "Display".to_owned(),
+                args: vec![Expr::Local(LocalId(0))],
+            })),
+            StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::SetInvalidParam {
+                param: "p1".to_owned(),
+            })),
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(0)),
+                then_body: vec![
+                    StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::Diagnostic {
+                        target: "Warning".to_owned(),
+                        args: vec![Expr::Local(LocalId(1))],
+                    })),
+                    assign_int(LocalId(1), 2),
+                ],
+                else_body: vec![StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::CollapseHint {
+                    hi: "n2".to_owned(),
+                    lo: Some("n1".to_owned()),
+                }))],
+            },
+        ];
+
+        assert!(drop_non_semantic_diagnostics_in_body(&mut body));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::SetInvalidParam {
+                    param: "p1".to_owned(),
+                })),
+                StructuredStmt::If {
+                    cond: Expr::Local(LocalId(0)),
+                    then_body: vec![assign_int(LocalId(1), 2)],
+                    else_body: vec![StructuredStmt::Stmt(Stmt::CallEffect(
+                        CallEffect::CollapseHint { hi: "n2".to_owned(), lo: Some("n1".to_owned()) },
+                    ))],
+                },
+            ]
+        );
+        assert!(!drop_non_semantic_diagnostics_in_body(&mut body));
+    }
+
+    #[test]
+    fn optional_live_ins_track_values_derived_from_undefined_locals() {
+        let target = Label(3);
+        let mut optional = HashSet::new();
+        let mut defined = HashSet::new();
+        let helper_params = HashMap::from([(target, vec![LocalId(1)])]);
+        let body = vec![
+            StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(1), value: Expr::Local(LocalId(0)) }),
+            StructuredStmt::CallHelper(target),
+        ];
+
+        collect_optional_helper_live_ins(&body, &mut defined, &helper_params, &mut optional);
+
+        assert_eq!(optional, HashSet::from([(target, LocalId(1))]));
     }
 
     fn assign_int(dst: LocalId, value: i32) -> StructuredStmt {

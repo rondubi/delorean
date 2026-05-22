@@ -61,12 +61,34 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
                 captures_effects
             )
         )?;
-        let mut defined = helper.params.iter().copied().collect::<HashSet<_>>();
+        let mut assigned = helper.params.iter().copied().collect::<HashSet<_>>();
+        let mut defined = helper
+            .params
+            .iter()
+            .copied()
+            .filter(|param| !cx.optional_helper_live_ins.contains(&(helper.label, *param)))
+            .collect::<HashSet<_>>();
         if body_calls_helper(&helper.body, helper.label) {
             writeln!(out, "    while True:")?;
-            emit_structured_body(&mut out, &helper.body, &cx, 2, &mut defined, EmptyBody::Pass)?;
+            emit_structured_body(
+                &mut out,
+                &helper.body,
+                &cx,
+                2,
+                &mut assigned,
+                &mut defined,
+                EmptyBody::Pass,
+            )?;
         } else {
-            emit_structured_body(&mut out, &helper.body, &cx, 1, &mut defined, EmptyBody::Return)?;
+            emit_structured_body(
+                &mut out,
+                &helper.body,
+                &cx,
+                1,
+                &mut assigned,
+                &mut defined,
+                EmptyBody::Return,
+            )?;
         }
         writeln!(out)?;
     }
@@ -84,8 +106,17 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
             captures_effects
         )
     )?;
-    let mut defined = function.params.iter().copied().collect::<HashSet<_>>();
-    emit_structured_body(&mut out, &structured.body, &cx, 1, &mut defined, EmptyBody::Return)?;
+    let mut assigned = function.params.iter().copied().collect::<HashSet<_>>();
+    let mut defined = assigned.clone();
+    emit_structured_body(
+        &mut out,
+        &structured.body,
+        &cx,
+        1,
+        &mut assigned,
+        &mut defined,
+        EmptyBody::Return,
+    )?;
     writeln!(out)?;
 
     writeln!(out, "def {}({}):", function_name, names.params(function))?;
@@ -108,13 +139,19 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
     Ok(out)
 }
 
-fn emit_stmt(out: &mut String, stmt: &Stmt, names: &NameTable, indent: usize) -> Result<()> {
+fn emit_stmt(
+    out: &mut String,
+    stmt: &Stmt,
+    names: &NameTable,
+    indent: usize,
+    defined: &HashSet<LocalId>,
+) -> Result<()> {
     match stmt {
         Stmt::Assign { dst, value } => {
             writeln!(out, "{}{} = {}", pad(indent), names.local(*dst), expr(value, names)?)?;
         }
         Stmt::Capture { key, value } => {
-            emit_capture(out, key, value, names, indent)?;
+            emit_capture(out, key, value, names, indent, defined)?;
         }
         Stmt::CallEffect(effect) => emit_call_effect(out, effect, names, indent)?,
         Stmt::Expr(value) => {
@@ -160,14 +197,15 @@ fn emit_capture(
     value: &Expr,
     names: &NameTable,
     indent: usize,
+    defined: &HashSet<LocalId>,
 ) -> Result<()> {
-    let locals = expr_local_ids(value);
-    if locals.is_empty() {
+    let undefined = expr_undefined_local_ids(value, defined);
+    if undefined.is_empty() {
         writeln!(out, "{}_lir_outputs[{key:?}] = {}", pad(indent), expr(value, names)?)?;
         return Ok(());
     }
 
-    let guard = locals
+    let guard = undefined
         .iter()
         .map(|local| format!("{} is not _LIR_UNDEF", names.local(*local)))
         .collect::<Vec<_>>()
@@ -209,19 +247,20 @@ fn emit_structured_body(
     body: &[StructuredStmt],
     cx: &EmitCx<'_>,
     indent: usize,
+    assigned: &mut HashSet<LocalId>,
     defined: &mut HashSet<LocalId>,
     empty: EmptyBody,
 ) -> Result<()> {
     if body.is_empty() {
         match empty {
             EmptyBody::Pass => writeln!(out, "{}pass", pad(indent))?,
-            EmptyBody::Return => emit_return(out, &[], cx, indent)?,
+            EmptyBody::Return => emit_return(out, &[], cx, indent, defined)?,
         }
         return Ok(());
     }
 
     for stmt in body {
-        emit_structured_stmt(out, stmt, cx, indent, defined)?;
+        emit_structured_stmt(out, stmt, cx, indent, assigned, defined)?;
     }
     Ok(())
 }
@@ -231,42 +270,49 @@ fn emit_structured_stmt(
     stmt: &StructuredStmt,
     cx: &EmitCx<'_>,
     indent: usize,
+    assigned: &mut HashSet<LocalId>,
     defined: &mut HashSet<LocalId>,
 ) -> Result<()> {
     match stmt {
         StructuredStmt::Stmt(stmt) => {
-            emit_stmt(out, stmt, cx.names, indent)?;
-            mark_stmt_defs(stmt, defined);
+            emit_stmt(out, stmt, cx.names, indent, defined)?;
+            mark_stmt_defs(stmt, assigned, defined);
         }
         StructuredStmt::If { cond, then_body, else_body } => {
             writeln!(out, "{}if {}:", pad(indent), expr(cond, cx.names)?)?;
+            let mut then_assigned = assigned.clone();
             let mut then_defined = defined.clone();
             emit_structured_body(
                 out,
                 then_body,
                 cx,
                 indent + 1,
+                &mut then_assigned,
                 &mut then_defined,
                 EmptyBody::Pass,
             )?;
             writeln!(out, "{}else:", pad(indent))?;
+            let mut else_assigned = assigned.clone();
             let mut else_defined = defined.clone();
             emit_structured_body(
                 out,
                 else_body,
                 cx,
                 indent + 1,
+                &mut else_assigned,
                 &mut else_defined,
                 EmptyBody::Pass,
             )?;
+            then_assigned.retain(|local| else_assigned.contains(local));
             then_defined.retain(|local| else_defined.contains(local));
+            *assigned = then_assigned;
             *defined = then_defined;
         }
         StructuredStmt::CallHelper(label) => {
             if Some(*label) == cx.current_helper {
-                emit_self_loop_continue(out, *label, cx, indent, defined)?;
+                emit_self_loop_continue(out, *label, cx, indent, assigned)?;
             } else {
-                let args = helper_args_list(*label, cx, defined)?;
+                let args = helper_args_list(*label, cx, assigned)?;
                 writeln!(
                     out,
                     "{}return {}({args})",
@@ -276,7 +322,7 @@ fn emit_structured_stmt(
             }
         }
         StructuredStmt::Return(values) => {
-            emit_return(out, values, cx, indent)?;
+            emit_return(out, values, cx, indent, defined)?;
         }
         StructuredStmt::Raise(message) => {
             writeln!(out, "{}raise RuntimeError({message:?})", pad(indent))?;
@@ -290,10 +336,10 @@ fn emit_self_loop_continue(
     label: Label,
     cx: &EmitCx<'_>,
     indent: usize,
-    defined: &HashSet<LocalId>,
+    assigned: &HashSet<LocalId>,
 ) -> Result<()> {
     let params = cx.helper_params.get(&label).cloned().unwrap_or_default();
-    let args = helper_param_arg_exprs(label, cx, defined)?;
+    let args = helper_param_arg_exprs(label, cx, assigned)?;
     if !params.is_empty() {
         let targets = params.iter().map(|param| cx.names.local(*param)).collect::<Vec<_>>();
         writeln!(out, "{}{} = {}", pad(indent), tuple_items(&targets), tuple_items(&args))?;
@@ -302,19 +348,19 @@ fn emit_self_loop_continue(
     Ok(())
 }
 
-fn helper_args_list(label: Label, cx: &EmitCx<'_>, defined: &HashSet<LocalId>) -> Result<String> {
+fn helper_args_list(label: Label, cx: &EmitCx<'_>, assigned: &HashSet<LocalId>) -> Result<String> {
     let mut args = if cx.captures_outputs { vec!["_lir_outputs".to_owned()] } else { Vec::new() };
     if cx.captures_effects {
         args.push("_lir_state".to_owned());
     }
-    args.extend(helper_param_arg_exprs(label, cx, defined)?);
+    args.extend(helper_param_arg_exprs(label, cx, assigned)?);
     Ok(args.join(", "))
 }
 
 fn helper_param_arg_exprs(
     label: Label,
     cx: &EmitCx<'_>,
-    defined: &HashSet<LocalId>,
+    assigned: &HashSet<LocalId>,
 ) -> Result<Vec<String>> {
     cx.helper_params
         .get(&label)
@@ -322,14 +368,14 @@ fn helper_param_arg_exprs(
         .unwrap_or_default()
         .into_iter()
         .map(|arg| -> Result<String> {
-            if !defined.contains(&arg) && !cx.optional_helper_live_ins.contains(&(label, arg)) {
+            if !assigned.contains(&arg) && !cx.optional_helper_live_ins.contains(&(label, arg)) {
                 bail!(
                     "structured LIR helper {} requires {} before it is defined",
                     helper_name(cx.helper_prefix, label),
                     cx.names.local(arg)
                 );
             }
-            if defined.contains(&arg) {
+            if assigned.contains(&arg) {
                 Ok(cx.names.local(arg))
             } else {
                 Ok("_LIR_UNDEF".to_owned())
@@ -351,8 +397,9 @@ fn emit_return(
     values: &[crate::lir::ReturnValue],
     cx: &EmitCx<'_>,
     indent: usize,
+    defined: &HashSet<LocalId>,
 ) -> Result<()> {
-    if cx.optional_helper_live_ins.is_empty() {
+    if return_values_are_definitely_defined(values, defined) {
         if cx.captures_outputs || cx.captures_effects {
             if cx.captures_outputs {
                 writeln!(out, "{}_lir_return = dict(_lir_outputs)", pad(indent))?;
@@ -401,8 +448,8 @@ fn emit_return(
     for value in values {
         match value {
             crate::lir::ReturnValue::Named { key, value } => {
-                let locals = expr_local_ids(value);
-                if locals.is_empty() {
+                let undefined = expr_undefined_local_ids(value, defined);
+                if undefined.is_empty() {
                     writeln!(
                         out,
                         "{}_lir_return[{key:?}] = {}",
@@ -410,7 +457,7 @@ fn emit_return(
                         expr(value, cx.names)?
                     )?;
                 } else {
-                    let guard = locals
+                    let guard = undefined
                         .iter()
                         .map(|local| format!("{} is not _LIR_UNDEF", cx.names.local(*local)))
                         .collect::<Vec<_>>()
@@ -430,16 +477,39 @@ fn emit_return(
     Ok(())
 }
 
-fn mark_stmt_defs(stmt: &Stmt, defined: &mut HashSet<LocalId>) {
+fn mark_stmt_defs(stmt: &Stmt, assigned: &mut HashSet<LocalId>, defined: &mut HashSet<LocalId>) {
     match stmt {
-        Stmt::Assign { dst, .. } => {
-            defined.insert(*dst);
+        Stmt::Assign { dst, value } => {
+            assigned.insert(*dst);
+            if expr_is_definitely_defined(value, defined) {
+                defined.insert(*dst);
+            } else {
+                defined.remove(dst);
+            }
         }
         Stmt::Unsupported { dsts, .. } => {
+            assigned.extend(dsts.iter().copied());
             defined.extend(dsts.iter().copied());
         }
         Stmt::Capture { .. } | Stmt::CallEffect(_) | Stmt::Expr(_) => {}
     }
+}
+
+fn return_values_are_definitely_defined(
+    values: &[crate::lir::ReturnValue],
+    defined: &HashSet<LocalId>,
+) -> bool {
+    values.iter().all(|value| match value {
+        crate::lir::ReturnValue::Named { value, .. } => expr_is_definitely_defined(value, defined),
+    })
+}
+
+fn expr_is_definitely_defined(expr: &Expr, defined: &HashSet<LocalId>) -> bool {
+    expr_undefined_local_ids(expr, defined).is_empty()
+}
+
+fn expr_undefined_local_ids(expr: &Expr, defined: &HashSet<LocalId>) -> Vec<LocalId> {
+    expr_local_ids(expr).into_iter().filter(|local| !defined.contains(local)).collect()
 }
 
 fn expr_local_ids(expr: &Expr) -> Vec<LocalId> {
@@ -816,7 +886,7 @@ mod tests {
         assert!(!emitted.contains(" = mir_call("), "{emitted}");
         assert!(!emitted.contains("MIR_IGNORED_CALLS"), "{emitted}");
         assert!(emitted.contains("val = 0.000000000001"), "{emitted}");
-        assert!(emitted.contains(r#"_lir_state["diagnostics"]"#), "{emitted}");
+        assert!(!emitted.contains(r#"_lir_state["diagnostics"].append"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_state["invalid_params"]"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_state["collapse_hints"]"#), "{emitted}");
         assert!(!emitted.contains("_lir_effects.append"), "{emitted}");
@@ -827,7 +897,7 @@ mod tests {
             "{emitted}\n\
              result = call_effects()\n\
              assert result['out'] == 1e-12, result\n\
-             assert result['_lir_state']['diagnostics'][0]['args'] == [1e-12], result\n\
+             assert result['_lir_state']['diagnostics'] == [], result\n\
              assert result['_lir_state']['invalid_params'] == ['p7'], result\n\
              assert result['_lir_state']['collapse_hints'] == [('n2', 'n1')], result\n"
         );
@@ -842,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_values_used_only_by_call_effects_live() {
+    fn drops_values_used_only_by_diagnostic_effects() {
         let input = LocalId(0);
         let computed = LocalId(1);
         let function = Function {
@@ -875,12 +945,13 @@ mod tests {
         };
 
         let emitted = emit_function(&function).unwrap();
-        assert!(emitted.contains("computed = (input) + (1)"), "{emitted}");
+        assert!(!emitted.contains("computed = (input) + (1)"), "{emitted}");
+        assert!(!emitted.contains(r#"_lir_state["diagnostics"].append"#), "{emitted}");
 
         let script = format!(
             "{emitted}\n\
              result = effect_live_value(4)\n\
-             assert result['_lir_state']['diagnostics'][0]['args'] == [5], result\n"
+             assert result['_lir_state']['diagnostics'] == [], result\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -947,13 +1018,15 @@ mod tests {
                 ConstValue::Int(1),
             )))],
         }];
-        let mut defined = HashSet::from([cond]);
+        let mut assigned = HashSet::from([cond]);
+        let mut defined = assigned.clone();
         let mut emitted = String::new();
         super::emit_structured_body(
             &mut emitted,
             &body,
             &cx,
             1,
+            &mut assigned,
             &mut defined,
             super::EmptyBody::Return,
         )
@@ -1213,6 +1286,41 @@ mod tests {
              assert stale_capture(True) == {{}}, stale_capture(True)\n\
              assert stale_capture(False) == {{'slot': 9}}, stale_capture(False)\n"
         );
+        let output =
+            Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
+        assert!(
+            output.status.success(),
+            "python failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn capture_of_definitely_defined_value_does_not_emit_undef_guard() {
+        let value = LocalId(0);
+        let function = Function {
+            name: "defined_capture".to_owned(),
+            params: Vec::new(),
+            locals: vec![Local { id: value, name_hint: "value".to_owned(), ty: LirType::Int }],
+            entry: Label(0),
+            blocks: vec![Block {
+                label: Label(0),
+                stmts: vec![
+                    Stmt::Assign { dst: value, value: Expr::Const(ConstValue::Int(11)) },
+                    Stmt::Capture { key: "slot".to_owned(), value: Expr::Local(value) },
+                ],
+                term: Terminator::Return(Vec::new()),
+            }],
+            returns: Vec::new(),
+        };
+
+        let emitted = emit_function(&function).unwrap();
+        assert_no_trampoline_protocol(&emitted);
+        assert!(!emitted.contains("is not _LIR_UNDEF"), "{emitted}");
+        assert!(!emitted.contains(r#"_lir_outputs.pop("slot", None)"#), "{emitted}");
+
+        let script = format!("{emitted}\nassert defined_capture() == {{'slot': 11}}\n");
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
         assert!(
