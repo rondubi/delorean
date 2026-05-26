@@ -57,9 +57,11 @@ const CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperComputationPushUp,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
+    BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
 ];
@@ -79,9 +81,11 @@ const FINAL_DCE_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
+    BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
 ];
@@ -153,6 +157,7 @@ enum BackwardPassKind {
     HelperComputationPushUp,
     HelperLiveIns,
     OptionalHelperLiveIns,
+    CopyAliasPropagation,
     DeadAssignments,
 }
 
@@ -170,6 +175,7 @@ impl BackwardPassKind {
             Self::HelperComputationPushUp => "helper-computation-push-up",
             Self::HelperLiveIns => "helper-live-ins",
             Self::OptionalHelperLiveIns => "optional-helper-live-ins",
+            Self::CopyAliasPropagation => "copy-alias-propagation",
             Self::DeadAssignments => "dead-assignments",
         }
     }
@@ -187,6 +193,7 @@ impl BackwardPassKind {
             Self::HelperComputationPushUp => run_backward_pass::<HelperComputationPushUp>(cx),
             Self::HelperLiveIns => run_backward_pass::<HelperLiveIns>(cx),
             Self::OptionalHelperLiveIns => run_backward_pass::<OptionalHelperLiveIns>(cx),
+            Self::CopyAliasPropagation => run_backward_pass::<CopyAliasPropagation>(cx),
             Self::DeadAssignments => run_backward_pass::<DeadAssignments>(cx),
         }
     }
@@ -1623,6 +1630,162 @@ fn expr_is_definitely_defined_by(expr: &Expr, defined: &HashSet<LocalId>) -> boo
 }
 
 #[derive(Default)]
+struct CopyAliasPropagation;
+
+impl BackwardLirPass for CopyAliasPropagation {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let mut changed = false;
+
+        for helper in &mut cx.structured.helpers {
+            let mut aliases = HashMap::new();
+            changed |= propagate_copy_aliases_in_body(&mut helper.body, &mut aliases);
+        }
+
+        let mut aliases = HashMap::new();
+        changed |= propagate_copy_aliases_in_body(&mut cx.structured.body, &mut aliases);
+        changed
+    }
+}
+
+type CopyAliasMap = HashMap<LocalId, LocalId>;
+
+fn propagate_copy_aliases_in_body(body: &mut [StructuredStmt], aliases: &mut CopyAliasMap) -> bool {
+    let mut changed = false;
+    for stmt in body {
+        changed |= propagate_copy_aliases_in_stmt(stmt, aliases);
+    }
+    changed
+}
+
+fn propagate_copy_aliases_in_stmt(stmt: &mut StructuredStmt, aliases: &mut CopyAliasMap) -> bool {
+    match stmt {
+        StructuredStmt::Stmt(stmt) => propagate_copy_aliases_in_plain_stmt(stmt, aliases),
+        StructuredStmt::If { cond, then_body, else_body } => {
+            let mut changed = rewrite_alias_expr(cond, aliases);
+
+            let incoming = aliases.clone();
+            let mut then_aliases = incoming.clone();
+            let mut else_aliases = incoming;
+            changed |= propagate_copy_aliases_in_body(then_body, &mut then_aliases);
+            changed |= propagate_copy_aliases_in_body(else_body, &mut else_aliases);
+            *aliases = intersect_alias_maps(&then_aliases, &else_aliases);
+            changed
+        }
+        StructuredStmt::CallHelper(_) => {
+            aliases.clear();
+            false
+        }
+        StructuredStmt::Return(values) => {
+            let mut changed = false;
+            for value in values {
+                match value {
+                    ReturnValue::Named { value, .. } => {
+                        changed |= rewrite_alias_expr(value, aliases);
+                    }
+                }
+            }
+            aliases.clear();
+            changed
+        }
+        StructuredStmt::Raise(_) => {
+            aliases.clear();
+            false
+        }
+    }
+}
+
+fn propagate_copy_aliases_in_plain_stmt(stmt: &mut Stmt, aliases: &mut CopyAliasMap) -> bool {
+    match stmt {
+        Stmt::Assign { dst, value } => {
+            let changed = rewrite_alias_expr(value, aliases);
+            let copied = match value {
+                Expr::Local(src) => Some(canonical_alias(*src, aliases)),
+                _ => None,
+            };
+            kill_aliases_for_definition(aliases, *dst);
+            if let Some(src) = copied.filter(|src| *src != *dst) {
+                aliases.insert(*dst, src);
+            }
+            changed
+        }
+        Stmt::Capture { value, .. } | Stmt::Expr(value) => rewrite_alias_expr(value, aliases),
+        Stmt::CallEffect(effect) => rewrite_alias_call_effect(effect, aliases),
+        Stmt::Unsupported { dsts, .. } => {
+            for dst in dsts {
+                kill_aliases_for_definition(aliases, *dst);
+            }
+            false
+        }
+    }
+}
+
+fn rewrite_alias_expr(expr: &mut Expr, aliases: &CopyAliasMap) -> bool {
+    match expr {
+        Expr::Local(local) => {
+            let canonical = canonical_alias(*local, aliases);
+            let changed = canonical != *local;
+            *local = canonical;
+            changed
+        }
+        Expr::Const(_) => false,
+        Expr::Unary { arg, .. } => rewrite_alias_expr(arg, aliases),
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_alias_expr(lhs, aliases) | rewrite_alias_expr(rhs, aliases)
+        }
+        Expr::SimparamOpt { name, default } => {
+            rewrite_alias_expr(name, aliases) | rewrite_alias_expr(default, aliases)
+        }
+        Expr::Call { args, .. } | Expr::Unsupported { args, .. } => {
+            let mut changed = false;
+            for arg in args {
+                changed |= rewrite_alias_expr(arg, aliases);
+            }
+            changed
+        }
+    }
+}
+
+fn rewrite_alias_call_effect(effect: &mut CallEffect, aliases: &CopyAliasMap) -> bool {
+    match effect {
+        CallEffect::Diagnostic { args, .. } => {
+            let mut changed = false;
+            for arg in args {
+                changed |= rewrite_alias_expr(arg, aliases);
+            }
+            changed
+        }
+        CallEffect::SetInvalidParam { .. } | CallEffect::CollapseHint { .. } => false,
+    }
+}
+
+fn canonical_alias(local: LocalId, aliases: &CopyAliasMap) -> LocalId {
+    let mut current = local;
+    let mut seen = HashSet::new();
+    while let Some(&next) = aliases.get(&current) {
+        if next == current || !seen.insert(current) {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+fn kill_aliases_for_definition(aliases: &mut CopyAliasMap, dst: LocalId) {
+    aliases.remove(&dst);
+    aliases.retain(|alias, target| *alias != dst && *target != dst);
+}
+
+fn intersect_alias_maps(left: &CopyAliasMap, right: &CopyAliasMap) -> CopyAliasMap {
+    left.iter()
+        .filter_map(|(alias, target)| {
+            right
+                .get(alias)
+                .and_then(|right_target| (right_target == target).then_some((*alias, *target)))
+        })
+        .collect()
+}
+
+#[derive(Default)]
 struct DeadAssignments;
 
 impl BackwardLirPass for DeadAssignments {
@@ -2834,6 +2997,183 @@ mod tests {
         collect_optional_helper_live_ins(&body, &mut defined, &helper_params, &mut optional);
 
         assert_eq!(optional, HashSet::from([(target, LocalId(1))]));
+    }
+
+    #[test]
+    fn copy_alias_propagation_rewrites_straight_line_and_leaves_dce_removal() {
+        let mut body = vec![
+            StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(1), value: Expr::Local(LocalId(0)) }),
+            StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(2),
+                value: Expr::Binary {
+                    op: BinaryOp::Add,
+                    lhs: Box::new(Expr::Local(LocalId(1))),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(1))),
+                },
+            }),
+            StructuredStmt::Return(vec![ReturnValue::Named {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(2)),
+            }]),
+        ];
+
+        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert_eq!(
+            body[1],
+            StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(2),
+                value: Expr::Binary {
+                    op: BinaryOp::Add,
+                    lhs: Box::new(Expr::Local(LocalId(0))),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(1))),
+                },
+            })
+        );
+
+        let mut live = LiveSet::new(3);
+        assert!(prune_dead_assignments_in_body(&mut body, &mut live, &HashMap::new()));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(2),
+                    value: Expr::Binary {
+                        op: BinaryOp::Add,
+                        lhs: Box::new(Expr::Local(LocalId(0))),
+                        rhs: Box::new(Expr::Const(ConstValue::Int(1))),
+                    },
+                }),
+                StructuredStmt::Return(vec![ReturnValue::Named {
+                    key: "x".to_owned(),
+                    value: Expr::Local(LocalId(2)),
+                }]),
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_alias_propagation_follows_transitive_aliases() {
+        let mut body = vec![
+            StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(1), value: Expr::Local(LocalId(0)) }),
+            StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(2), value: Expr::Local(LocalId(1)) }),
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(2)),
+            }),
+        ];
+
+        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert_eq!(
+            body[2],
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(0)),
+            })
+        );
+    }
+
+    #[test]
+    fn copy_alias_propagation_keeps_branch_aliases_that_agree() {
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(3)),
+                then_body: vec![StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Local(LocalId(0)),
+                })],
+                else_body: vec![StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Local(LocalId(0)),
+                })],
+            },
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(1)),
+            }),
+        ];
+
+        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert_eq!(
+            body[1],
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(0)),
+            })
+        );
+    }
+
+    #[test]
+    fn copy_alias_propagation_drops_branch_aliases_that_disagree() {
+        let original_capture = StructuredStmt::Stmt(Stmt::Capture {
+            key: "x".to_owned(),
+            value: Expr::Local(LocalId(1)),
+        });
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(3)),
+                then_body: vec![StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Local(LocalId(0)),
+                })],
+                else_body: vec![StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Local(LocalId(2)),
+                })],
+            },
+            original_capture.clone(),
+        ];
+
+        assert!(!propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert_eq!(body[1], original_capture);
+    }
+
+    #[test]
+    fn copy_alias_propagation_kills_aliases_when_target_is_redefined() {
+        let mut body = vec![
+            StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(1), value: Expr::Local(LocalId(0)) }),
+            assign_int(LocalId(0), 3),
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(1)),
+            }),
+        ];
+
+        assert!(!propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert_eq!(
+            body[2],
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(1)),
+            })
+        );
+    }
+
+    #[test]
+    fn copy_alias_propagation_rewrites_capture_operands() {
+        let mut body = vec![
+            StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(1), value: Expr::Local(LocalId(0)) }),
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Binary {
+                    op: BinaryOp::Mul,
+                    lhs: Box::new(Expr::Local(LocalId(1))),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(2))),
+                },
+            }),
+        ];
+
+        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert_eq!(
+            body[1],
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Binary {
+                    op: BinaryOp::Mul,
+                    lhs: Box::new(Expr::Local(LocalId(0))),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(2))),
+                },
+            })
+        );
     }
 
     fn assign_int(dst: LocalId, value: i32) -> StructuredStmt {
