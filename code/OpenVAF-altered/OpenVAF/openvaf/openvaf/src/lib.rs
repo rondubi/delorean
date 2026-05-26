@@ -476,6 +476,7 @@ struct PythonOsdiModule {
     model_instance_defaults: Vec<(String, mir::Value)>,
     instance_params: Vec<(String, mir::Value)>,
     cache_values: Vec<Option<mir::Value>>,
+    cache_defaults: Vec<Option<&'static str>>,
     builtin_params: Vec<(String, f64)>,
     hidden_slots: Vec<String>,
     init_hidden_values: Vec<(String, mir::Value)>,
@@ -587,6 +588,7 @@ impl PythonOsdiModule {
             ),
             instance_params: python_osdi_param_outputs(db, compiled, &compiled.init.intern, true),
             cache_values: python_osdi_cache_values(compiled),
+            cache_defaults: python_osdi_cache_defaults(compiled),
             builtin_params: python_osdi_builtin_params(compiled),
             hidden_slots: python_osdi_hidden_slots(db, compiled),
             init_hidden_values,
@@ -816,6 +818,44 @@ fn python_osdi_cache_values(compiled: &sim_back::CompiledModule<'_>) -> Vec<Opti
         cache_values[usize::from(slot)] = Some(value);
     }
     cache_values
+}
+
+fn python_osdi_cache_defaults(
+    compiled: &sim_back::CompiledModule<'_>,
+) -> Vec<Option<&'static str>> {
+    let mut defaults = vec![None; compiled.init.cache_slots.len()];
+    let init = &compiled.init.func;
+    let cfg = mir::ControlFlowGraph::with_function(init);
+    let exit_blocks = init
+        .layout
+        .blocks()
+        .filter(|&block| cfg.succ_iter(block).next().is_none())
+        .collect::<Vec<_>>();
+    if exit_blocks.is_empty() {
+        return defaults;
+    }
+
+    let mut dom_tree = mir::DominatorTree::default();
+    dom_tree.compute(init, &cfg, true, false, false);
+
+    for (&value, &slot) in compiled.init.cached_vals.iter() {
+        let Some(inst) = init.dfg.value_def(value).inst() else { continue };
+        let Some(block) = init.layout.inst_block(inst) else { continue };
+        if exit_blocks.iter().all(|&exit| dom_tree.dominates(exit, block)) {
+            continue;
+        }
+
+        // Native instance storage is zeroed before setup runs. A cache store in a conditional
+        // setup block therefore leaves an explicit zero on paths where that block is not reached.
+        defaults[usize::from(slot)] = match compiled.init.cache_slots[slot] {
+            hir::Type::Real => Some("0.0"),
+            hir::Type::Integer => Some("0"),
+            hir::Type::Bool => Some("False"),
+            _ => None,
+        };
+    }
+
+    defaults
 }
 
 fn python_osdi_eval_args(
@@ -1454,7 +1494,7 @@ def _pyosdi_missing_hidden(name):
     out.push_str(&module.outputs.len().to_string());
     out.push_str(", _params, _given, _builtin_params, dict(sim_params), _hidden, list(range(");
     out.push_str(&module.num_states.to_string());
-    out.push_str(")), [0.0] * ");
+    out.push_str(")), [_PYOSDI_UNSET] * ");
     out.push_str(&module.num_cache_slots.to_string());
     out.push_str(")\n");
     append_python_osdi_raw_args(out, &module.init_args);
@@ -1474,6 +1514,9 @@ def _pyosdi_missing_hidden(name):
     out.push_str("    _cache = instance.cache\n");
     for (idx, value) in module.cache_values.iter().enumerate() {
         if let Some(value) = value {
+            if let Some(default) = module.cache_defaults[idx] {
+                out.push_str(&format!("    _cache[{idx}] = {default}\n"));
+            }
             let slot = python_osdi_raw_slot(&module.raw_init_slots, *value);
             out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
             out.push_str(&format!("        _cache[{idx}] = _pyosdi_raw_slot(_raw, {slot})\n"));
@@ -1634,4 +1677,94 @@ fn strip_unused_lir_undef_sentinel(python: &mut String) {
 
 fn strip_lift_prelude(lifted: &str) -> &str {
     lifted.find("\ndef ").map(|idx| &lifted[idx + 1..]).unwrap_or(lifted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_python_osdi_cache_slots_start_unset() {
+        let cached_value = mir::Value::with_number_(42);
+        let mut raw_init_slots = std::collections::HashMap::new();
+        raw_init_slots.insert(cached_value, 0);
+
+        let module = PythonOsdiModule {
+            name: "device".to_owned(),
+            raw_model_function: "_device_model_raw".to_owned(),
+            raw_init_function: "_device_init_raw".to_owned(),
+            raw_eval_function: "_device_eval_raw".to_owned(),
+            setup_model_function: "device_setup_model".to_owned(),
+            setup_instance_function: "device_setup_instance".to_owned(),
+            eval_function: "device_eval".to_owned(),
+            model_args: Vec::new(),
+            init_args: Vec::new(),
+            eval_args: vec!["_pyosdi_cache(instance, 1)".to_owned()],
+            raw_model_slots: std::collections::HashMap::new(),
+            raw_init_slots,
+            raw_eval_slots: std::collections::HashMap::new(),
+            model_params: Vec::new(),
+            model_instance_defaults: Vec::new(),
+            instance_params: Vec::new(),
+            cache_values: vec![Some(cached_value), None],
+            cache_defaults: vec![None, None],
+            builtin_params: Vec::new(),
+            hidden_slots: Vec::new(),
+            init_hidden_values: Vec::new(),
+            eval_hidden_values: Vec::new(),
+            num_states: 0,
+            num_cache_slots: 2,
+            outputs: Vec::new(),
+        };
+
+        let mut python = String::new();
+        append_python_osdi_module(&mut python, &module);
+
+        assert!(python.contains("[_PYOSDI_UNSET] * 2"));
+        assert!(!python.contains("[0.0] * 2"));
+        assert!(python.contains("raise RuntimeError(f\"missing cache value at index {idx}\")"));
+        assert!(python.contains("_pyosdi_cache(instance, 1)"));
+    }
+
+    #[test]
+    fn generated_python_osdi_explicitly_defaults_conditional_cache_slots() {
+        let cached_value = mir::Value::with_number_(42);
+        let mut raw_init_slots = std::collections::HashMap::new();
+        raw_init_slots.insert(cached_value, 0);
+
+        let module = PythonOsdiModule {
+            name: "device".to_owned(),
+            raw_model_function: "_device_model_raw".to_owned(),
+            raw_init_function: "_device_init_raw".to_owned(),
+            raw_eval_function: "_device_eval_raw".to_owned(),
+            setup_model_function: "device_setup_model".to_owned(),
+            setup_instance_function: "device_setup_instance".to_owned(),
+            eval_function: "device_eval".to_owned(),
+            model_args: Vec::new(),
+            init_args: Vec::new(),
+            eval_args: vec!["_pyosdi_cache(instance, 0)".to_owned()],
+            raw_model_slots: std::collections::HashMap::new(),
+            raw_init_slots,
+            raw_eval_slots: std::collections::HashMap::new(),
+            model_params: Vec::new(),
+            model_instance_defaults: Vec::new(),
+            instance_params: Vec::new(),
+            cache_values: vec![Some(cached_value)],
+            cache_defaults: vec![Some("0.0")],
+            builtin_params: Vec::new(),
+            hidden_slots: Vec::new(),
+            init_hidden_values: Vec::new(),
+            eval_hidden_values: Vec::new(),
+            num_states: 0,
+            num_cache_slots: 1,
+            outputs: Vec::new(),
+        };
+
+        let mut python = String::new();
+        append_python_osdi_module(&mut python, &module);
+
+        assert!(python.contains("_cache[0] = 0.0"));
+        assert!(python.contains("if _pyosdi_raw_present(_raw, 0):"));
+        assert!(python.contains("_cache[0] = _pyosdi_raw_slot(_raw, 0)"));
+    }
 }
