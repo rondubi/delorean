@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::time::Instant;
 
@@ -29,11 +29,8 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
         .iter()
         .flat_map(|block| block.stmts.iter())
         .any(|stmt| matches!(stmt, Stmt::Capture { .. }));
-    let captures_effects = function
-        .blocks
-        .iter()
-        .flat_map(|block| block.stmts.iter())
-        .any(|stmt| matches!(stmt, Stmt::CallEffect(_)));
+    let captures_effects = structured_captures_effects(&structured);
+    let output_layout = OutputLayout::new(function, captures_effects);
     let mut out = String::new();
     let mut cx = EmitCx {
         names: &names,
@@ -42,6 +39,7 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
         helper_prefix: &function_name,
         captures_outputs,
         captures_effects,
+        output_layout,
         current_helper: None,
     };
 
@@ -121,13 +119,10 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
 
     writeln!(out, "def {}({}):", function_name, names.params(function))?;
     if captures_outputs {
-        writeln!(out, "    _lir_outputs = {{}}")?;
+        writeln!(out, "    _lir_outputs = [None] * {}", cx.output_layout.value_len)?;
     }
     if captures_effects {
-        writeln!(
-            out,
-            "    _lir_state = {{\"diagnostics\": [], \"invalid_params\": [], \"collapse_hints\": []}}"
-        )?;
+        writeln!(out, "    _lir_state = {{\"invalid_params\": []}}")?;
     }
     writeln!(
         out,
@@ -142,20 +137,20 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
 fn emit_stmt(
     out: &mut String,
     stmt: &Stmt,
-    names: &NameTable,
+    cx: &EmitCx<'_>,
     indent: usize,
     defined: &HashSet<LocalId>,
 ) -> Result<()> {
     match stmt {
         Stmt::Assign { dst, value } => {
-            writeln!(out, "{}{} = {}", pad(indent), names.local(*dst), expr(value, names)?)?;
+            writeln!(out, "{}{} = {}", pad(indent), cx.names.local(*dst), expr(value, cx.names)?)?;
         }
         Stmt::Capture { key, value } => {
-            emit_capture(out, key, value, names, indent, defined)?;
+            emit_capture(out, key, value, cx, indent, defined)?;
         }
-        Stmt::CallEffect(effect) => emit_call_effect(out, effect, names, indent)?,
+        Stmt::CallEffect(effect) => emit_call_effect(out, effect, cx.names, indent)?,
         Stmt::Expr(value) => {
-            writeln!(out, "{}{}", pad(indent), expr(value, names)?)?;
+            writeln!(out, "{}{}", pad(indent), expr(value, cx.names)?)?;
         }
         Stmt::Unsupported { text, .. } => {
             bail!("unsupported LIR statement: {text}");
@@ -195,25 +190,26 @@ fn emit_capture(
     out: &mut String,
     key: &str,
     value: &Expr,
-    names: &NameTable,
+    cx: &EmitCx<'_>,
     indent: usize,
     defined: &HashSet<LocalId>,
 ) -> Result<()> {
+    let slot = cx.output_layout.slot(key)?;
     let undefined = expr_undefined_local_ids(value, defined);
     if undefined.is_empty() {
-        writeln!(out, "{}_lir_outputs[{key:?}] = {}", pad(indent), expr(value, names)?)?;
+        writeln!(out, "{}_lir_outputs[{slot}] = {}", pad(indent), expr(value, cx.names)?)?;
         return Ok(());
     }
 
     let guard = undefined
         .iter()
-        .map(|local| format!("{} is not _LIR_UNDEF", names.local(*local)))
+        .map(|local| format!("{} is not _LIR_UNDEF", cx.names.local(*local)))
         .collect::<Vec<_>>()
         .join(" and ");
     writeln!(out, "{}if {guard}:", pad(indent))?;
-    writeln!(out, "{}_lir_outputs[{key:?}] = {}", pad(indent + 1), expr(value, names)?)?;
+    writeln!(out, "{}_lir_outputs[{slot}] = {}", pad(indent + 1), expr(value, cx.names)?)?;
     writeln!(out, "{}else:", pad(indent))?;
-    writeln!(out, "{}_lir_outputs.pop({key:?}, None)", pad(indent + 1))?;
+    writeln!(out, "{}_lir_outputs[{slot}] = None", pad(indent + 1))?;
     Ok(())
 }
 
@@ -228,7 +224,9 @@ fn expr(value: &Expr, names: &NameTable) -> Result<String> {
         Expr::Const(ConstValue::None) => "None".to_owned(),
         Expr::Unary { op, arg } => unary_expr(*op, expr(arg, names)?),
         Expr::Binary { op, lhs, rhs } => binary_expr(*op, expr(lhs, names)?, expr(rhs, names)?),
-        Expr::SimparamOpt { default, .. } => expr(default, names)?,
+        Expr::SimparamOpt { name, default } => {
+            format!("_lir_simparam_opt({}, {})", expr(name, names)?, expr(default, names)?)
+        }
         Expr::Call { target, .. } => {
             bail!("unsupported LIR call target during Python emission: {target}");
         }
@@ -275,7 +273,7 @@ fn emit_structured_stmt(
 ) -> Result<()> {
     match stmt {
         StructuredStmt::Stmt(stmt) => {
-            emit_stmt(out, stmt, cx.names, indent, defined)?;
+            emit_stmt(out, stmt, cx, indent, defined)?;
             mark_stmt_defs(stmt, assigned, defined);
         }
         StructuredStmt::If { cond, then_body, else_body } => {
@@ -400,18 +398,24 @@ fn emit_return(
     defined: &HashSet<LocalId>,
 ) -> Result<()> {
     if return_values_are_definitely_defined(values, defined) {
-        if cx.captures_outputs || cx.captures_effects {
+        if cx.output_layout.uses_slots() {
             if cx.captures_outputs {
-                writeln!(out, "{}_lir_return = dict(_lir_outputs)", pad(indent))?;
+                writeln!(out, "{}_lir_return = list(_lir_outputs)", pad(indent))?;
             } else {
-                writeln!(out, "{}_lir_return = {{}}", pad(indent))?;
+                writeln!(
+                    out,
+                    "{}_lir_return = [None] * {}",
+                    pad(indent),
+                    cx.output_layout.value_len
+                )?;
             }
             for value in values {
                 match value {
                     crate::lir::ReturnValue::Named { key, value } => {
+                        let slot = cx.output_layout.slot(key)?;
                         writeln!(
                             out,
-                            "{}_lir_return[{key:?}] = {}",
+                            "{}_lir_return[{slot}] = {}",
                             pad(indent),
                             expr(value, cx.names)?
                         )?;
@@ -419,7 +423,7 @@ fn emit_return(
                 }
             }
             if cx.captures_effects {
-                writeln!(out, "{}_lir_return[\"_lir_state\"] = _lir_state", pad(indent))?;
+                writeln!(out, "{}_lir_return.append(_lir_state)", pad(indent))?;
             }
             writeln!(out, "{}return _lir_return", pad(indent))?;
             return Ok(());
@@ -438,21 +442,22 @@ fn emit_return(
     }
 
     if cx.captures_outputs {
-        writeln!(out, "{}_lir_return = dict(_lir_outputs)", pad(indent))?;
+        writeln!(out, "{}_lir_return = list(_lir_outputs)", pad(indent))?;
     } else {
-        writeln!(out, "{}_lir_return = {{}}", pad(indent))?;
+        writeln!(out, "{}_lir_return = [None] * {}", pad(indent), cx.output_layout.value_len)?;
     }
     if cx.captures_effects {
-        writeln!(out, "{}_lir_return[\"_lir_state\"] = _lir_state", pad(indent))?;
+        writeln!(out, "{}_lir_return.append(_lir_state)", pad(indent))?;
     }
     for value in values {
         match value {
             crate::lir::ReturnValue::Named { key, value } => {
+                let slot = cx.output_layout.slot(key)?;
                 let undefined = expr_undefined_local_ids(value, defined);
                 if undefined.is_empty() {
                     writeln!(
                         out,
-                        "{}_lir_return[{key:?}] = {}",
+                        "{}_lir_return[{slot}] = {}",
                         pad(indent),
                         expr(value, cx.names)?
                     )?;
@@ -465,7 +470,7 @@ fn emit_return(
                     writeln!(out, "{}if {guard}:", pad(indent))?;
                     writeln!(
                         out,
-                        "{}_lir_return[{key:?}] = {}",
+                        "{}_lir_return[{slot}] = {}",
                         pad(indent + 1),
                         expr(value, cx.names)?
                     )?;
@@ -548,7 +553,54 @@ struct EmitCx<'a> {
     helper_prefix: &'a str,
     captures_outputs: bool,
     captures_effects: bool,
+    output_layout: OutputLayout,
     current_helper: Option<Label>,
+}
+
+#[derive(Clone, Debug)]
+struct OutputLayout {
+    slots: HashMap<String, usize>,
+    value_len: usize,
+    state_slot: Option<usize>,
+}
+
+impl OutputLayout {
+    fn new(function: &Function, captures_effects: bool) -> Self {
+        let mut keys = BTreeMap::<String, ()>::new();
+        for block in &function.blocks {
+            for stmt in &block.stmts {
+                if let Stmt::Capture { key, .. } = stmt {
+                    keys.insert(key.clone(), ());
+                }
+            }
+            if let crate::lir::Terminator::Return(values) = &block.term {
+                for value in values {
+                    match value {
+                        crate::lir::ReturnValue::Named { key, .. } => {
+                            keys.insert(key.clone(), ());
+                        }
+                    }
+                }
+            }
+        }
+
+        let slots =
+            keys.into_keys().enumerate().map(|(slot, key)| (key, slot)).collect::<HashMap<_, _>>();
+        let value_len = slots.len();
+        let state_slot = captures_effects.then_some(value_len);
+        Self { slots, value_len, state_slot }
+    }
+
+    fn uses_slots(&self) -> bool {
+        self.value_len != 0 || self.state_slot.is_some()
+    }
+
+    fn slot(&self, key: &str) -> Result<usize> {
+        self.slots
+            .get(key)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("missing LIR output slot for {key:?}"))
+    }
 }
 
 fn validate_direct_helper_graph(structured: &lir_structure::StructuredFunction) -> Result<()> {
@@ -826,6 +878,28 @@ fn pad(indent: usize) -> String {
     "    ".repeat(indent)
 }
 
+fn structured_captures_effects(structured: &lir_structure::StructuredFunction) -> bool {
+    body_captures_effects(&structured.body)
+        || structured.helpers.iter().any(|helper| body_captures_effects(&helper.body))
+}
+
+fn body_captures_effects(body: &[StructuredStmt]) -> bool {
+    body.iter().any(stmt_captures_effects)
+}
+
+fn stmt_captures_effects(stmt: &StructuredStmt) -> bool {
+    match stmt {
+        StructuredStmt::Stmt(Stmt::CallEffect(_)) => true,
+        StructuredStmt::If { then_body, else_body, .. } => {
+            body_captures_effects(then_body) || body_captures_effects(else_body)
+        }
+        StructuredStmt::Stmt(_)
+        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::Return(_)
+        | StructuredStmt::Raise(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
@@ -885,21 +959,25 @@ mod tests {
         assert_no_trampoline_protocol(&emitted);
         assert!(!emitted.contains(" = mir_call("), "{emitted}");
         assert!(!emitted.contains("MIR_IGNORED_CALLS"), "{emitted}");
-        assert!(emitted.contains("val = 0.000000000001"), "{emitted}");
+        assert!(
+            emitted.contains(r#"val = _lir_simparam_opt("gmin", 0.000000000001)"#),
+            "{emitted}"
+        );
         assert!(!emitted.contains(r#"_lir_state["diagnostics"].append"#), "{emitted}");
+        assert!(!emitted.contains("diagnostics"), "{emitted}");
         assert!(emitted.contains(r#"_lir_state["invalid_params"]"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_state["collapse_hints"]"#), "{emitted}");
+        assert!(!emitted.contains("collapse_hints"), "{emitted}");
         assert!(!emitted.contains("_lir_effects.append"), "{emitted}");
         assert!(!emitted.contains(" ignored:"), "{emitted}");
         assert!(!emitted.contains("pass"), "{emitted}");
 
         let script = format!(
             "{emitted}\n\
+             def _lir_simparam_opt(name, default): return {{'gmin': 2e-12}}.get(name, default)\n\
              result = call_effects()\n\
-             assert result['out'] == 1e-12, result\n\
-             assert result['_lir_state']['diagnostics'] == [], result\n\
-             assert result['_lir_state']['invalid_params'] == ['p7'], result\n\
-             assert result['_lir_state']['collapse_hints'] == [('n2', 'n1')], result\n"
+             assert result[0] == 2e-12, result\n\
+             assert result[1]['invalid_params'] == ['p7'], result\n\
+             assert set(result[1]) == {{'invalid_params'}}, result\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -912,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_values_used_only_by_diagnostic_effects() {
+    fn drops_values_used_only_by_non_semantic_effects() {
         let input = LocalId(0);
         let computed = LocalId(1);
         let function = Function {
@@ -938,6 +1016,10 @@ mod tests {
                         target: "Display".to_owned(),
                         args: vec![Expr::Local(computed)],
                     }),
+                    Stmt::CallEffect(CallEffect::CollapseHint {
+                        hi: "n2".to_owned(),
+                        lo: Some("n1".to_owned()),
+                    }),
                 ],
                 term: Terminator::Return(Vec::new()),
             }],
@@ -947,11 +1029,13 @@ mod tests {
         let emitted = emit_function(&function).unwrap();
         assert!(!emitted.contains("computed = (input) + (1)"), "{emitted}");
         assert!(!emitted.contains(r#"_lir_state["diagnostics"].append"#), "{emitted}");
+        assert!(!emitted.contains("_lir_state"), "{emitted}");
+        assert!(!emitted.contains("collapse_hints"), "{emitted}");
 
         let script = format!(
             "{emitted}\n\
              result = effect_live_value(4)\n\
-             assert result['_lir_state']['diagnostics'] == [], result\n"
+             assert result == {{}}, result\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -1009,6 +1093,7 @@ mod tests {
             helper_prefix: "noop_branch",
             captures_outputs: false,
             captures_effects: false,
+            output_layout: super::OutputLayout::new(&function, false),
             current_helper: None,
         };
         let body = vec![crate::lir_structure::StructuredStmt::If {
@@ -1089,12 +1174,12 @@ mod tests {
 
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
-        assert!(emitted.contains(r#"return {"out": v}"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_return[0] = v"#), "{emitted}");
 
         let script = format!(
             "{emitted}\n\
-             assert diamond(True) == {{'out': 1}}, diamond(True)\n\
-             assert diamond(False) == {{'out': 2}}, diamond(False)\n"
+             assert diamond(True) == [1], diamond(True)\n\
+             assert diamond(False) == [2], diamond(False)\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -1183,8 +1268,8 @@ mod tests {
 
         let script = format!(
             "{emitted}\n\
-             assert sum_to_n(0) == {{'out': 0}}, sum_to_n(0)\n\
-             assert sum_to_n(5) == {{'out': 10}}, sum_to_n(5)\n"
+             assert sum_to_n(0) == [0], sum_to_n(0)\n\
+             assert sum_to_n(5) == [10], sum_to_n(5)\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -1279,12 +1364,12 @@ mod tests {
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
         assert!(emitted.contains("return _stale_capture_bb_1("), "{emitted}");
-        assert!(emitted.contains(r#"_lir_outputs.pop("slot", None)"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_outputs[0] = None"#), "{emitted}");
 
         let script = format!(
             "{emitted}\n\
-             assert stale_capture(True) == {{}}, stale_capture(True)\n\
-             assert stale_capture(False) == {{'slot': 9}}, stale_capture(False)\n"
+             assert stale_capture(True) == [None], stale_capture(True)\n\
+             assert stale_capture(False) == [9], stale_capture(False)\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -1318,9 +1403,9 @@ mod tests {
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
         assert!(!emitted.contains("is not _LIR_UNDEF"), "{emitted}");
-        assert!(!emitted.contains(r#"_lir_outputs.pop("slot", None)"#), "{emitted}");
+        assert!(!emitted.contains(r#"_lir_outputs[0] = None"#), "{emitted}");
 
-        let script = format!("{emitted}\nassert defined_capture() == {{'slot': 11}}\n");
+        let script = format!("{emitted}\nassert defined_capture() == [11]\n");
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
         assert!(

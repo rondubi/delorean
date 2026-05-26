@@ -428,11 +428,20 @@ impl<'a, 'r> LowerCx<'a, 'r> {
         let id = LocalId(self.locals.len());
         self.locals.push(Local {
             id,
-            name_hint: value_name(value),
+            name_hint: self.name_hint_for_value(value),
             ty: type_for_value(self.unit.source, value),
         });
         self.locals_by_value.insert(value, id);
         id
+    }
+
+    fn name_hint_for_value(&self, value: Value) -> String {
+        match self.unit.source.dfg.value_def(value) {
+            ValueDef::Param(param) => {
+                self.unit.param_name_hints.get(&param).cloned().unwrap_or_else(|| value_name(value))
+            }
+            _ => value_name(value),
+        }
     }
 
     fn canonical_value(&self, mut value: Value) -> Value {

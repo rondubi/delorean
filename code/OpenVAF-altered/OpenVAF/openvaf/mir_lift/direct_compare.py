@@ -394,7 +394,7 @@ def run_osdi(
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, list[int]], dict[str, object]]:
     lib = ctypes.CDLL(str(path))
     patch_osdi_log(lib)
-    patch_lim_table(lib)
+    require_resolved_lim_table(lib)
     ndesc = ctypes.c_uint32.in_dll(lib, "OSDI_NUM_DESCRIPTORS").value
     if ndesc < 1:
         raise SystemExit("OSDI_NUM_DESCRIPTORS is zero")
@@ -528,7 +528,7 @@ def run_osdi(
                         {},
                         instance_values,
                         instance_given,
-                        {},
+                        instance_builtin_values,
                         attempt_report,
                     )
                 desc.setup_instance(
@@ -541,23 +541,6 @@ def run_osdi(
                     ctypes.byref(init),
                 )
                 check_init(init)
-                # Lifted setup_instance currently has no instance builtin_params argument;
-                # apply builtins after setup on both paths so eval sees the same values.
-                if access is not None and mode == "realistic" and instance_builtin_values:
-                    set_osdi_params(
-                        access,
-                        desc,
-                        ctypes.byref(inst),
-                        ctypes.byref(model),
-                        params,
-                        {},
-                        {},
-                        {},
-                        {},
-                        {},
-                        instance_builtin_values,
-                        attempt_report,
-                    )
             except OsdiInitFailed as err:
                 last_init_error = err
                 report["init_retry_failures"] = int(report["init_retry_failures"]) + 1
@@ -986,41 +969,30 @@ def run_python(
             "builtin_params": bundle.get("model_builtin_params", {}),
         }
         try:
-            model = call_with_supported_kwargs(setup_model, model_kwargs)
+            model = call_with_supported_kwargs(setup_model, model_kwargs, f"{module}_setup_model")
         except Exception as err:
             last = traceback.extract_tb(err.__traceback__)[-1]
             raise SystemExit(
                 f"lifted Python setup_model failed: {type(err).__name__}: {err} at {last.filename}:{last.lineno}\n"
                 f"context: {format_case_context(bundle)}"
             ) from None
-        apply_lifted_overrides(
-            model,
-            params=bundle.get("model_params", {}),
-            given=bundle.get("model_given", {}),
-            builtin_params=bundle.get("model_builtin_params", {}),
-        )
         connected_terminals = bundle.get("connected_terminals", bundle.get("num_terminals", 0))
         instance_kwargs = {
             "model": model,
             "temperature": bundle.get("temperature", 300.0),
             "params": bundle.get("instance_params", {}),
             "given": bundle.get("instance_given", {}),
+            "builtin_params": bundle.get("instance_builtin_params", {}),
             "connected_terminals": connected_terminals,
         }
         try:
-            instance = call_with_supported_kwargs(setup_instance, instance_kwargs)
+            instance = call_with_supported_kwargs(setup_instance, instance_kwargs, f"{module}_setup_instance")
         except Exception as err:
             last = traceback.extract_tb(err.__traceback__)[-1]
             raise SystemExit(
                 f"lifted Python setup_instance failed: {type(err).__name__}: {err} at {last.filename}:{last.lineno}\n"
                 f"context: {format_case_context(bundle)}"
             ) from None
-        apply_lifted_overrides(
-            instance,
-            params=bundle.get("instance_params", {}),
-            given=bundle.get("instance_given", {}),
-            builtin_params=bundle.get("instance_builtin_params", {}),
-        )
         for sim_case in bundle.get("evals", []):
             try:
                 result = func(instance, model, sim_case)
@@ -1045,22 +1017,6 @@ def run_python(
     return out
 
 
-def apply_lifted_overrides(
-    target: object,
-    params: object,
-    given: object,
-    builtin_params: object,
-) -> None:
-    if not isinstance(target, dict):
-        return
-    if isinstance(params, dict) and params:
-        target.setdefault("params", {}).update(params)
-    if isinstance(given, dict) and given:
-        target.setdefault("given", {}).update(given)
-    if isinstance(builtin_params, dict) and builtin_params:
-        target.setdefault("builtin_params", {}).update(builtin_params)
-
-
 def load_lifted_module(path: Path) -> object:
     spec = importlib.util.spec_from_file_location("lifted", path)
     if spec is None or spec.loader is None:
@@ -1070,11 +1026,23 @@ def load_lifted_module(path: Path) -> object:
     return mod
 
 
-def call_with_supported_kwargs(func: object, kwargs: dict[str, object]) -> object:
+def call_with_supported_kwargs(func: object, kwargs: dict[str, object], func_name: str) -> object:
     sig = inspect.signature(func)
     if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()):
         return func(**kwargs)
     supported = {key: value for key, value in kwargs.items() if key in sig.parameters}
+    missing = {
+        key: value
+        for key, value in kwargs.items()
+        if key not in sig.parameters and setup_input_required(value)
+    }
+    if missing:
+        missing_names = ", ".join(sorted(missing))
+        supported_names = ", ".join(sig.parameters) or "<none>"
+        raise TypeError(
+            f"{func_name} missing setup interface for required input(s): {missing_names}; "
+            f"signature supports: {supported_names}"
+        )
     try:
         return func(**supported)
     except TypeError:
@@ -1083,6 +1051,14 @@ def call_with_supported_kwargs(func: object, kwargs: dict[str, object]) -> objec
             if name in supported:
                 positional.append(supported[name])
         return func(*positional)
+
+
+def setup_input_required(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (dict, list, tuple, set)):
+        return bool(value)
+    return True
 
 
 def format_case_context(bundle: dict[str, object], sim_case: object = None) -> str:
@@ -1218,38 +1194,30 @@ def patch_osdi_log(lib: ctypes.CDLL) -> None:
     slot.value = ctypes.cast(osdi_log, ctypes.c_void_p).value
 
 
-def patch_lim_table(lib: ctypes.CDLL) -> None:
-    # Simple enough for current OpenVAF OSDI: if a limiter table exists, make pnjlim callable.
+def require_resolved_lim_table(lib: ctypes.CDLL) -> None:
     try:
         table_len = ctypes.c_uint32.in_dll(lib, "OSDI_LIM_TABLE_LEN").value
         table_ptr = ctypes.c_void_p.in_dll(lib, "OSDI_LIM_TABLE").value
     except ValueError:
+        return
+    if not table_ptr or table_len == 0:
         return
 
     class Lim(ctypes.Structure):
         _fields_ = [("name", ctypes.c_char_p), ("num_args", ctypes.c_uint32), ("func_ptr", ctypes.c_void_p)]
 
     table = (Lim * table_len).from_address(table_ptr)
-
-    @ctypes.CFUNCTYPE(ctypes.c_double, ctypes.c_bool, ctypes.POINTER(ctypes.c_bool), ctypes.c_double, ctypes.c_double, ctypes.c_double, ctypes.c_double)
-    def pnjlim(_init, check, vnew, vold, vt, vcrit):
-        check[0] = False
-        if vnew > vcrit and abs(vnew - vold) > (vt + vt):
-            if vold > 0.0:
-                arg = 1.0 + (vnew - vold) / vt
-                if arg > 0.0:
-                    vnew = vold + vt * math.log(arg)
-                else:
-                    vnew = vcrit
-            else:
-                vnew = vt * math.log(vnew / vt)
-            check[0] = True
-        return vnew
-
-    patch_lim_table._pnjlim = pnjlim
+    missing = []
     for item in table:
-        if item.name and item.name.decode() == "pnjlim":
-            item.func_ptr = ctypes.cast(pnjlim, ctypes.c_void_p).value
+        if item.func_ptr:
+            continue
+        name = item.name.decode(errors="replace") if item.name else "<unnamed>"
+        missing.append(f"{name}/{int(item.num_args)}")
+    if missing:
+        raise SystemExit(
+            "native OSDI requires unresolved limiter callback(s) in OSDI_LIM_TABLE: "
+            + ", ".join(missing)
+        )
 
 
 def empty_sim_paras() -> tuple[OsdiSimParas, tuple[ctypes.c_char_p, ctypes.c_char_p]]:

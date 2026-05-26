@@ -19,7 +19,7 @@ pub(crate) struct BackwardFacts {
 
 const DISABLED_PASSES: &[BackwardPassKind] = &[BackwardPassKind::HelperLiveIns];
 const CLEANUP_PASSES: &[BackwardPassKind] = &[
-    BackwardPassKind::DropNonSemanticDiagnostics,
+    BackwardPassKind::DropNonSemanticEffects,
     BackwardPassKind::HelperForwarding,
     BackwardPassKind::CommonTailHelperSinking,
     BackwardPassKind::HelperSignaturePruning,
@@ -40,7 +40,7 @@ const STRUCTURAL_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::HelperSignaturePruning,
 ];
 const FINAL_DCE_PASSES: &[BackwardPassKind] = &[
-    BackwardPassKind::DropNonSemanticDiagnostics,
+    BackwardPassKind::DropNonSemanticEffects,
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
@@ -101,7 +101,7 @@ pub(crate) trait BackwardLirPass {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BackwardPassKind {
-    DropNonSemanticDiagnostics,
+    DropNonSemanticEffects,
     HelperForwarding,
     CommonTailHelperSinking,
     HelperSignaturePruning,
@@ -116,7 +116,7 @@ enum BackwardPassKind {
 impl BackwardPassKind {
     fn name(self) -> &'static str {
         match self {
-            Self::DropNonSemanticDiagnostics => "drop-non-semantic-diagnostics",
+            Self::DropNonSemanticEffects => "drop-non-semantic-effects",
             Self::HelperForwarding => "helper-forwarding",
             Self::CommonTailHelperSinking => "common-tail-helper-sinking",
             Self::HelperSignaturePruning => "helper-signature-pruning",
@@ -131,7 +131,7 @@ impl BackwardPassKind {
 
     fn run(self, cx: &mut BackwardPassCx<'_>) -> bool {
         match self {
-            Self::DropNonSemanticDiagnostics => run_backward_pass::<DropNonSemanticDiagnostics>(cx),
+            Self::DropNonSemanticEffects => run_backward_pass::<DropNonSemanticEffects>(cx),
             Self::HelperForwarding => run_backward_pass::<HelperForwarding>(cx),
             Self::CommonTailHelperSinking => run_backward_pass::<CommonTailHelperSinking>(cx),
             Self::HelperSignaturePruning => run_backward_pass::<HelperSignaturePruning>(cx),
@@ -196,25 +196,25 @@ impl BackwardPassCx<'_> {
 }
 
 #[derive(Default)]
-struct DropNonSemanticDiagnostics;
+struct DropNonSemanticEffects;
 
-impl BackwardLirPass for DropNonSemanticDiagnostics {
+impl BackwardLirPass for DropNonSemanticEffects {
     fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
-        let mut changed = drop_non_semantic_diagnostics_in_body(&mut cx.structured.body);
+        let mut changed = drop_non_semantic_effects_in_body(&mut cx.structured.body);
         for helper in &mut cx.structured.helpers {
-            changed |= drop_non_semantic_diagnostics_in_body(&mut helper.body);
+            changed |= drop_non_semantic_effects_in_body(&mut helper.body);
         }
         changed
     }
 }
 
-fn drop_non_semantic_diagnostics_in_body(body: &mut Vec<StructuredStmt>) -> bool {
+fn drop_non_semantic_effects_in_body(body: &mut Vec<StructuredStmt>) -> bool {
     let mut changed = false;
     let mut kept = Vec::with_capacity(body.len());
 
     for mut stmt in body.drain(..) {
-        changed |= drop_non_semantic_diagnostics_in_stmt(&mut stmt);
-        if matches!(stmt, StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::Diagnostic { .. }))) {
+        changed |= drop_non_semantic_effects_in_stmt(&mut stmt);
+        if is_non_semantic_effect_stmt(&stmt) {
             changed = true;
         } else {
             kept.push(stmt);
@@ -225,11 +225,11 @@ fn drop_non_semantic_diagnostics_in_body(body: &mut Vec<StructuredStmt>) -> bool
     changed
 }
 
-fn drop_non_semantic_diagnostics_in_stmt(stmt: &mut StructuredStmt) -> bool {
+fn drop_non_semantic_effects_in_stmt(stmt: &mut StructuredStmt) -> bool {
     match stmt {
         StructuredStmt::If { then_body, else_body, .. } => {
-            let then_changed = drop_non_semantic_diagnostics_in_body(then_body);
-            let else_changed = drop_non_semantic_diagnostics_in_body(else_body);
+            let then_changed = drop_non_semantic_effects_in_body(then_body);
+            let else_changed = drop_non_semantic_effects_in_body(else_body);
             then_changed || else_changed
         }
         StructuredStmt::Stmt(_)
@@ -237,6 +237,15 @@ fn drop_non_semantic_diagnostics_in_stmt(stmt: &mut StructuredStmt) -> bool {
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     }
+}
+
+fn is_non_semantic_effect_stmt(stmt: &StructuredStmt) -> bool {
+    matches!(
+        stmt,
+        StructuredStmt::Stmt(Stmt::CallEffect(
+            CallEffect::Diagnostic { .. } | CallEffect::CollapseHint { .. }
+        ))
+    )
 }
 
 #[derive(Default)]
@@ -1921,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_only_non_semantic_diagnostic_effects() {
+    fn drops_only_non_semantic_effects() {
         let mut body = vec![
             StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::Diagnostic {
                 target: "Display".to_owned(),
@@ -1946,7 +1955,7 @@ mod tests {
             },
         ];
 
-        assert!(drop_non_semantic_diagnostics_in_body(&mut body));
+        assert!(drop_non_semantic_effects_in_body(&mut body));
         assert_eq!(
             body,
             vec![
@@ -1956,13 +1965,11 @@ mod tests {
                 StructuredStmt::If {
                     cond: Expr::Local(LocalId(0)),
                     then_body: vec![assign_int(LocalId(1), 2)],
-                    else_body: vec![StructuredStmt::Stmt(Stmt::CallEffect(
-                        CallEffect::CollapseHint { hi: "n2".to_owned(), lo: Some("n1".to_owned()) },
-                    ))],
+                    else_body: Vec::new(),
                 },
             ]
         );
-        assert!(!drop_non_semantic_diagnostics_in_body(&mut body));
+        assert!(!drop_non_semantic_effects_in_body(&mut body));
     }
 
     #[test]

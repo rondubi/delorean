@@ -346,6 +346,10 @@ fn compile_with_mir_lift(
         let init_capture_values = compiled.init.cached_vals.keys().copied().collect::<Vec<_>>();
         let python_osdi = PythonOsdiModule::new(base_name.to_string(), db, &compiled);
         let eval_output_values = python_osdi.return_values();
+        let model_param_name_hints =
+            mir_lift_param_name_hints(db, &compiled.model_param_intern);
+        let init_param_name_hints = mir_lift_param_name_hints(db, &compiled.init.intern);
+        let eval_param_name_hints = mir_lift_param_name_hints(db, &compiled.intern);
 
         writeln!(&mut stderr, "mir-lift: lifting {} model setup", base_name)?;
         if opts.dump_lir {
@@ -353,23 +357,25 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_hir_returns_and_captures(
+                mir_lift::dump_function_lir_with_hir_returns_captures_and_param_hints(
                     &compiled.model_param_setup,
                     &[],
                     &model_output_values,
                     &literals,
                     &compiled.model_param_intern,
+                    model_param_name_hints.clone(),
                 )?
             )?;
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_hir_returns_and_captures(
+            &mir_lift::lift_function_with_hir_returns_captures_and_param_hints(
                 &compiled.model_param_setup,
                 &[],
                 &model_output_values,
                 &literals,
                 &compiled.model_param_intern,
+                model_param_name_hints,
             )?,
             &mut first_unit,
         )?;
@@ -379,23 +385,25 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_hir_returns_and_captures(
+                mir_lift::dump_function_lir_with_hir_returns_captures_and_param_hints(
                     &compiled.init.func,
                     &init_output_values,
                     &init_capture_values,
                     &literals,
                     &compiled.init.intern,
+                    init_param_name_hints.clone(),
                 )?
             )?;
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_hir_returns_and_captures(
+            &mir_lift::lift_function_with_hir_returns_captures_and_param_hints(
                 &compiled.init.func,
                 &init_output_values,
                 &init_capture_values,
                 &literals,
                 &compiled.init.intern,
+                init_param_name_hints,
             )?,
             &mut first_unit,
         )?;
@@ -405,21 +413,23 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_hir_returns(
+                mir_lift::dump_function_lir_with_hir_returns_and_param_hints(
                     &compiled.eval,
                     &eval_output_values,
                     &literals,
                     &compiled.intern,
+                    eval_param_name_hints.clone(),
                 )?
             )?;
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_hir_returns(
+            &mir_lift::lift_function_with_hir_returns_and_param_hints(
                 &compiled.eval,
                 &eval_output_values,
                 &literals,
                 &compiled.intern,
+                eval_param_name_hints,
             )?,
             &mut first_unit,
         )?;
@@ -430,6 +440,22 @@ fn compile_with_mir_lift(
     writeln!(&mut stderr, "mir-lift: writing {}", lib_file)?;
     std::fs::write(lib_file, python).context("failed to write mir_lift output")?;
     Ok(())
+}
+
+fn mir_lift_param_name_hints(
+    db: &CompilationDB,
+    intern: &hir_lower::HirInterner,
+) -> std::collections::HashMap<mir::Param, String> {
+    intern
+        .params
+        .iter_enumerated()
+        .filter_map(|(param, (kind, _))| match kind {
+            hir_lower::ParamKind::Param(param_def) => {
+                Some((param, format!("param_{}", param_def.name(db))))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 struct PythonOsdiModule {
@@ -443,6 +469,9 @@ struct PythonOsdiModule {
     model_args: Vec<String>,
     init_args: Vec<String>,
     eval_args: Vec<String>,
+    raw_model_slots: std::collections::HashMap<mir::Value, usize>,
+    raw_init_slots: std::collections::HashMap<mir::Value, usize>,
+    raw_eval_slots: std::collections::HashMap<mir::Value, usize>,
     model_params: Vec<(String, mir::Value)>,
     model_instance_defaults: Vec<(String, mir::Value)>,
     instance_params: Vec<(String, mir::Value)>,
@@ -464,6 +493,63 @@ struct PythonOsdiOutputGroup {
 impl PythonOsdiModule {
     fn new(name: String, db: &CompilationDB, compiled: &sim_back::CompiledModule<'_>) -> Self {
         let eval = &compiled.eval;
+        let model_output_values = compiled
+            .model_param_intern
+            .outputs
+            .values()
+            .copied()
+            .filter_map(|value| value.expand())
+            .collect::<Vec<_>>();
+        let init_output_values = compiled
+            .init
+            .intern
+            .outputs
+            .values()
+            .copied()
+            .filter_map(|value| value.expand())
+            .collect::<Vec<_>>();
+        let init_capture_values = compiled.init.cached_vals.keys().copied().collect::<Vec<_>>();
+        let init_slots = python_osdi_raw_slots(
+            init_output_values.iter().copied().chain(init_capture_values.iter().copied()),
+        );
+        let init_hidden_values = python_osdi_hidden_outputs(db, &compiled.init.intern);
+        let eval_hidden_values = python_osdi_hidden_outputs(db, &compiled.intern);
+        let outputs = vec![
+            python_osdi_group(
+                "residual_resist",
+                compiled.dae_system.residual.iter().map(|residual| residual.resist),
+                eval,
+            ),
+            python_osdi_group(
+                "residual_react",
+                compiled.dae_system.residual.iter().map(|residual| residual.react),
+                eval,
+            ),
+            python_osdi_group(
+                "limit_rhs_resist",
+                compiled.dae_system.residual.iter().map(|residual| residual.resist_lim_rhs),
+                eval,
+            ),
+            python_osdi_group(
+                "limit_rhs_react",
+                compiled.dae_system.residual.iter().map(|residual| residual.react_lim_rhs),
+                eval,
+            ),
+            python_osdi_group(
+                "jacobian_resist",
+                compiled.dae_system.jacobian.iter().map(|entry| entry.resist),
+                eval,
+            ),
+            python_osdi_group(
+                "jacobian_react",
+                compiled.dae_system.jacobian.iter().map(|entry| entry.react),
+                eval,
+            ),
+        ];
+        let eval_output_values = outputs
+            .iter()
+            .flat_map(|group| group.values.iter().copied().flatten())
+            .chain(eval_hidden_values.iter().map(|(_, value)| *value));
         Self {
             raw_model_function: sanitize_python_ident(&format!("_{name}_model_raw")),
             raw_init_function: sanitize_python_ident(&format!("_{name}_init_raw")),
@@ -484,6 +570,9 @@ impl PythonOsdiModule {
                 SetupPhase::Instance,
             ),
             eval_args: python_osdi_eval_args(db, compiled),
+            raw_model_slots: python_osdi_raw_slots(model_output_values),
+            raw_init_slots: init_slots,
+            raw_eval_slots: python_osdi_raw_slots(eval_output_values),
             model_params: python_osdi_param_outputs(
                 db,
                 compiled,
@@ -500,42 +589,11 @@ impl PythonOsdiModule {
             cache_values: python_osdi_cache_values(compiled),
             builtin_params: python_osdi_builtin_params(compiled),
             hidden_slots: python_osdi_hidden_slots(db, compiled),
-            init_hidden_values: python_osdi_hidden_outputs(db, &compiled.init.intern),
-            eval_hidden_values: python_osdi_hidden_outputs(db, &compiled.intern),
+            init_hidden_values,
+            eval_hidden_values,
             num_states: compiled.intern.lim_state.len(),
             num_cache_slots: compiled.init.cache_slots.len(),
-            outputs: vec![
-                python_osdi_group(
-                    "residual_resist",
-                    compiled.dae_system.residual.iter().map(|residual| residual.resist),
-                    eval,
-                ),
-                python_osdi_group(
-                    "residual_react",
-                    compiled.dae_system.residual.iter().map(|residual| residual.react),
-                    eval,
-                ),
-                python_osdi_group(
-                    "limit_rhs_resist",
-                    compiled.dae_system.residual.iter().map(|residual| residual.resist_lim_rhs),
-                    eval,
-                ),
-                python_osdi_group(
-                    "limit_rhs_react",
-                    compiled.dae_system.residual.iter().map(|residual| residual.react_lim_rhs),
-                    eval,
-                ),
-                python_osdi_group(
-                    "jacobian_resist",
-                    compiled.dae_system.jacobian.iter().map(|entry| entry.resist),
-                    eval,
-                ),
-                python_osdi_group(
-                    "jacobian_react",
-                    compiled.dae_system.jacobian.iter().map(|entry| entry.react),
-                    eval,
-                ),
-            ],
+            outputs,
             name,
         }
     }
@@ -555,6 +613,39 @@ impl PythonOsdiModule {
         }
         values
     }
+}
+
+fn python_osdi_raw_slots(
+    values: impl IntoIterator<Item = mir::Value>,
+) -> std::collections::HashMap<mir::Value, usize> {
+    let values = values.into_iter().collect::<Vec<_>>();
+    let mut key_slots = std::collections::BTreeMap::<String, usize>::new();
+    for value in &values {
+        key_slots.entry(python_osdi_raw_key(*value)).or_insert(0);
+    }
+    for (slot, value_slot) in key_slots.values_mut().enumerate() {
+        *value_slot = slot;
+    }
+    values
+        .into_iter()
+        .map(|value| {
+            let slot = key_slots[&python_osdi_raw_key(value)];
+            (value, slot)
+        })
+        .collect()
+}
+
+fn python_osdi_raw_key(value: mir::Value) -> String {
+    format!("{value}").replace('.', "_")
+}
+
+fn python_osdi_raw_slot(
+    slots: &std::collections::HashMap<mir::Value, usize>,
+    value: mir::Value,
+) -> usize {
+    *slots.get(&value).unwrap_or_else(|| {
+        panic!("missing Python OSDI raw slot for {}", python_osdi_raw_key(value))
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -682,7 +773,9 @@ fn python_osdi_setup_param_expr(
         hir_lower::ParamKind::HiddenState(var) => match phase {
             SetupPhase::Model => format!("_pyosdi_missing_hidden({:?})", var.name(db).to_string()),
             SetupPhase::Instance => {
-                format!("_pyosdi_hidden(instance, {:?})", var.name(db).to_string())
+                let name = var.name(db).to_string();
+                let slot = python_osdi_hidden_slot(&python_osdi_hidden_slots(db, compiled), &name);
+                format!("_pyosdi_hidden(instance, {slot}, {name:?})")
             }
         },
     }
@@ -922,7 +1015,9 @@ fn python_osdi_param_expr(
             format!("_pyosdi_builtin(instance, {:?}, {:?})", format!("{param:?}"), param.default_value())
         }
         hir_lower::ParamKind::HiddenState(var) => {
-            format!("_pyosdi_hidden(instance, {:?})", var.name(db).to_string())
+            let name = var.name(db).to_string();
+            let slot = python_osdi_hidden_slot(&python_osdi_hidden_slots(db, compiled), &name);
+            format!("_pyosdi_hidden(instance, {slot}, {name:?})")
         }
         hir_lower::ParamKind::ImplicitUnknown(equation) => {
             python_osdi_solve_expr(compiled, sim_back::SimUnknownKind::Implicit(equation))
@@ -961,10 +1056,76 @@ fn python_osdi_group(
     }
 }
 
+fn python_osdi_output_var_name(group: &PythonOsdiOutputGroup) -> String {
+    sanitize_python_ident(&format!("output_{}", group.name))
+}
+
+fn python_osdi_hidden_slot(slots: &[String], name: &str) -> usize {
+    slots
+        .iter()
+        .position(|slot_name| slot_name == name)
+        .unwrap_or_else(|| panic!("missing Python OSDI hidden slot for {name}"))
+}
+
 fn append_python_osdi_module(out: &mut String, module: &PythonOsdiModule) {
     out.push_str("\n\n");
     out.push_str(
         r#"_PYOSDI_UNSET = object()
+
+
+class _PyOsdiModel:
+    __slots__ = ("module", "raw", "params", "given", "inst_defaults", "builtin_params", "sim_params")
+
+    def __init__(self, module, raw, params, given, inst_defaults, builtin_params, sim_params):
+        self.module = module
+        self.raw = raw
+        self.params = params
+        self.given = given
+        self.inst_defaults = inst_defaults
+        self.builtin_params = builtin_params
+        self.sim_params = sim_params
+
+
+class _PyOsdiInstance:
+    __slots__ = (
+        "model",
+        "temperature",
+        "raw",
+        "outputs",
+        "params",
+        "given",
+        "builtin_params",
+        "sim_params",
+        "hidden",
+        "state_idx",
+        "cache",
+    )
+
+    def __init__(
+        self,
+        model,
+        temperature,
+        raw,
+        outputs,
+        params,
+        given,
+        builtin_params,
+        sim_params,
+        hidden,
+        state_idx,
+        cache,
+    ):
+        self.model = model
+        self.temperature = temperature
+        self.raw = raw
+        self.outputs = outputs
+        self.params = params
+        self.given = given
+        self.builtin_params = builtin_params
+        self.sim_params = sim_params
+        self.hidden = hidden
+        self.state_idx = state_idx
+        self.cache = cache
 
 
 def _pyosdi_unsupported(message):
@@ -1001,6 +1162,18 @@ def _pyosdi_dict_get(items, key, context):
     return val
 
 
+def _pyosdi_attr_get(item, name, context):
+    if item is None:
+        _pyosdi_missing(context, name)
+    try:
+        val = getattr(item, name)
+    except AttributeError:
+        _pyosdi_missing(context, name)
+    if val is None:
+        _pyosdi_missing(context, name)
+    return val
+
+
 def _pyosdi_effective_given(params, given):
     effective = dict(given or {})
     for key, val in (params or {}).items():
@@ -1034,15 +1207,69 @@ def _pyosdi_merge_given_params(base, params, given):
     return merged
 
 
-def _pyosdi_raw_get(items, key, context):
+def _pyosdi_raw_missing(slot):
+    raise RuntimeError(f"missing raw output slot {slot}")
+
+
+def _pyosdi_raw_present(items, slot):
     if items is None:
-        _pyosdi_missing(context, key)
-    if key not in items:
-        _pyosdi_missing(context, key)
-    val = items[key]
+        _pyosdi_raw_missing(slot)
+    try:
+        val = items[slot]
+    except IndexError:
+        return False
+    except TypeError:
+        raise RuntimeError("raw outputs are not indexable") from None
+    return val is not None and val is not _PYOSDI_UNSET
+
+
+def _pyosdi_raw_slot(items, slot):
+    if items is None:
+        _pyosdi_raw_missing(slot)
+    try:
+        val = items[slot]
+    except IndexError:
+        _pyosdi_raw_missing(slot)
+    except TypeError:
+        raise RuntimeError("raw outputs are not indexable") from None
     if val is None or val is _PYOSDI_UNSET:
-        _pyosdi_missing(context, key)
+        _pyosdi_raw_missing(slot)
     return val
+
+
+_PYOSDI_SIMPARAM_STACK = []
+
+
+def _lir_simparam_opt(name, default):
+    for items in reversed(_PYOSDI_SIMPARAM_STACK):
+        if items is None:
+            continue
+        try:
+            present = name in items
+        except TypeError:
+            raise RuntimeError("sim_params is not a mapping") from None
+        if not present:
+            continue
+        val = items[name]
+        if val is None:
+            _pyosdi_missing("simulator parameter", name)
+        return val
+    return default
+
+
+def _pyosdi_sim_params_from(sim_info=None, instance=None, model=None):
+    if sim_info is not None:
+        try:
+            sim_params = sim_info.get("sim_params")
+        except AttributeError:
+            sim_params = None
+        if sim_params is not None:
+            return sim_params
+    if instance is not None:
+        return _pyosdi_instance_value(instance, "sim_params")
+    if model is not None:
+        return _pyosdi_model_value(model, "sim_params")
+    return {}
 
 
 def _pyosdi_sim_info(sim_info, key):
@@ -1050,11 +1277,11 @@ def _pyosdi_sim_info(sim_info, key):
 
 
 def _pyosdi_instance_value(instance, key):
-    return _pyosdi_dict_get(instance, key, "instance")
+    return _pyosdi_attr_get(instance, key, "instance")
 
 
 def _pyosdi_model_value(model, key):
-    return _pyosdi_dict_get(model, key, "model")
+    return _pyosdi_attr_get(model, key, "model")
 
 
 def _pyosdi_cache(instance, idx):
@@ -1087,10 +1314,10 @@ def _pyosdi_param(instance, model, name):
 
 
 def _pyosdi_given(instance, model, name):
-    inst_given = instance.get("given", {})
+    inst_given = _pyosdi_instance_value(instance, "given")
     if name in inst_given and inst_given[name]:
         return True
-    return bool(model.get("given", {}).get(name, False))
+    return bool(_pyosdi_model_value(model, "given").get(name, False))
 
 
 def _pyosdi_builtin(instance, name, default):
@@ -1113,17 +1340,24 @@ def _pyosdi_connected(sim_info, idx):
     return idx < connected
 
 
-def _pyosdi_hidden(instance, name):
+def _pyosdi_hidden(instance, idx, name):
     hidden = _pyosdi_instance_value(instance, "hidden")
-    if name not in hidden:
+    val = _pyosdi_get_required(hidden, idx, f"hidden state {name!r}")
+    if val is _PYOSDI_UNSET or val is None:
         _pyosdi_missing("hidden state", name)
-    if hidden[name] is _PYOSDI_UNSET or hidden[name] is None:
-        _pyosdi_missing("hidden state", name)
-    return hidden[name]
+    return val
+
+
+def _pyosdi_output(instance, idx, name):
+    outputs = _pyosdi_instance_value(instance, "outputs")
+    val = _pyosdi_get_required(outputs, idx, f"output {name!r}")
+    if val is _PYOSDI_UNSET or val is None:
+        _pyosdi_missing("output", name)
+    return val
 
 
 def _pyosdi_return_flags(raw):
-    state = raw.get("_lir_state") if isinstance(raw, dict) else None
+    state = raw[-1] if isinstance(raw, list) and raw and isinstance(raw[-1], dict) else None
     if isinstance(state, dict) and state.get("invalid_params"):
         raise RuntimeError(f"unsupported invalid parameter flag(s): {state['invalid_params']!r}")
     return int(state.get("ret_flags", 0)) if isinstance(state, dict) else 0
@@ -1136,7 +1370,7 @@ def _pyosdi_missing_hidden(name):
     );
 
     out.push_str(&format!(
-        "def {}(params=None, given=None, builtin_params=None):\n",
+        "def {}(params=None, given=None, builtin_params=None, sim_params=None):\n",
         module.setup_model_function
     ));
     out.push_str("    if params is None:\n");
@@ -1145,39 +1379,43 @@ def _pyosdi_missing_hidden(name):
     out.push_str("        given = {}\n");
     out.push_str("    if builtin_params is None:\n");
     out.push_str("        builtin_params = {}\n");
+    out.push_str("    if sim_params is None:\n");
+    out.push_str("        sim_params = {}\n");
     out.push_str("    given = _pyosdi_effective_given(params, given)\n");
     append_python_osdi_raw_args(out, &module.model_args);
-    out.push_str(&format!("    _raw = {}(*_raw_args)\n", module.raw_model_function));
+    out.push_str("    _PYOSDI_SIMPARAM_STACK.append(sim_params)\n");
+    out.push_str("    try:\n");
+    out.push_str(&format!("        _raw = {}(*_raw_args)\n", module.raw_model_function));
+    out.push_str("    finally:\n");
+    out.push_str("        _PYOSDI_SIMPARAM_STACK.pop()\n");
     out.push_str("    _params = _pyosdi_given_params(params, given)\n");
     out.push_str("    _inst_defaults = {}\n");
     for (name, value) in &module.model_params {
-        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
-        out.push_str(&format!(
-            "        _params[{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
-            value.to_string(),
-            value.to_string()
-        ));
+        let slot = python_osdi_raw_slot(&module.raw_model_slots, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
+        out.push_str(&format!("        _params[{name:?}] = _pyosdi_raw_slot(_raw, {slot})\n"));
     }
     for (name, value) in &module.model_instance_defaults {
-        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
+        let slot = python_osdi_raw_slot(&module.raw_model_slots, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
         out.push_str(&format!(
-            "        _inst_defaults[{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
-            value.to_string(),
-            value.to_string()
+            "        _inst_defaults[{name:?}] = _pyosdi_raw_slot(_raw, {slot})\n"
         ));
     }
     out.push_str(&format!(
-        "    return {{\"module\": {:?}, \"raw\": _raw, \"params\": _params, \"given\": dict(given), \"inst_defaults\": _inst_defaults, \"builtin_params\": dict(builtin_params)}}\n",
+        "    return _PyOsdiModel({:?}, _raw, _params, dict(given), _inst_defaults, dict(builtin_params), dict(sim_params))\n",
         module.name
     ));
 
     out.push_str("\n\n");
     out.push_str(&format!(
-        "def {}(model=None, temperature=300.0, params=None, given=None, builtin_params=None, connected_terminals=None):\n",
+        "def {}(model=None, temperature=300.0, params=None, given=None, builtin_params=None, connected_terminals=None, sim_params=None):\n",
         module.setup_instance_function
     ));
     out.push_str("    if model is None:\n");
-    out.push_str(&format!("        model = {}()\n", module.setup_model_function));
+    out.push_str(&format!("        model = {}(sim_params=sim_params)\n", module.setup_model_function));
+    out.push_str("    if sim_params is None:\n");
+    out.push_str("        sim_params = _pyosdi_model_value(model, \"sim_params\")\n");
     out.push_str("    if builtin_params is None:\n");
     out.push_str("        builtin_params = {}\n");
     out.push_str("    _builtin_params = {");
@@ -1191,48 +1429,45 @@ def _pyosdi_missing_hidden(name):
     out.push_str("    _builtin_params.update(builtin_params)\n");
     out.push_str("    _given = _pyosdi_effective_given(params, given)\n");
     out.push_str("    _params = _pyosdi_merge_given_params(_pyosdi_model_value(model, \"inst_defaults\"), params, _given)\n");
-    out.push_str("    _hidden = {");
-    for (idx, name) in module.hidden_slots.iter().enumerate() {
-        if idx != 0 {
-            out.push_str(", ");
-        }
-        out.push_str(&format!("{name:?}: 0.0"));
-    }
-    out.push_str("}\n");
-    out.push_str("    instance = {\"model\": model, \"temperature\": temperature, \"raw\": {}, \"outputs\": {}, \"params\": _params, \"given\": _given, \"builtin_params\": _builtin_params, \"hidden\": _hidden, \"state_idx\": list(range(");
+    out.push_str("    _hidden = [0.0] * ");
+    out.push_str(&module.hidden_slots.len().to_string());
+    out.push_str("\n");
+    out.push_str("    instance = _PyOsdiInstance(model, temperature, [], [_PYOSDI_UNSET] * ");
+    out.push_str(&module.outputs.len().to_string());
+    out.push_str(", _params, _given, _builtin_params, dict(sim_params), _hidden, list(range(");
     out.push_str(&module.num_states.to_string());
-    out.push_str(")), \"cache\": [0.0] * ");
+    out.push_str(")), [0.0] * ");
     out.push_str(&module.num_cache_slots.to_string());
-    out.push_str("}\n");
+    out.push_str(")\n");
     append_python_osdi_raw_args(out, &module.init_args);
-    out.push_str(&format!("    _raw = {}(*_raw_args)\n", module.raw_init_function));
-    out.push_str("    instance[\"raw\"] = _raw\n");
+    out.push_str("    _PYOSDI_SIMPARAM_STACK.append(sim_params)\n");
+    out.push_str("    try:\n");
+    out.push_str(&format!("        _raw = {}(*_raw_args)\n", module.raw_init_function));
+    out.push_str("    finally:\n");
+    out.push_str("        _PYOSDI_SIMPARAM_STACK.pop()\n");
+    out.push_str("    instance.raw = _raw\n");
     for (name, value) in &module.instance_params {
-        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
+        let slot = python_osdi_raw_slot(&module.raw_init_slots, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
         out.push_str(&format!(
-            "        instance[\"params\"][{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
-            value.to_string(),
-            value.to_string()
+            "        instance.params[{name:?}] = _pyosdi_raw_slot(_raw, {slot})\n"
         ));
     }
-    out.push_str("    _cache = instance[\"cache\"]\n");
+    out.push_str("    _cache = instance.cache\n");
     for (idx, value) in module.cache_values.iter().enumerate() {
         if let Some(value) = value {
-            out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
-            out.push_str(&format!(
-                "        _cache[{idx}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
-                value.to_string(),
-                value.to_string()
-            ));
+            let slot = python_osdi_raw_slot(&module.raw_init_slots, *value);
+            out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
+            out.push_str(&format!("        _cache[{idx}] = _pyosdi_raw_slot(_raw, {slot})\n"));
         }
     }
-    out.push_str("    _hidden = instance[\"hidden\"]\n");
+    out.push_str("    _hidden = instance.hidden\n");
     for (name, value) in &module.init_hidden_values {
-        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
+        let hidden_slot = python_osdi_hidden_slot(&module.hidden_slots, name);
+        let slot = python_osdi_raw_slot(&module.raw_init_slots, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
         out.push_str(&format!(
-            "        _hidden[{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
-            value.to_string(),
-            value.to_string()
+            "        _hidden[{hidden_slot}] = _pyosdi_raw_slot(_raw, {slot})\n"
         ));
     }
     out.push_str(&format!("    return instance\n"));
@@ -1248,48 +1483,65 @@ def _pyosdi_missing_hidden(name):
     out.push_str("        model = _pyosdi_instance_value(instance, \"model\")\n");
     out.push_str("    if sim_info is None:\n");
     out.push_str("        sim_info = {}\n");
+    out.push_str("    _sim_params = _pyosdi_sim_params_from(sim_info, instance, model)\n");
     append_python_osdi_raw_args(out, &module.eval_args);
-    out.push_str("    _raw = ");
+    out.push_str("    _PYOSDI_SIMPARAM_STACK.append(_sim_params)\n");
+    out.push_str("    try:\n");
+    out.push_str("        _raw = ");
     out.push_str(&module.raw_eval_function);
     out.push_str("(*_raw_args)\n");
-    out.push_str("    _outputs = {\n");
+    out.push_str("    finally:\n");
+    out.push_str("        _PYOSDI_SIMPARAM_STACK.pop()\n");
     for group in &module.outputs {
-        out.push_str(&format!("        {:?}: [", group.name));
+        out.push_str(&format!("    {} = [", python_osdi_output_var_name(group)));
         for (idx, value) in group.values.iter().enumerate() {
             if idx != 0 {
                 out.push_str(", ");
             }
             match value {
-                Some(value) => out.push_str(&format!(
-                    "_pyosdi_raw_get(_raw, {:?}, {:?})",
-                    value.to_string(),
-                    value.to_string()
-                )),
+                Some(value) => {
+                    let slot = python_osdi_raw_slot(&module.raw_eval_slots, *value);
+                    out.push_str(&format!("_pyosdi_raw_slot(_raw, {slot})"));
+                }
                 None => out.push_str("0.0"),
             }
         }
-        out.push_str("],\n");
+        out.push_str("]\n");
     }
-    out.push_str("    }\n");
-    out.push_str("    instance[\"outputs\"] = _outputs\n");
-    out.push_str("    _hidden = _pyosdi_instance_value(instance, \"hidden\")\n");
-    for (name, value) in &module.eval_hidden_values {
-        out.push_str(&format!("    if {:?} in _raw:\n", value.to_string()));
+    out.push_str("    instance.outputs = [\n");
+    for group in &module.outputs {
         out.push_str(&format!(
-            "        _hidden[{name:?}] = _pyosdi_raw_get(_raw, {:?}, {:?})\n",
-            value.to_string(),
-            value.to_string()
+            "        {},\n",
+            python_osdi_output_var_name(group)
         ));
     }
-    out.push_str("    return {\"flags\": _pyosdi_return_flags(_raw), **_outputs}\n");
-
+    out.push_str("    ]\n");
+    out.push_str("    _hidden = instance.hidden\n");
+    for (name, value) in &module.eval_hidden_values {
+        let hidden_slot = python_osdi_hidden_slot(&module.hidden_slots, name);
+        let slot = python_osdi_raw_slot(&module.raw_eval_slots, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
+        out.push_str(&format!(
+            "        _hidden[{hidden_slot}] = _pyosdi_raw_slot(_raw, {slot})\n"
+        ));
+    }
+    out.push_str("    return {\n");
+    out.push_str("        \"flags\": _pyosdi_return_flags(_raw),\n");
     for group in &module.outputs {
+        out.push_str(&format!(
+            "        {:?}: {},\n",
+            group.name,
+            python_osdi_output_var_name(group)
+        ));
+    }
+    out.push_str("    }\n");
+
+    for (idx, group) in module.outputs.iter().enumerate() {
         out.push_str("\n\n");
         out.push_str(&format!("def {0}_load_{1}(instance):\n", module.name, group.name));
         out.push_str(&format!(
-            "    return _pyosdi_raw_get(_pyosdi_instance_value(instance, \"outputs\"), {:?}, {:?})\n",
+            "    return _pyosdi_output(instance, {idx}, {:?})\n",
             group.name,
-            group.name
         ));
     }
 }
