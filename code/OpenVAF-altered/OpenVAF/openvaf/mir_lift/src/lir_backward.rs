@@ -53,10 +53,12 @@ const CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::CostBasedHelperInlining,
     BackwardPassKind::StructuredSimplify,
+    BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperComputationPushUp,
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::DeadAssignments,
+    BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
@@ -67,15 +69,18 @@ const STRUCTURAL_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::CostBasedHelperInlining,
     BackwardPassKind::StructuredSimplify,
+    BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperComputationPushUp,
     BackwardPassKind::HelperSignaturePruning,
 ];
 const FINAL_DCE_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::DropNonSemanticEffects,
+    BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::DeadAssignments,
+    BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
@@ -143,6 +148,7 @@ enum BackwardPassKind {
     HelperSignaturePruning,
     CostBasedHelperInlining,
     StructuredSimplify,
+    BranchInvariantHoist,
     BranchSquash,
     HelperComputationPushUp,
     HelperLiveIns,
@@ -159,6 +165,7 @@ impl BackwardPassKind {
             Self::HelperSignaturePruning => "helper-signature-pruning",
             Self::CostBasedHelperInlining => "cost-based-helper-inlining",
             Self::StructuredSimplify => "structured-simplify",
+            Self::BranchInvariantHoist => "branch-invariant-hoist",
             Self::BranchSquash => "branch-squash",
             Self::HelperComputationPushUp => "helper-computation-push-up",
             Self::HelperLiveIns => "helper-live-ins",
@@ -175,6 +182,7 @@ impl BackwardPassKind {
             Self::HelperSignaturePruning => run_backward_pass::<HelperSignaturePruning>(cx),
             Self::CostBasedHelperInlining => run_backward_pass::<CostBasedHelperInlining>(cx),
             Self::StructuredSimplify => run_backward_pass::<StructuredSimplify>(cx),
+            Self::BranchInvariantHoist => run_backward_pass::<BranchInvariantHoist>(cx),
             Self::BranchSquash => run_backward_pass::<BranchSquash>(cx),
             Self::HelperComputationPushUp => run_backward_pass::<HelperComputationPushUp>(cx),
             Self::HelperLiveIns => run_backward_pass::<HelperLiveIns>(cx),
@@ -740,6 +748,124 @@ fn simplify_stmt(stmt: &mut StructuredStmt) -> bool {
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     }
+}
+
+#[derive(Default)]
+struct BranchInvariantHoist;
+
+impl BackwardLirPass for BranchInvariantHoist {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let mut changed = hoist_branch_invariants_in_body(&mut cx.structured.body);
+        for helper in &mut cx.structured.helpers {
+            changed |= hoist_branch_invariants_in_body(&mut helper.body);
+        }
+        changed
+    }
+}
+
+fn hoist_branch_invariants_in_body(body: &mut Vec<StructuredStmt>) -> bool {
+    let mut changed = false;
+    let mut rewritten = Vec::with_capacity(body.len());
+
+    for mut stmt in body.drain(..) {
+        changed |= hoist_branch_invariants_in_stmt(&mut stmt);
+
+        match stmt {
+            StructuredStmt::If { cond, mut then_body, mut else_body } => {
+                let prefix_len = common_hoistable_branch_prefix_len(&cond, &then_body, &else_body);
+                if prefix_len > 0 {
+                    rewritten.extend(then_body.drain(..prefix_len));
+                    let _ = else_body.drain(..prefix_len).count();
+                    changed = true;
+                }
+
+                let suffix_len = common_hoistable_branch_suffix_len(&then_body, &else_body);
+                let suffix = if suffix_len > 0 {
+                    let suffix_start = then_body.len() - suffix_len;
+                    let suffix = then_body.split_off(suffix_start);
+                    else_body.truncate(else_body.len() - suffix_len);
+                    changed = true;
+                    suffix
+                } else {
+                    Vec::new()
+                };
+
+                rewritten.push(StructuredStmt::If { cond, then_body, else_body });
+                rewritten.extend(suffix);
+            }
+            other => rewritten.push(other),
+        }
+    }
+
+    *body = rewritten;
+    changed
+}
+
+fn hoist_branch_invariants_in_stmt(stmt: &mut StructuredStmt) -> bool {
+    match stmt {
+        StructuredStmt::If { then_body, else_body, .. } => {
+            let then_changed = hoist_branch_invariants_in_body(then_body);
+            let else_changed = hoist_branch_invariants_in_body(else_body);
+            then_changed || else_changed
+        }
+        StructuredStmt::Stmt(_)
+        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::Return(_)
+        | StructuredStmt::Raise(_) => false,
+    }
+}
+
+fn common_hoistable_branch_prefix_len(
+    cond: &Expr,
+    then_body: &[StructuredStmt],
+    else_body: &[StructuredStmt],
+) -> usize {
+    if expr_has_side_effects(cond) {
+        return 0;
+    }
+
+    let mut cond_locals = Vec::new();
+    collect_expr_local_ids(cond, &mut cond_locals);
+
+    let mut len = 0;
+    while let (Some(then_stmt), Some(else_stmt)) = (then_body.get(len), else_body.get(len)) {
+        if then_stmt != else_stmt {
+            break;
+        }
+        let Some(dst) = hoistable_pure_assignment_dst(then_stmt) else {
+            break;
+        };
+        if cond_locals.contains(&dst) {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+fn common_hoistable_branch_suffix_len(
+    then_body: &[StructuredStmt],
+    else_body: &[StructuredStmt],
+) -> usize {
+    let mut len = 0;
+    while len < then_body.len() && len < else_body.len() {
+        let then_index = then_body.len() - 1 - len;
+        let else_index = else_body.len() - 1 - len;
+        let then_stmt = &then_body[then_index];
+        let else_stmt = &else_body[else_index];
+        if then_stmt != else_stmt || hoistable_pure_assignment_dst(then_stmt).is_none() {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+fn hoistable_pure_assignment_dst(stmt: &StructuredStmt) -> Option<LocalId> {
+    let StructuredStmt::Stmt(Stmt::Assign { dst, value }) = stmt else {
+        return None;
+    };
+    (!expr_has_side_effects(value)).then_some(*dst)
 }
 
 #[derive(Default)]
@@ -2296,6 +2422,163 @@ mod tests {
             ]
         );
         assert!(!drop_non_semantic_effects_in_body(&mut body));
+    }
+
+    #[test]
+    fn branch_invariant_hoist_moves_common_prefix_assignments() {
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![
+                assign_int(LocalId(2), 7),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(3),
+                    value: Expr::Local(LocalId(2)),
+                }),
+                assign_int(LocalId(1), 1),
+            ],
+            else_body: vec![
+                assign_int(LocalId(2), 7),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(3),
+                    value: Expr::Local(LocalId(2)),
+                }),
+                assign_int(LocalId(1), 0),
+            ],
+        }];
+
+        assert!(hoist_branch_invariants_in_body(&mut body));
+        assert_eq!(
+            body,
+            vec![
+                assign_int(LocalId(2), 7),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(3),
+                    value: Expr::Local(LocalId(2)),
+                }),
+                StructuredStmt::If {
+                    cond: Expr::Local(LocalId(0)),
+                    then_body: vec![assign_int(LocalId(1), 1)],
+                    else_body: vec![assign_int(LocalId(1), 0)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_invariant_hoist_moves_common_suffix_assignments() {
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![
+                assign_int(LocalId(1), 1),
+                assign_int(LocalId(2), 7),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(3),
+                    value: Expr::Local(LocalId(2)),
+                }),
+            ],
+            else_body: vec![
+                assign_int(LocalId(1), 0),
+                assign_int(LocalId(2), 7),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(3),
+                    value: Expr::Local(LocalId(2)),
+                }),
+            ],
+        }];
+
+        assert!(hoist_branch_invariants_in_body(&mut body));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::If {
+                    cond: Expr::Local(LocalId(0)),
+                    then_body: vec![assign_int(LocalId(1), 1)],
+                    else_body: vec![assign_int(LocalId(1), 0)],
+                },
+                assign_int(LocalId(2), 7),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(3),
+                    value: Expr::Local(LocalId(2)),
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_invariant_hoist_rejects_effecting_and_non_assignment_prefixes() {
+        let target = Label(19);
+        let original = vec![
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(0)),
+                then_body: vec![StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Call { target: "probe".to_owned(), args: Vec::new() },
+                })],
+                else_body: vec![StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Call { target: "probe".to_owned(), args: Vec::new() },
+                })],
+            },
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(0)),
+                then_body: vec![StructuredStmt::Stmt(Stmt::Capture {
+                    key: "x".to_owned(),
+                    value: Expr::Local(LocalId(1)),
+                })],
+                else_body: vec![StructuredStmt::Stmt(Stmt::Capture {
+                    key: "x".to_owned(),
+                    value: Expr::Local(LocalId(1)),
+                })],
+            },
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(0)),
+                then_body: vec![StructuredStmt::CallHelper(target)],
+                else_body: vec![StructuredStmt::CallHelper(target)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!hoist_branch_invariants_in_body(&mut body));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_invariant_hoist_rejects_prefix_assignment_used_by_condition() {
+        let original = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(2)),
+            then_body: vec![assign_int(LocalId(2), 7), assign_int(LocalId(1), 1)],
+            else_body: vec![assign_int(LocalId(2), 7), assign_int(LocalId(1), 0)],
+        }];
+        let mut body = original.clone();
+
+        assert!(!hoist_branch_invariants_in_body(&mut body));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_invariant_hoist_exposes_branch_squash() {
+        let function = bool_condition_function(LirType::Int);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(2), 7), assign_int(LocalId(1), 1)],
+            else_body: vec![assign_int(LocalId(2), 7), assign_int(LocalId(1), 0)],
+        }];
+
+        assert!(hoist_branch_invariants_in_body(&mut body));
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![
+                assign_int(LocalId(2), 7),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Unary {
+                        op: UnaryOp::Cast(LirType::Int),
+                        arg: Box::new(Expr::Local(LocalId(0))),
+                    },
+                }),
+            ]
+        );
     }
 
     #[test]
