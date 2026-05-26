@@ -174,10 +174,9 @@ fn emit_capture(
 ) -> Result<()> {
     let slot = cx.output_layout.slot(key)?;
     let undefined = expr_undefined_local_ids(value, defined);
-    writeln!(out, "{}{} = True", pad(indent), capture_present_name(slot))?;
     if undefined.is_empty() {
-        writeln!(out, "{}{} = True", pad(indent), capture_defined_name(slot))?;
         writeln!(out, "{}{} = {}", pad(indent), capture_value_name(slot), expr(value, cx.names)?)?;
+        writeln!(out, "{}{} = True", pad(indent), capture_valid_name(slot))?;
         return Ok(());
     }
 
@@ -187,11 +186,11 @@ fn emit_capture(
         .collect::<Vec<_>>()
         .join(" and ");
     writeln!(out, "{}if {guard}:", pad(indent))?;
-    writeln!(out, "{}{} = True", pad(indent + 1), capture_defined_name(slot))?;
     writeln!(out, "{}{} = {}", pad(indent + 1), capture_value_name(slot), expr(value, cx.names)?)?;
+    writeln!(out, "{}{} = True", pad(indent + 1), capture_valid_name(slot))?;
     writeln!(out, "{}else:", pad(indent))?;
-    writeln!(out, "{}{} = False", pad(indent + 1), capture_defined_name(slot))?;
     writeln!(out, "{}{} = None", pad(indent + 1), capture_value_name(slot))?;
+    writeln!(out, "{}{} = False", pad(indent + 1), capture_valid_name(slot))?;
     Ok(())
 }
 
@@ -259,34 +258,7 @@ fn emit_structured_stmt(
             mark_stmt_defs(stmt, assigned, defined);
         }
         StructuredStmt::If { cond, then_body, else_body } => {
-            writeln!(out, "{}if {}:", pad(indent), expr(cond, cx.names)?)?;
-            let mut then_assigned = assigned.clone();
-            let mut then_defined = defined.clone();
-            emit_structured_body(
-                out,
-                then_body,
-                cx,
-                indent + 1,
-                &mut then_assigned,
-                &mut then_defined,
-                EmptyBody::Pass,
-            )?;
-            writeln!(out, "{}else:", pad(indent))?;
-            let mut else_assigned = assigned.clone();
-            let mut else_defined = defined.clone();
-            emit_structured_body(
-                out,
-                else_body,
-                cx,
-                indent + 1,
-                &mut else_assigned,
-                &mut else_defined,
-                EmptyBody::Pass,
-            )?;
-            then_assigned.retain(|local| else_assigned.contains(local));
-            then_defined.retain(|local| else_defined.contains(local));
-            *assigned = then_assigned;
-            *defined = then_defined;
+            emit_if(out, cond, then_body, else_body, cx, indent, assigned, defined)?;
         }
         StructuredStmt::CallHelper(label) => {
             if Some(*label) == cx.current_helper {
@@ -308,6 +280,62 @@ fn emit_structured_stmt(
             writeln!(out, "{}raise RuntimeError({message:?})", pad(indent))?;
         }
     }
+    Ok(())
+}
+
+fn emit_if(
+    out: &mut String,
+    cond: &Expr,
+    then_body: &[StructuredStmt],
+    else_body: &[StructuredStmt],
+    cx: &EmitCx<'_>,
+    indent: usize,
+    assigned: &mut HashSet<LocalId>,
+    defined: &mut HashSet<LocalId>,
+) -> Result<()> {
+    let mut then_assigned = assigned.clone();
+    let mut then_defined = defined.clone();
+    let mut else_assigned = assigned.clone();
+    let mut else_defined = defined.clone();
+
+    if then_body.is_empty() && !else_body.is_empty() {
+        writeln!(out, "{}if not ({}):", pad(indent), expr(cond, cx.names)?)?;
+        emit_structured_body(
+            out,
+            else_body,
+            cx,
+            indent + 1,
+            &mut else_assigned,
+            &mut else_defined,
+            EmptyBody::Pass,
+        )?;
+    } else {
+        writeln!(out, "{}if {}:", pad(indent), expr(cond, cx.names)?)?;
+        emit_structured_body(
+            out,
+            then_body,
+            cx,
+            indent + 1,
+            &mut then_assigned,
+            &mut then_defined,
+            EmptyBody::Pass,
+        )?;
+        writeln!(out, "{}else:", pad(indent))?;
+        emit_structured_body(
+            out,
+            else_body,
+            cx,
+            indent + 1,
+            &mut else_assigned,
+            &mut else_defined,
+            EmptyBody::Pass,
+        )?;
+    }
+
+    then_assigned.retain(|local| else_assigned.contains(local));
+    then_defined.retain(|local| else_defined.contains(local));
+    *assigned = then_assigned;
+    *defined = then_defined;
     Ok(())
 }
 
@@ -413,13 +441,7 @@ fn emit_slot_return(
     writeln!(out, "{}_lir_outputs = [None] * {}", pad(indent), cx.output_layout.value_len)?;
     if cx.captures_outputs {
         for slot in &cx.output_layout.capture_slots {
-            writeln!(
-                out,
-                "{}if {} and {}:",
-                pad(indent),
-                capture_present_name(*slot),
-                capture_defined_name(*slot)
-            )?;
+            writeln!(out, "{}if {}:", pad(indent), capture_valid_name(*slot))?;
             writeln!(
                 out,
                 "{}_lir_outputs[{slot}] = {}",
@@ -590,13 +612,7 @@ impl OutputLayout {
     fn capture_state_names(&self) -> Vec<String> {
         self.capture_slots
             .iter()
-            .flat_map(|slot| {
-                [
-                    capture_value_name(*slot),
-                    capture_present_name(*slot),
-                    capture_defined_name(*slot),
-                ]
-            })
+            .flat_map(|slot| [capture_value_name(*slot), capture_valid_name(*slot)])
             .collect()
     }
 
@@ -612,12 +628,8 @@ fn capture_value_name(slot: usize) -> String {
     format!("_lir_capture_{slot}")
 }
 
-fn capture_present_name(slot: usize) -> String {
-    format!("_lir_capture_{slot}_present")
-}
-
-fn capture_defined_name(slot: usize) -> String {
-    format!("_lir_capture_{slot}_defined")
+fn capture_valid_name(slot: usize) -> String {
+    format!("_lir_capture_{slot}_valid")
 }
 
 fn validate_direct_helper_graph(structured: &lir_structure::StructuredFunction) -> Result<()> {
@@ -776,7 +788,7 @@ fn entry_args_list(
         output_layout
             .capture_slots
             .iter()
-            .flat_map(|_| ["None".to_owned(), "False".to_owned(), "False".to_owned()])
+            .flat_map(|_| ["None".to_owned(), "False".to_owned()])
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -1116,7 +1128,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_pass_for_empty_noop_branch_body() {
+    fn inverts_empty_then_branch_instead_of_emitting_pass_else() {
         let cond = LocalId(0);
         let function = Function {
             name: "noop_branch".to_owned(),
@@ -1164,8 +1176,9 @@ mod tests {
         .unwrap();
 
         assert!(!emitted.contains("empty LIR body"), "{emitted}");
-        assert!(emitted.contains("if cond:"), "{emitted}");
-        assert!(emitted.contains("    pass"), "{emitted}");
+        assert!(emitted.contains("if not (cond):"), "{emitted}");
+        assert!(!emitted.contains("    pass"), "{emitted}");
+        assert!(!emitted.contains("else:"), "{emitted}");
     }
 
     #[test]
@@ -1410,11 +1423,13 @@ mod tests {
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
         assert!(emitted.contains("return _stale_capture_bb_1("), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_0_present = True"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_0_defined = False"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_capture_0 = None"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_capture_0_valid = False"#), "{emitted}");
+        assert!(emitted.contains(r#"if _lir_capture_0_valid:"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_outputs[0] = _lir_capture_0"#), "{emitted}");
         assert!(!emitted.contains(r#"_lir_outputs[0] = None"#), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_0_present"), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_0_defined"), "{emitted}");
 
         let script = format!(
             "{emitted}\n\
@@ -1468,10 +1483,12 @@ mod tests {
 
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
-        assert!(emitted.contains(r#"_lir_capture_0_present = True"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_0_defined = True"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_capture_0_valid = True"#), "{emitted}");
+        assert!(emitted.contains(r#"if _lir_capture_0_valid:"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_outputs[0] = _lir_capture_0"#), "{emitted}");
         assert!(!emitted.contains(r#"_lir_outputs[0] = value"#), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_0_present"), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_0_defined"), "{emitted}");
         assert_output_slot_writes_follow_exit_packing(&emitted);
 
         let script = format!(
@@ -1511,11 +1528,13 @@ mod tests {
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
         assert!(!emitted.contains("is not _LIR_UNDEF"), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_0_present = True"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_0_defined = True"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_capture_0 = value"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_capture_0_valid = True"#), "{emitted}");
+        assert!(emitted.contains(r#"if _lir_capture_0_valid:"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_outputs[0] = _lir_capture_0"#), "{emitted}");
         assert!(!emitted.contains(r#"_lir_outputs[0] = None"#), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_0_present"), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_0_defined"), "{emitted}");
         assert_output_slot_writes_follow_exit_packing(&emitted);
 
         let script = format!("{emitted}\nassert defined_capture() == [11]\n");

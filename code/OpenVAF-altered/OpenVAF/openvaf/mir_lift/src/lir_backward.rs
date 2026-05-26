@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::lir::{CallEffect, ConstValue, Expr, Function, Label, LocalId, ReturnValue, Stmt};
+use crate::lir::{
+    BinaryOp, CallEffect, ConstValue, Expr, Function, Label, LirType, LocalId, ReturnValue, Stmt,
+    UnaryOp,
+};
 use crate::lir_structure::{StructuredFunction, StructuredStmt};
 
 const DEFAULT_CLEANUP_ROUNDS: usize = 12;
@@ -50,8 +53,11 @@ const CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::CostBasedHelperInlining,
     BackwardPassKind::StructuredSimplify,
+    BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperComputationPushUp,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::DeadAssignments,
+    BackwardPassKind::BranchSquash,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
 ];
@@ -61,12 +67,16 @@ const STRUCTURAL_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::CostBasedHelperInlining,
     BackwardPassKind::StructuredSimplify,
+    BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperComputationPushUp,
     BackwardPassKind::HelperSignaturePruning,
 ];
 const FINAL_DCE_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::DropNonSemanticEffects,
+    BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::DeadAssignments,
+    BackwardPassKind::BranchSquash,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
 ];
@@ -133,6 +143,7 @@ enum BackwardPassKind {
     HelperSignaturePruning,
     CostBasedHelperInlining,
     StructuredSimplify,
+    BranchSquash,
     HelperComputationPushUp,
     HelperLiveIns,
     OptionalHelperLiveIns,
@@ -148,6 +159,7 @@ impl BackwardPassKind {
             Self::HelperSignaturePruning => "helper-signature-pruning",
             Self::CostBasedHelperInlining => "cost-based-helper-inlining",
             Self::StructuredSimplify => "structured-simplify",
+            Self::BranchSquash => "branch-squash",
             Self::HelperComputationPushUp => "helper-computation-push-up",
             Self::HelperLiveIns => "helper-live-ins",
             Self::OptionalHelperLiveIns => "optional-helper-live-ins",
@@ -163,6 +175,7 @@ impl BackwardPassKind {
             Self::HelperSignaturePruning => run_backward_pass::<HelperSignaturePruning>(cx),
             Self::CostBasedHelperInlining => run_backward_pass::<CostBasedHelperInlining>(cx),
             Self::StructuredSimplify => run_backward_pass::<StructuredSimplify>(cx),
+            Self::BranchSquash => run_backward_pass::<BranchSquash>(cx),
             Self::HelperComputationPushUp => run_backward_pass::<HelperComputationPushUp>(cx),
             Self::HelperLiveIns => run_backward_pass::<HelperLiveIns>(cx),
             Self::OptionalHelperLiveIns => run_backward_pass::<OptionalHelperLiveIns>(cx),
@@ -726,6 +739,217 @@ fn simplify_stmt(stmt: &mut StructuredStmt) -> bool {
         | StructuredStmt::CallHelper(_)
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
+    }
+}
+
+#[derive(Default)]
+struct BranchSquash;
+
+impl BackwardLirPass for BranchSquash {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let local_types = local_types(cx.function);
+        let mut changed = squash_branches_in_body(&mut cx.structured.body, &local_types);
+        for helper in &mut cx.structured.helpers {
+            changed |= squash_branches_in_body(&mut helper.body, &local_types);
+        }
+        changed
+    }
+}
+
+fn squash_branches_in_body(body: &mut [StructuredStmt], local_types: &[LirType]) -> bool {
+    let mut changed = false;
+    for stmt in body {
+        changed |= squash_branches_in_stmt(stmt, local_types);
+    }
+    changed
+}
+
+fn squash_branches_in_stmt(stmt: &mut StructuredStmt, local_types: &[LirType]) -> bool {
+    let mut changed = match stmt {
+        StructuredStmt::If { then_body, else_body, .. } => {
+            squash_branches_in_body(then_body, local_types)
+                | squash_branches_in_body(else_body, local_types)
+        }
+        StructuredStmt::Stmt(_)
+        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::Return(_)
+        | StructuredStmt::Raise(_) => false,
+    };
+
+    if let Some(replacement) = squashed_branch_assignment(stmt, local_types) {
+        *stmt = replacement;
+        changed = true;
+    }
+
+    changed
+}
+
+fn squashed_branch_assignment(
+    stmt: &StructuredStmt,
+    local_types: &[LirType],
+) -> Option<StructuredStmt> {
+    let StructuredStmt::If { cond, then_body, else_body } = stmt else {
+        return None;
+    };
+    if expr_has_side_effects(cond) || expr_type(cond, local_types) != Some(LirType::Bool) {
+        return None;
+    }
+
+    let (dst, then_value) = single_assignment(then_body)?;
+    let (else_dst, else_value) = single_assignment(else_body)?;
+    if dst != else_dst {
+        return None;
+    }
+
+    let dst_ty = *local_types.get(dst.0)?;
+    let value = squashed_boolish_branch_expr(cond, then_value, else_value, dst_ty)
+        .or_else(|| squashed_int_const_branch_expr(cond, then_value, else_value, dst_ty))?;
+
+    Some(StructuredStmt::Stmt(Stmt::Assign { dst, value }))
+}
+
+fn squashed_boolish_branch_expr(
+    cond: &Expr,
+    then_value: &ConstValue,
+    else_value: &ConstValue,
+    dst_ty: LirType,
+) -> Option<Expr> {
+    let (kind, then_truthy, else_truthy) = boolish_const_pair(then_value, else_value)?;
+    let kind = replacement_kind_for_dst(kind, dst_ty)?;
+    match (kind, then_truthy, else_truthy) {
+        (BoolishKind::Bool, true, false) => Some(cond.clone()),
+        (BoolishKind::Bool, false, true) => {
+            Some(Expr::Unary { op: UnaryOp::Not, arg: Box::new(cond.clone()) })
+        }
+        (BoolishKind::Int, true, false) => {
+            Some(Expr::Unary { op: UnaryOp::Cast(LirType::Int), arg: Box::new(cond.clone()) })
+        }
+        (BoolishKind::Int, false, true) => Some(Expr::Unary {
+            op: UnaryOp::Cast(LirType::Int),
+            arg: Box::new(Expr::Unary { op: UnaryOp::Not, arg: Box::new(cond.clone()) }),
+        }),
+        _ => None,
+    }
+}
+
+fn squashed_int_const_branch_expr(
+    cond: &Expr,
+    then_value: &ConstValue,
+    else_value: &ConstValue,
+    dst_ty: LirType,
+) -> Option<Expr> {
+    if dst_ty != LirType::Int {
+        return None;
+    }
+    let (ConstValue::Int(then_int), ConstValue::Int(else_int)) = (then_value, else_value) else {
+        return None;
+    };
+    let delta = checked_int_branch_delta(*then_int, *else_int)?;
+
+    Some(Expr::Binary {
+        op: BinaryOp::Add,
+        lhs: Box::new(Expr::Const(ConstValue::Int(*else_int))),
+        rhs: Box::new(Expr::Binary {
+            op: BinaryOp::Mul,
+            lhs: Box::new(Expr::Unary {
+                op: UnaryOp::Cast(LirType::Int),
+                arg: Box::new(cond.clone()),
+            }),
+            rhs: Box::new(Expr::Const(ConstValue::Int(delta))),
+        }),
+    })
+}
+
+fn checked_int_branch_delta(then_int: i32, else_int: i32) -> Option<i32> {
+    let delta = then_int.checked_sub(else_int)?;
+    for cond_value in [0, 1] {
+        let product = delta.checked_mul(cond_value)?;
+        let result = else_int.checked_add(product)?;
+        let expected = if cond_value == 0 { else_int } else { then_int };
+        if result != expected {
+            return None;
+        }
+    }
+    Some(delta)
+}
+
+fn single_assignment(body: &[StructuredStmt]) -> Option<(LocalId, &ConstValue)> {
+    let [StructuredStmt::Stmt(Stmt::Assign { dst, value: Expr::Const(value) })] = body else {
+        return None;
+    };
+    Some((*dst, value))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoolishKind {
+    Bool,
+    Int,
+}
+
+fn boolish_const_pair(
+    then_value: &ConstValue,
+    else_value: &ConstValue,
+) -> Option<(BoolishKind, bool, bool)> {
+    let (then_kind, then_truthy) = boolish_const(then_value)?;
+    let (else_kind, else_truthy) = boolish_const(else_value)?;
+    (then_kind == else_kind).then_some((then_kind, then_truthy, else_truthy))
+}
+
+fn boolish_const(value: &ConstValue) -> Option<(BoolishKind, bool)> {
+    match value {
+        ConstValue::Bool(value) => Some((BoolishKind::Bool, *value)),
+        ConstValue::Int(0) => Some((BoolishKind::Int, false)),
+        ConstValue::Int(1) => Some((BoolishKind::Int, true)),
+        _ => None,
+    }
+}
+
+fn replacement_kind_for_dst(kind: BoolishKind, dst_ty: LirType) -> Option<BoolishKind> {
+    match (dst_ty, kind) {
+        (LirType::Bool, BoolishKind::Bool)
+        | (LirType::Int, BoolishKind::Int)
+        | (LirType::Unknown, _) => Some(kind),
+        _ => None,
+    }
+}
+
+fn local_types(function: &Function) -> Vec<LirType> {
+    function.locals.iter().map(|local| local.ty).collect()
+}
+
+fn expr_type(expr: &Expr, local_types: &[LirType]) -> Option<LirType> {
+    match expr {
+        Expr::Local(local) => local_types.get(local.0).copied(),
+        Expr::Const(ConstValue::Bool(_)) => Some(LirType::Bool),
+        Expr::Const(ConstValue::Int(_)) => Some(LirType::Int),
+        Expr::Const(ConstValue::Real(_)) => Some(LirType::Real),
+        Expr::Const(ConstValue::Str(_)) => Some(LirType::Str),
+        Expr::Const(ConstValue::None) => None,
+        Expr::Unary { op: UnaryOp::Not, .. } => Some(LirType::Bool),
+        Expr::Unary { op: UnaryOp::Neg, arg } => expr_type(arg, local_types),
+        Expr::Unary { op: UnaryOp::Cast(ty), .. } => Some(*ty),
+        Expr::Unary { op: UnaryOp::Math1(_), .. } => Some(LirType::Real),
+        Expr::Binary { op, lhs, .. } => match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Rem
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor => expr_type(lhs, local_types),
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => Some(LirType::Bool),
+            BinaryOp::Math2(_) => Some(LirType::Real),
+        },
+        Expr::SimparamOpt { default, .. } => expr_type(default, local_types),
+        Expr::Call { .. } | Expr::Unsupported { .. } => None,
     }
 }
 
@@ -2075,6 +2299,245 @@ mod tests {
     }
 
     #[test]
+    fn branch_squash_replaces_direct_int_branch_with_cast_condition() {
+        let function = bool_condition_function(LirType::Int);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), 1)],
+            else_body: vec![assign_int(LocalId(1), 0)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: Expr::Unary {
+                    op: UnaryOp::Cast(LirType::Int),
+                    arg: Box::new(Expr::Local(LocalId(0))),
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_replaces_direct_int_constant_branch_with_arithmetic_condition() {
+        let function = bool_condition_function(LirType::Int);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), 3)],
+            else_body: vec![assign_int(LocalId(1), 5)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: int_branch_arithmetic_expr(5, -2),
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_replaces_negative_int_constant_branch_with_arithmetic_condition() {
+        let function = bool_condition_function(LirType::Int);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), -7)],
+            else_body: vec![assign_int(LocalId(1), -2)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: int_branch_arithmetic_expr(-2, -5),
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_rejects_overflowing_int_constant_branch() {
+        let function = bool_condition_function(LirType::Int);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), i32::MIN)],
+            else_body: vec![assign_int(LocalId(1), i32::MAX)],
+        }];
+
+        assert!(!squash_branches_in_body(&mut body, &local_types(&function)));
+    }
+
+    #[test]
+    fn branch_squash_rejects_real_mixed_and_unknown_int_constant_branches() {
+        let real_function = bool_condition_function(LirType::Real);
+        let mut real_body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_real(LocalId(1), 3.0)],
+            else_body: vec![assign_real(LocalId(1), 5.0)],
+        }];
+        let int_function = bool_condition_function(LirType::Int);
+        let mut mixed_body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), 3)],
+            else_body: vec![assign_real(LocalId(1), 5.0)],
+        }];
+        let unknown_function = bool_condition_function(LirType::Unknown);
+        let mut unknown_body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), 3)],
+            else_body: vec![assign_int(LocalId(1), 5)],
+        }];
+
+        assert!(!squash_branches_in_body(&mut real_body, &local_types(&real_function)));
+        assert!(!squash_branches_in_body(&mut mixed_body, &local_types(&int_function)));
+        assert!(!squash_branches_in_body(&mut unknown_body, &local_types(&unknown_function)));
+    }
+
+    #[test]
+    fn branch_squash_replaces_flipped_bool_branch_with_not_condition() {
+        let function = bool_condition_function(LirType::Bool);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), false)],
+            else_body: vec![assign_bool(LocalId(1), true)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: Expr::Unary { op: UnaryOp::Not, arg: Box::new(Expr::Local(LocalId(0))) },
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_replaces_unknown_direct_int_branch_with_cast_condition() {
+        let function = bool_condition_function(LirType::Unknown);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), 1)],
+            else_body: vec![assign_int(LocalId(1), 0)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: Expr::Unary {
+                    op: UnaryOp::Cast(LirType::Int),
+                    arg: Box::new(Expr::Local(LocalId(0))),
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_replaces_unknown_flipped_int_branch_with_cast_not_condition() {
+        let function = bool_condition_function(LirType::Unknown);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), 0)],
+            else_body: vec![assign_int(LocalId(1), 1)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: Expr::Unary {
+                    op: UnaryOp::Cast(LirType::Int),
+                    arg: Box::new(Expr::Unary {
+                        op: UnaryOp::Not,
+                        arg: Box::new(Expr::Local(LocalId(0))),
+                    }),
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_replaces_unknown_direct_bool_branch_with_condition() {
+        let function = bool_condition_function(LirType::Unknown);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), true)],
+            else_body: vec![assign_bool(LocalId(1), false)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: Expr::Local(LocalId(0)),
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_replaces_unknown_flipped_bool_branch_with_not_condition() {
+        let function = bool_condition_function(LirType::Unknown);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), false)],
+            else_body: vec![assign_bool(LocalId(1), true)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: Expr::Unary { op: UnaryOp::Not, arg: Box::new(Expr::Local(LocalId(0))) },
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_rejects_known_incompatible_destination_type() {
+        let real_function = bool_condition_function(LirType::Real);
+        let mut real_body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), 1)],
+            else_body: vec![assign_int(LocalId(1), 0)],
+        }];
+        let str_function = bool_condition_function(LirType::Str);
+        let mut str_body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), true)],
+            else_body: vec![assign_bool(LocalId(1), false)],
+        }];
+
+        assert!(!squash_branches_in_body(&mut real_body, &local_types(&real_function)));
+        assert!(!squash_branches_in_body(&mut str_body, &local_types(&str_function)));
+    }
+
+    #[test]
+    fn branch_squash_rejects_side_effecting_condition_and_different_targets() {
+        let function = bool_condition_function(LirType::Int);
+        let mut side_effecting = vec![StructuredStmt::If {
+            cond: Expr::Call { target: "probe".to_owned(), args: Vec::new() },
+            then_body: vec![assign_int(LocalId(1), 1)],
+            else_body: vec![assign_int(LocalId(1), 0)],
+        }];
+        let mut different_targets = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), 1)],
+            else_body: vec![assign_int(LocalId(2), 0)],
+        }];
+
+        assert!(!squash_branches_in_body(&mut side_effecting, &local_types(&function)));
+        assert!(!squash_branches_in_body(&mut different_targets, &local_types(&function)));
+    }
+
+    #[test]
     fn optional_live_ins_track_values_derived_from_undefined_locals() {
         let target = Label(3);
         let mut optional = HashSet::new();
@@ -2092,6 +2555,44 @@ mod tests {
 
     fn assign_int(dst: LocalId, value: i32) -> StructuredStmt {
         StructuredStmt::Stmt(Stmt::Assign { dst, value: Expr::Const(ConstValue::Int(value)) })
+    }
+
+    fn assign_bool(dst: LocalId, value: bool) -> StructuredStmt {
+        StructuredStmt::Stmt(Stmt::Assign { dst, value: Expr::Const(ConstValue::Bool(value)) })
+    }
+
+    fn assign_real(dst: LocalId, value: f64) -> StructuredStmt {
+        StructuredStmt::Stmt(Stmt::Assign { dst, value: Expr::Const(ConstValue::Real(value)) })
+    }
+
+    fn int_branch_arithmetic_expr(else_int: i32, delta: i32) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::Add,
+            lhs: Box::new(Expr::Const(ConstValue::Int(else_int))),
+            rhs: Box::new(Expr::Binary {
+                op: BinaryOp::Mul,
+                lhs: Box::new(Expr::Unary {
+                    op: UnaryOp::Cast(LirType::Int),
+                    arg: Box::new(Expr::Local(LocalId(0))),
+                }),
+                rhs: Box::new(Expr::Const(ConstValue::Int(delta))),
+            }),
+        }
+    }
+
+    fn bool_condition_function(value_ty: LirType) -> Function {
+        Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "cond".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(1), name_hint: "x".to_owned(), ty: value_ty },
+                Local { id: LocalId(2), name_hint: "y".to_owned(), ty: value_ty },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+        }
     }
 
     fn test_function() -> Function {
