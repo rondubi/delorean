@@ -3,9 +3,9 @@ use std::collections::{HashMap, HashSet};
 use crate::lir::{CallEffect, ConstValue, Expr, Function, Label, LocalId, ReturnValue, Stmt};
 use crate::lir_structure::{StructuredFunction, StructuredStmt};
 
-const CLEANUP_ROUNDS: usize = 4;
-const FINAL_DCE_ROUNDS: usize = 3;
-const POST_DCE_CLEANUP_ROUNDS: usize = 0;
+const DEFAULT_CLEANUP_ROUNDS: usize = 12;
+const DEFAULT_FINAL_DCE_ROUNDS: usize = 3;
+const DEFAULT_POST_DCE_CLEANUP_ROUNDS: usize = 0;
 const SMALL_HELPER_STMT_LIMIT: usize = 12;
 const COST_INLINE_HELPER_CALL_LIMIT: usize = 3;
 const COST_INLINE_MIN_SAVINGS: usize = 32;
@@ -13,8 +13,33 @@ const PUSH_UP_HELPER_CALL_LIMIT: usize = 4;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BackwardFacts {
+    pub entry_live_ins: Vec<LocalId>,
     pub helper_live_ins: HashMap<Label, Vec<LocalId>>,
     pub optional_helper_live_ins: HashSet<(Label, LocalId)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BackwardRoundCounts {
+    cleanup: usize,
+    final_dce: usize,
+    post_dce_cleanup: usize,
+}
+
+impl BackwardRoundCounts {
+    fn from_env() -> Self {
+        Self {
+            cleanup: env_round_count("MIR_LIFT_LIR_CLEANUP_ROUNDS", DEFAULT_CLEANUP_ROUNDS),
+            final_dce: env_round_count("MIR_LIFT_LIR_FINAL_DCE_ROUNDS", DEFAULT_FINAL_DCE_ROUNDS),
+            post_dce_cleanup: env_round_count(
+                "MIR_LIFT_LIR_POST_DCE_CLEANUP_ROUNDS",
+                DEFAULT_POST_DCE_CLEANUP_ROUNDS,
+            ),
+        }
+    }
+}
+
+fn env_round_count(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(default)
 }
 
 const DISABLED_PASSES: &[BackwardPassKind] = &[BackwardPassKind::HelperLiveIns];
@@ -66,8 +91,9 @@ pub(crate) fn run_backward_passes(
         BackwardPipeline { name: "lir-backward-structural", passes: STRUCTURAL_PASSES };
     let final_dce_pipeline =
         BackwardPipeline { name: "lir-backward-final-dce", passes: FINAL_DCE_PASSES };
+    let rounds = BackwardRoundCounts::from_env();
 
-    for _ in 0..CLEANUP_ROUNDS {
+    for _ in 0..rounds.cleanup {
         if !cleanup_pipeline.run(&mut BackwardPassCx { function, structured, facts: &mut facts }) {
             break;
         }
@@ -75,14 +101,14 @@ pub(crate) fn run_backward_passes(
 
     structural_pipeline.run(&mut BackwardPassCx { function, structured, facts: &mut facts });
 
-    for _ in 0..FINAL_DCE_ROUNDS {
+    for _ in 0..rounds.final_dce {
         if !final_dce_pipeline.run(&mut BackwardPassCx { function, structured, facts: &mut facts })
         {
             break;
         }
     }
 
-    for _ in 0..POST_DCE_CLEANUP_ROUNDS {
+    for _ in 0..rounds.post_dce_cleanup {
         if !run_metric_guarded_post_dce_cleanup(function, structured, &mut facts) {
             break;
         }
@@ -179,6 +205,14 @@ pub(crate) struct BackwardPassCx<'a> {
 impl BackwardPassCx<'_> {
     fn helper_params(&self, label: Label) -> Vec<LocalId> {
         self.facts.helper_live_ins.get(&label).cloned().unwrap_or_default()
+    }
+
+    fn update_entry_params(&mut self, params: Vec<LocalId>) -> bool {
+        let changed = self.facts.entry_live_ins != params;
+        if changed {
+            self.facts.entry_live_ins = params;
+        }
+        changed
     }
 
     fn update_helper_params(&mut self, label: Label, params: Vec<LocalId>) -> bool {
@@ -1008,7 +1042,9 @@ struct HelperLiveIns;
 
 impl BackwardLirPass for HelperLiveIns {
     fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
-        recompute_helper_live_ins(cx)
+        let mut changed = recompute_helper_live_ins(cx);
+        changed |= recompute_entry_live_ins(cx);
+        changed
     }
 }
 
@@ -1019,6 +1055,7 @@ impl BackwardLirPass for HelperSignaturePruning {
     fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
         let mut changed = retain_reachable_helpers(cx);
         changed |= recompute_helper_live_ins(cx);
+        changed |= recompute_entry_live_ins(cx);
         changed |= prune_helper_facts(cx);
         changed
     }
@@ -1098,6 +1135,32 @@ fn recompute_helper_live_ins(cx: &mut BackwardPassCx<'_>) -> bool {
     }
 
     changed
+}
+
+fn recompute_entry_live_ins(cx: &mut BackwardPassCx<'_>) -> bool {
+    let bodies = cx
+        .structured
+        .helpers
+        .iter()
+        .map(|helper| (helper.label, helper.body.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut computed = HashMap::new();
+    let mut visiting = Vec::new();
+    let raw_params = cx.function.params.iter().copied().collect::<HashSet<_>>();
+    let params = live_in_body_static(
+        &cx.structured.body,
+        LiveSet::new(cx.function.locals.len()),
+        cx.function.locals.len(),
+        &bodies,
+        &mut computed,
+        &mut visiting,
+    )
+    .into_sorted_locals()
+    .into_iter()
+    .filter(|local| raw_params.contains(local))
+    .collect::<Vec<_>>();
+
+    cx.update_entry_params(params)
 }
 
 fn prune_helper_facts(cx: &mut BackwardPassCx<'_>) -> bool {
@@ -1909,6 +1972,7 @@ mod tests {
             facts: BackwardFacts::default(),
         };
         let mut facts = BackwardFacts {
+            entry_live_ins: Vec::new(),
             helper_live_ins: HashMap::from([
                 (live, vec![LocalId(0), LocalId(1)]),
                 (dead, vec![LocalId(0)]),
@@ -1927,6 +1991,44 @@ mod tests {
         assert_eq!(facts.helper_live_ins.get(&live), Some(&Vec::new()));
         assert!(!facts.helper_live_ins.contains_key(&dead));
         assert!(facts.optional_helper_live_ins.is_empty());
+    }
+
+    #[test]
+    fn signature_pruning_tracks_entry_live_ins_for_raw_params_only() {
+        let function = Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0), LocalId(1)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "unused".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(1), name_hint: "used".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(2), name_hint: "tmp".to_owned(), ty: LirType::Int },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+        };
+        let mut structured = StructuredFunction {
+            body: vec![
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(2),
+                    value: Expr::Local(LocalId(1)),
+                }),
+                StructuredStmt::Return(vec![ReturnValue::Named {
+                    key: "x".to_owned(),
+                    value: Expr::Local(LocalId(2)),
+                }]),
+            ],
+            helpers: Vec::new(),
+            facts: BackwardFacts::default(),
+        };
+        let mut facts = BackwardFacts::default();
+
+        let mut pass = HelperSignaturePruning;
+        let mut cx =
+            BackwardPassCx { function: &function, structured: &mut structured, facts: &mut facts };
+
+        assert!(pass.run(&mut cx));
+        assert_eq!(facts.entry_live_ins, vec![LocalId(1)]);
     }
 
     #[test]

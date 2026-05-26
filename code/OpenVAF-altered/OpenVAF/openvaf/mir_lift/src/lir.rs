@@ -28,7 +28,7 @@ pub struct LocalId(pub usize);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Label(pub usize);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LirType {
     Bool,
     Int,
@@ -88,7 +88,7 @@ pub enum ConstValue {
     None,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
     Not,
     Neg,
@@ -96,7 +96,7 @@ pub enum UnaryOp {
     Math1(MathUnary),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -117,7 +117,7 @@ pub enum BinaryOp {
     Math2(MathBinary),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MathUnary {
     Sqrt,
     Exp,
@@ -140,7 +140,7 @@ pub enum MathUnary {
     Atanh,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MathBinary {
     Hypot,
     Atan2,

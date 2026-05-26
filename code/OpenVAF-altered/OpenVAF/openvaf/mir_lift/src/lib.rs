@@ -795,7 +795,7 @@ mod tests {
         assert!(!lifted.contains("v36 = v35"));
         assert!(lifted.contains("if (v16) < (0):"));
         assert!(lifted.contains("v31 = (float(v16)) / (3.141)"));
-        assert!(lifted.contains("_lir_return[") && lifted.contains("] = v36"));
+        assert!(lifted.contains("_lir_outputs[") && lifted.contains("] = v36"));
     }
 
     #[test]
