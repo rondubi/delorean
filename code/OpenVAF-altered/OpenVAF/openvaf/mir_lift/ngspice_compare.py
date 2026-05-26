@@ -71,8 +71,8 @@ def main() -> int:
         "python_replay": replay_summary,
         "note": (
             "The ngspice reference is run through Delorean's run_ngspice_osdi.py substitution harness. "
-            "The current lifted Python exposes MIR-internal model/init/eval functions, so numeric "
-            "Python comparison still needs a MIR argument/result trace or an OSDI-to-MIR bridge."
+            "Numeric lifted Python comparison still needs a compatible replay trace or "
+            "an OSDI-to-Python result bridge."
         ),
     }
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")

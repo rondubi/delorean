@@ -122,7 +122,7 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
         writeln!(out, "    _lir_outputs = [None] * {}", cx.output_layout.value_len)?;
     }
     if captures_effects {
-        writeln!(out, "    _lir_state = {{\"invalid_params\": []}}")?;
+        writeln!(out, "    _lir_invalid_params = []")?;
     }
     writeln!(
         out,
@@ -162,26 +162,15 @@ fn emit_stmt(
 fn emit_call_effect(
     out: &mut String,
     effect: &CallEffect,
-    names: &NameTable,
+    _names: &NameTable,
     indent: usize,
 ) -> Result<()> {
     match effect {
-        CallEffect::Diagnostic { target, args } => {
-            let args = args.iter().map(|arg| expr(arg, names)).collect::<Result<Vec<_>>>()?;
-            writeln!(
-                out,
-                "{}_lir_state[\"diagnostics\"].append({{\"target\": {target:?}, \"args\": [{}]}})",
-                pad(indent),
-                args.join(", ")
-            )?;
-        }
+        CallEffect::Diagnostic { .. } => {}
         CallEffect::SetInvalidParam { param } => {
-            writeln!(out, "{}_lir_state[\"invalid_params\"].append({param:?})", pad(indent),)?;
+            writeln!(out, "{}_lir_invalid_params.append({param:?})", pad(indent),)?;
         }
-        CallEffect::CollapseHint { hi, lo } => {
-            let lo = lo.as_ref().map_or_else(|| "None".to_owned(), |lo| format!("{lo:?}"));
-            writeln!(out, "{}_lir_state[\"collapse_hints\"].append(({hi:?}, {lo}))", pad(indent),)?;
-        }
+        CallEffect::CollapseHint { .. } => {}
     }
     Ok(())
 }
@@ -349,7 +338,7 @@ fn emit_self_loop_continue(
 fn helper_args_list(label: Label, cx: &EmitCx<'_>, assigned: &HashSet<LocalId>) -> Result<String> {
     let mut args = if cx.captures_outputs { vec!["_lir_outputs".to_owned()] } else { Vec::new() };
     if cx.captures_effects {
-        args.push("_lir_state".to_owned());
+        args.push("_lir_invalid_params".to_owned());
     }
     args.extend(helper_param_arg_exprs(label, cx, assigned)?);
     Ok(args.join(", "))
@@ -423,7 +412,7 @@ fn emit_return(
                 }
             }
             if cx.captures_effects {
-                writeln!(out, "{}_lir_return.append(_lir_state)", pad(indent))?;
+                writeln!(out, "{}_lir_return.append([0, _lir_invalid_params])", pad(indent))?;
             }
             writeln!(out, "{}return _lir_return", pad(indent))?;
             return Ok(());
@@ -447,7 +436,7 @@ fn emit_return(
         writeln!(out, "{}_lir_return = [None] * {}", pad(indent), cx.output_layout.value_len)?;
     }
     if cx.captures_effects {
-        writeln!(out, "{}_lir_return.append(_lir_state)", pad(indent))?;
+        writeln!(out, "{}_lir_return.append([0, _lir_invalid_params])", pad(indent))?;
     }
     for value in values {
         match value {
@@ -739,7 +728,7 @@ fn helper_params_signature(
 ) -> String {
     let mut rendered = if captures_outputs { vec!["_lir_outputs".to_owned()] } else { Vec::new() };
     if captures_effects {
-        rendered.push("_lir_state".to_owned());
+        rendered.push("_lir_invalid_params".to_owned());
     }
     rendered.extend(params.iter().map(|param| names.local(*param)));
     rendered.join(", ")
@@ -748,7 +737,7 @@ fn helper_params_signature(
 fn entry_args_list(params: String, captures_outputs: bool, captures_effects: bool) -> String {
     let mut args = if captures_outputs { vec!["_lir_outputs".to_owned()] } else { Vec::new() };
     if captures_effects {
-        args.push("_lir_state".to_owned());
+        args.push("_lir_invalid_params".to_owned());
     }
     args.extend(params.split(", ").filter(|param| !param.is_empty()).map(str::to_owned));
     args.join(", ")
@@ -889,7 +878,7 @@ fn body_captures_effects(body: &[StructuredStmt]) -> bool {
 
 fn stmt_captures_effects(stmt: &StructuredStmt) -> bool {
     match stmt {
-        StructuredStmt::Stmt(Stmt::CallEffect(_)) => true,
+        StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::SetInvalidParam { .. })) => true,
         StructuredStmt::If { then_body, else_body, .. } => {
             body_captures_effects(then_body) || body_captures_effects(else_body)
         }
@@ -965,7 +954,8 @@ mod tests {
         );
         assert!(!emitted.contains(r#"_lir_state["diagnostics"].append"#), "{emitted}");
         assert!(!emitted.contains("diagnostics"), "{emitted}");
-        assert!(emitted.contains(r#"_lir_state["invalid_params"]"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_invalid_params.append("p7")"#), "{emitted}");
+        assert!(!emitted.contains("_lir_state"), "{emitted}");
         assert!(!emitted.contains("collapse_hints"), "{emitted}");
         assert!(!emitted.contains("_lir_effects.append"), "{emitted}");
         assert!(!emitted.contains(" ignored:"), "{emitted}");
@@ -976,8 +966,9 @@ mod tests {
              def _lir_simparam_opt(name, default): return {{'gmin': 2e-12}}.get(name, default)\n\
              result = call_effects()\n\
              assert result[0] == 2e-12, result\n\
-             assert result[1]['invalid_params'] == ['p7'], result\n\
-             assert set(result[1]) == {{'invalid_params'}}, result\n"
+             assert result[1][0] == 0, result\n\
+             assert result[1][1] == ['p7'], result\n\
+             assert len(result[1]) == 2, result\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");

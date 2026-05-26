@@ -377,8 +377,8 @@ def main() -> int:
     print(f"python calls: {len(python_results)}")
 
     if not comparable(osdi_results, python_results):
-        print("not comparable: OSDI ctypes smoke currently captures flags/state; lifted Python captures flags/MIR outputs")
-        print("needed next: map OSDI jacobian/state slots to the lifted Python output keys")
+        print("not comparable: OSDI ctypes smoke and lifted Python currently report different result shapes")
+        print("comparison requires compatible OSDI and lifted Python result adapters")
         return 2
 
     for i, (lhs, rhs) in enumerate(zip(osdi_results, python_results)):
@@ -442,7 +442,7 @@ def run_osdi(
     if report["scalar_params_without_spec"]:
         report["partial"].append("numeric parameters without explicit ParamSpec are intentionally left at model defaults")
     if mode == "realistic":
-        report["partial"].append("simulator params are supplied to native OSDI and recorded in sim_info; lifted Python currently ignores sim_params")
+        report["partial"].append("simulator params are supplied to native OSDI and lifted Python sim_info")
         if report["builtin_params_skipped"]:
             report["partial"].append("instance builtin params without ParamSpec are left at generated defaults")
 

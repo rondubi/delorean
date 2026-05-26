@@ -1356,11 +1356,29 @@ def _pyosdi_output(instance, idx, name):
     return val
 
 
-def _pyosdi_return_flags(raw):
-    state = raw[-1] if isinstance(raw, list) and raw and isinstance(raw[-1], dict) else None
-    if isinstance(state, dict) and state.get("invalid_params"):
-        raise RuntimeError(f"unsupported invalid parameter flag(s): {state['invalid_params']!r}")
-    return int(state.get("ret_flags", 0)) if isinstance(state, dict) else 0
+def _pyosdi_return_flags(raw, state_slot=None):
+    state = None
+    if isinstance(raw, list):
+        if state_slot is not None:
+            try:
+                candidate = raw[state_slot]
+            except IndexError:
+                candidate = None
+        else:
+            candidate = raw[-1] if raw else None
+        if (
+            isinstance(candidate, list)
+            and len(candidate) == 2
+            and isinstance(candidate[0], int)
+            and isinstance(candidate[1], list)
+        ):
+            state = candidate
+    if state is None:
+        return 0
+    invalid_params = state[1]
+    if invalid_params:
+        raise RuntimeError(f"unsupported invalid parameter flag(s): {invalid_params!r}")
+    return int(state[0])
 
 
 def _pyosdi_missing_hidden(name):
@@ -1526,7 +1544,10 @@ def _pyosdi_missing_hidden(name):
         ));
     }
     out.push_str("    return {\n");
-    out.push_str("        \"flags\": _pyosdi_return_flags(_raw),\n");
+    out.push_str(&format!(
+        "        \"flags\": _pyosdi_return_flags(_raw, {}),\n",
+        module.raw_eval_slots.len()
+    ));
     for group in &module.outputs {
         out.push_str(&format!(
             "        {:?}: {},\n",
