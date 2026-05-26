@@ -1019,6 +1019,7 @@ mod tests {
                 }]),
             }],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         }
     }
 }

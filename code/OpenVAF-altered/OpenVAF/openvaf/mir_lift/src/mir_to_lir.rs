@@ -70,10 +70,13 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             .return_values
             .iter()
             .filter_map(|value| {
-                self.local_id_for_return(*value)
-                    .map(|local| ReturnSlot { key: value_name(*value), value: local })
+                self.local_id_for_return(*value).map(|local| ReturnSlot {
+                    key: self.output_key_for_value(*value),
+                    value: local,
+                })
             })
             .collect();
+        let output_types = self.output_types();
 
         for &block in &self.unit.blocks {
             self.lower_block(block)?;
@@ -86,6 +89,7 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             entry: self.labels_by_block[&self.unit.entry],
             blocks: self.blocks.clone(),
             returns,
+            output_types,
         })
     }
 
@@ -261,7 +265,7 @@ impl<'a, 'r> LowerCx<'a, 'r> {
         if !self.unit.capture_values.contains(&result) {
             return;
         }
-        stmts.push(Stmt::Capture { key: value_name(result), value });
+        stmts.push(Stmt::Capture { key: self.output_key_for_value(result), value });
     }
 
     fn expr_for_inst(&mut self, data: &InstructionData) -> Option<Expr> {
@@ -374,10 +378,35 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             .return_values
             .iter()
             .map(|value| ReturnValue::Named {
-                key: value_name(*value),
+                key: self.output_key_for_value(*value),
                 value: self.expr_for_value(*value),
             })
             .collect()
+    }
+
+    fn output_key_for_value(&self, value: Value) -> String {
+        self.unit.output_name_hints.get(&value).cloned().unwrap_or_else(|| value_name(value))
+    }
+
+    fn output_type_for_value(&self, value: Value) -> LirType {
+        match self.unit.output_type_hints.get(&value).copied() {
+            Some(LirType::Unknown) | None => {
+                type_for_value(self.unit.source, self.canonical_value(value))
+            }
+            Some(ty) => ty,
+        }
+    }
+
+    fn output_types(&self) -> HashMap<String, LirType> {
+        self.unit
+            .return_values
+            .iter()
+            .chain(self.unit.capture_values.iter())
+            .map(|value| (self.output_key_for_value(*value), self.output_type_for_value(*value)))
+            .fold(HashMap::new(), |mut types, (key, ty)| {
+                merge_output_type_hint(&mut types, key, ty);
+                types
+            })
     }
 
     fn expr_for_value(&mut self, value: Value) -> Expr {
@@ -429,7 +458,13 @@ impl<'a, 'r> LowerCx<'a, 'r> {
         self.locals.push(Local {
             id,
             name_hint: self.name_hint_for_value(value),
-            ty: type_for_value(self.unit.source, value),
+            ty: self
+                .unit
+                .output_type_hints
+                .get(&value)
+                .copied()
+                .filter(|ty| *ty != LirType::Unknown)
+                .unwrap_or_else(|| type_for_value(self.unit.source, value)),
         });
         self.locals_by_value.insert(value, id);
         id
@@ -440,7 +475,42 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             ValueDef::Param(param) => {
                 self.unit.param_name_hints.get(&param).cloned().unwrap_or_else(|| value_name(value))
             }
+            ValueDef::Result(inst, 0) => {
+                self.name_hint_for_call_result(inst).unwrap_or_else(|| value_name(value))
+            }
             _ => value_name(value),
+        }
+    }
+
+    fn name_hint_for_call_result(&self, inst: Inst) -> Option<String> {
+        let InstructionData::Call { func_ref, args } = &self.unit.source.dfg.insts[inst] else {
+            return None;
+        };
+        if !self.call_is_simparam_opt(*func_ref) {
+            return None;
+        }
+
+        let name = args
+            .as_slice(&self.unit.source.dfg.insts.value_lists)
+            .first()
+            .and_then(|value| self.string_const(*value))?;
+        Some(format!("simparam_{name}"))
+    }
+
+    fn call_is_simparam_opt(&self, func_ref: FuncRef) -> bool {
+        match self.unit.callbacks {
+            Some(intern) => {
+                usize::from(func_ref) < intern.callbacks.len()
+                    && intern.callbacks[func_ref] == CallBackKind::SimParamOpt
+            }
+            None => call_name(self.unit.source, func_ref) == "simparam_opt",
+        }
+    }
+
+    fn string_const(&self, value: Value) -> Option<String> {
+        match self.unit.source.dfg.value_def(self.canonical_value(value)) {
+            ValueDef::Const(Const::Str(value)) => Some(self.resolver.resolve(&value).to_owned()),
+            _ => None,
         }
     }
 
@@ -625,6 +695,21 @@ fn type_for_inst(data: &InstructionData) -> LirType {
             _ => LirType::Unknown,
         },
         _ => LirType::Unknown,
+    }
+}
+
+fn merge_output_type_hint(types: &mut HashMap<String, LirType>, key: String, ty: LirType) {
+    types.entry(key).and_modify(|current| *current = merged_lir_type(*current, ty)).or_insert(ty);
+}
+
+fn merged_lir_type(lhs: LirType, rhs: LirType) -> LirType {
+    use LirType::*;
+    match (lhs, rhs) {
+        (same_lhs, same_rhs) if same_lhs == same_rhs => same_lhs,
+        (Unknown, ty) | (ty, Unknown) => ty,
+        (Real, Int | Bool) | (Int | Bool, Real) => Real,
+        (Int, Bool) | (Bool, Int) => Int,
+        _ => Unknown,
     }
 }
 

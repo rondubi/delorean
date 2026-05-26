@@ -5,8 +5,8 @@ use std::time::Instant;
 use anyhow::{bail, Result};
 
 use crate::lir::{
-    BinaryOp, CallEffect, ConstValue, Expr, Function, Label, LocalId, MathBinary, MathUnary, Stmt,
-    UnaryOp,
+    BinaryOp, CallEffect, ConstValue, Expr, Function, Label, LirType, LocalId, MathBinary,
+    MathUnary, Stmt, UnaryOp,
 };
 use crate::lir_structure::{self, StructuredStmt};
 
@@ -39,8 +39,24 @@ pub(crate) fn emit_function(function: &Function) -> Result<String> {
         current_helper: None,
     };
 
+    if cx.output_layout.uses_result_object() {
+        writeln!(out, "from dataclasses import dataclass")?;
+        writeln!(out, "from typing import List, Union")?;
+        writeln!(out)?;
+    }
+
     writeln!(out, "_LIR_UNDEF = object()")?;
+    writeln!(out, "class _LirAbsent:")?;
+    writeln!(out, "    __slots__ = ()")?;
+    writeln!(out, "_LIR_ABSENT = _LirAbsent()")?;
     writeln!(out)?;
+
+    if cx.output_layout.uses_result_object() {
+        emit_result_getattr(&mut out)?;
+        writeln!(out)?;
+        emit_result_class(&mut out, &function_name, &cx.output_layout)?;
+        writeln!(out)?;
+    }
 
     for helper in &structured.helpers {
         cx.current_helper = Some(helper.label);
@@ -172,11 +188,11 @@ fn emit_capture(
     indent: usize,
     defined: &HashSet<LocalId>,
 ) -> Result<()> {
-    let slot = cx.output_layout.slot(key)?;
+    let field = cx.output_layout.field(key)?;
     let undefined = expr_undefined_local_ids(value, defined);
     if undefined.is_empty() {
-        writeln!(out, "{}{} = {}", pad(indent), capture_value_name(slot), expr(value, cx.names)?)?;
-        writeln!(out, "{}{} = True", pad(indent), capture_valid_name(slot))?;
+        writeln!(out, "{}{} = {}", pad(indent), capture_value_name(field), expr(value, cx.names)?)?;
+        writeln!(out, "{}{} = True", pad(indent), capture_valid_name(field))?;
         return Ok(());
     }
 
@@ -186,11 +202,11 @@ fn emit_capture(
         .collect::<Vec<_>>()
         .join(" and ");
     writeln!(out, "{}if {guard}:", pad(indent))?;
-    writeln!(out, "{}{} = {}", pad(indent + 1), capture_value_name(slot), expr(value, cx.names)?)?;
-    writeln!(out, "{}{} = True", pad(indent + 1), capture_valid_name(slot))?;
+    writeln!(out, "{}{} = {}", pad(indent + 1), capture_value_name(field), expr(value, cx.names)?)?;
+    writeln!(out, "{}{} = True", pad(indent + 1), capture_valid_name(field))?;
     writeln!(out, "{}else:", pad(indent))?;
-    writeln!(out, "{}{} = None", pad(indent + 1), capture_value_name(slot))?;
-    writeln!(out, "{}{} = False", pad(indent + 1), capture_valid_name(slot))?;
+    writeln!(out, "{}{} = _LIR_ABSENT", pad(indent + 1), capture_value_name(field))?;
+    writeln!(out, "{}{} = False", pad(indent + 1), capture_valid_name(field))?;
     Ok(())
 }
 
@@ -408,8 +424,8 @@ fn emit_return(
     indent: usize,
     defined: &HashSet<LocalId>,
 ) -> Result<()> {
-    if cx.output_layout.uses_slots() {
-        emit_slot_return(out, values, cx, indent, defined)?;
+    if cx.output_layout.uses_result_object() {
+        emit_result_return(out, values, cx, indent, defined)?;
         return Ok(());
     }
 
@@ -427,38 +443,39 @@ fn emit_return(
         return Ok(());
     }
 
-    emit_slot_return(out, values, cx, indent, defined)?;
+    emit_result_return(out, values, cx, indent, defined)?;
     Ok(())
 }
 
-fn emit_slot_return(
+fn emit_result_return(
     out: &mut String,
     values: &[crate::lir::ReturnValue],
     cx: &EmitCx<'_>,
     indent: usize,
     defined: &HashSet<LocalId>,
 ) -> Result<()> {
-    writeln!(out, "{}_lir_outputs = [None] * {}", pad(indent), cx.output_layout.value_len)?;
+    writeln!(out, "{}_lir_result = {}()", pad(indent), result_class_name(cx.helper_prefix))?;
     if cx.captures_outputs {
-        for slot in &cx.output_layout.capture_slots {
-            writeln!(out, "{}if {}:", pad(indent), capture_valid_name(*slot))?;
+        for key in &cx.output_layout.capture_keys {
+            let field = cx.output_layout.field(key)?;
+            writeln!(out, "{}if {}:", pad(indent), capture_valid_name(field))?;
             writeln!(
                 out,
-                "{}_lir_outputs[{slot}] = {}",
+                "{}_lir_result.{field} = {}",
                 pad(indent + 1),
-                capture_value_name(*slot)
+                capture_value_name(field)
             )?;
         }
     }
     for value in values {
         match value {
             crate::lir::ReturnValue::Named { key, value } => {
-                let slot = cx.output_layout.slot(key)?;
+                let field = cx.output_layout.field(key)?;
                 let undefined = expr_undefined_local_ids(value, defined);
                 if undefined.is_empty() {
                     writeln!(
                         out,
-                        "{}_lir_outputs[{slot}] = {}",
+                        "{}_lir_result.{field} = {}",
                         pad(indent),
                         expr(value, cx.names)?
                     )?;
@@ -471,7 +488,7 @@ fn emit_slot_return(
                     writeln!(out, "{}if {guard}:", pad(indent))?;
                     writeln!(
                         out,
-                        "{}_lir_outputs[{slot}] = {}",
+                        "{}_lir_result.{field} = {}",
                         pad(indent + 1),
                         expr(value, cx.names)?
                     )?;
@@ -480,9 +497,10 @@ fn emit_slot_return(
         }
     }
     if cx.captures_effects {
-        writeln!(out, "{}_lir_outputs.append([0, _lir_invalid_params])", pad(indent))?;
+        writeln!(out, "{}_lir_result._flags = 0", pad(indent))?;
+        writeln!(out, "{}_lir_result._invalid_params = _lir_invalid_params", pad(indent))?;
     }
-    writeln!(out, "{}return _lir_outputs", pad(indent))?;
+    writeln!(out, "{}return _lir_result", pad(indent))?;
     Ok(())
 }
 
@@ -563,73 +581,293 @@ struct EmitCx<'a> {
 
 #[derive(Clone, Debug)]
 struct OutputLayout {
-    slots: HashMap<String, usize>,
-    capture_slots: Vec<usize>,
-    value_len: usize,
-    state_slot: Option<usize>,
+    fields: Vec<String>,
+    field_types: HashMap<String, LirType>,
+    field_by_key: HashMap<String, String>,
+    capture_keys: Vec<String>,
+    captures_effects: bool,
 }
 
 impl OutputLayout {
     fn new(function: &Function, captures_effects: bool) -> Self {
         let mut keys = BTreeMap::<String, ()>::new();
+        let mut key_types = HashMap::<String, LirType>::new();
         let mut capture_keys = HashSet::<String>::new();
         for block in &function.blocks {
             for stmt in &block.stmts {
-                if let Stmt::Capture { key, .. } = stmt {
+                if let Stmt::Capture { key, value } = stmt {
                     keys.insert(key.clone(), ());
                     capture_keys.insert(key.clone());
+                    merge_output_type_hint(
+                        &mut key_types,
+                        key.clone(),
+                        output_or_expr_lir_type(function, key, value),
+                    );
                 }
             }
             if let crate::lir::Terminator::Return(values) = &block.term {
                 for value in values {
                     match value {
-                        crate::lir::ReturnValue::Named { key, .. } => {
+                        crate::lir::ReturnValue::Named { key, value } => {
                             keys.insert(key.clone(), ());
+                            merge_output_type_hint(
+                                &mut key_types,
+                                key.clone(),
+                                output_or_expr_lir_type(function, key, value),
+                            );
                         }
                     }
                 }
             }
         }
 
-        let slots =
-            keys.into_keys().enumerate().map(|(slot, key)| (key, slot)).collect::<HashMap<_, _>>();
-        let mut capture_slots =
-            capture_keys.iter().filter_map(|key| slots.get(key).copied()).collect::<Vec<_>>();
-        capture_slots.sort_unstable();
-        let value_len = slots.len();
-        let state_slot = captures_effects.then_some(value_len);
-        Self { slots, capture_slots, value_len, state_slot }
+        let mut used = HashSet::from(["_flags".to_owned(), "_invalid_params".to_owned()]);
+        let mut fields = Vec::new();
+        let mut field_types = HashMap::new();
+        let mut field_by_key = HashMap::new();
+        for key in keys.into_keys() {
+            let field = unique_field_name(&key, &mut used);
+            if let Some(ty) = key_types.get(&key).copied() {
+                field_types.insert(field.clone(), ty);
+            }
+            fields.push(field.clone());
+            field_by_key.insert(key, field);
+        }
+        let mut capture_keys = capture_keys
+            .into_iter()
+            .filter(|key| field_by_key.contains_key(key))
+            .collect::<Vec<_>>();
+        capture_keys.sort();
+        Self { fields, field_types, field_by_key, capture_keys, captures_effects }
     }
 
     fn captures_outputs(&self) -> bool {
-        !self.capture_slots.is_empty()
+        !self.capture_keys.is_empty()
     }
 
-    fn uses_slots(&self) -> bool {
-        self.value_len != 0 || self.state_slot.is_some()
+    fn uses_result_object(&self) -> bool {
+        !self.fields.is_empty() || self.captures_effects
     }
 
     fn capture_state_names(&self) -> Vec<String> {
-        self.capture_slots
+        self.capture_keys
             .iter()
-            .flat_map(|slot| [capture_value_name(*slot), capture_valid_name(*slot)])
+            .filter_map(|key| self.field_by_key.get(key))
+            .flat_map(|field| [capture_value_name(field), capture_valid_name(field)])
             .collect()
     }
 
-    fn slot(&self, key: &str) -> Result<usize> {
-        self.slots
+    fn result_slots(&self) -> Vec<String> {
+        let mut slots = self.fields.clone();
+        if self.captures_effects {
+            slots.push("_flags".to_owned());
+            slots.push("_invalid_params".to_owned());
+        }
+        slots
+    }
+
+    fn field(&self, key: &str) -> Result<&str> {
+        self.field_by_key
             .get(key)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("missing LIR output slot for {key:?}"))
+            .map(String::as_str)
+            .ok_or_else(|| anyhow::anyhow!("missing LIR output field for {key:?}"))
+    }
+
+    fn field_type(&self, field: &str) -> LirType {
+        self.field_types.get(field).copied().unwrap_or(LirType::Unknown)
     }
 }
 
-fn capture_value_name(slot: usize) -> String {
-    format!("_lir_capture_{slot}")
+fn output_or_expr_lir_type(function: &Function, key: &str, value: &Expr) -> LirType {
+    function
+        .output_types
+        .get(key)
+        .copied()
+        .filter(|ty| *ty != LirType::Unknown)
+        .unwrap_or_else(|| expr_lir_type(value, function))
 }
 
-fn capture_valid_name(slot: usize) -> String {
-    format!("_lir_capture_{slot}_valid")
+fn expr_lir_type(value: &Expr, function: &Function) -> LirType {
+    match value {
+        Expr::Local(local) => {
+            function.local(*local).map(|local| local.ty).unwrap_or(LirType::Unknown)
+        }
+        Expr::Const(ConstValue::Bool(_)) => LirType::Bool,
+        Expr::Const(ConstValue::Int(_)) => LirType::Int,
+        Expr::Const(ConstValue::Real(_)) => LirType::Real,
+        Expr::Const(ConstValue::Str(_)) => LirType::Str,
+        Expr::Const(ConstValue::None) => LirType::Unknown,
+        Expr::Unary { op, arg } => match op {
+            UnaryOp::Not => LirType::Bool,
+            UnaryOp::Neg => expr_lir_type(arg, function),
+            UnaryOp::Cast(ty) => *ty,
+            UnaryOp::Math1(_) => LirType::Real,
+        },
+        Expr::Binary { op, lhs, rhs } => match op {
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Le
+            | BinaryOp::Gt
+            | BinaryOp::Ge => LirType::Bool,
+            BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor => LirType::Int,
+            BinaryOp::Math2(_) => LirType::Real,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+                merged_lir_type(expr_lir_type(lhs, function), expr_lir_type(rhs, function))
+            }
+        },
+        Expr::SimparamOpt { default, .. } => expr_lir_type(default, function),
+        Expr::Call { .. } | Expr::Unsupported { .. } => LirType::Unknown,
+    }
+}
+
+fn merge_output_type_hint(types: &mut HashMap<String, LirType>, key: String, ty: LirType) {
+    types.entry(key).and_modify(|current| *current = merged_lir_type(*current, ty)).or_insert(ty);
+}
+
+fn merged_lir_type(lhs: LirType, rhs: LirType) -> LirType {
+    use LirType::*;
+    match (lhs, rhs) {
+        (same_lhs, same_rhs) if same_lhs == same_rhs => same_lhs,
+        (Unknown, ty) | (ty, Unknown) => ty,
+        (Real, Int | Bool) | (Int | Bool, Real) => Real,
+        (Int, Bool) | (Bool, Int) => Int,
+        _ => Unknown,
+    }
+}
+
+fn python_result_annotation(ty: LirType) -> &'static str {
+    match ty {
+        LirType::Bool => "Union[bool, _LirAbsent]",
+        LirType::Int => "Union[int, _LirAbsent]",
+        LirType::Real => "Union[float, _LirAbsent]",
+        LirType::Str => "Union[str, _LirAbsent]",
+        LirType::Unknown => "object",
+    }
+}
+
+fn unique_field_name(key: &str, used: &mut HashSet<String>) -> String {
+    let base = sanitize_field_ident(key);
+    if used.insert(base.clone()) {
+        return base;
+    }
+
+    let mut suffix = 1;
+    loop {
+        let candidate = format!("{base}_{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn sanitize_field_ident(name: &str) -> String {
+    let mut out = sanitize_ident(name);
+    if is_python_keyword(&out) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+fn is_python_keyword(name: &str) -> bool {
+    matches!(
+        name,
+        "False"
+            | "None"
+            | "True"
+            | "and"
+            | "as"
+            | "assert"
+            | "async"
+            | "await"
+            | "break"
+            | "class"
+            | "continue"
+            | "def"
+            | "del"
+            | "elif"
+            | "else"
+            | "except"
+            | "finally"
+            | "for"
+            | "from"
+            | "global"
+            | "if"
+            | "import"
+            | "in"
+            | "is"
+            | "lambda"
+            | "nonlocal"
+            | "not"
+            | "or"
+            | "pass"
+            | "raise"
+            | "return"
+            | "try"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
+fn capture_value_name(field: &str) -> String {
+    format!("_lir_capture_{field}")
+}
+
+fn capture_valid_name(field: &str) -> String {
+    format!("_lir_capture_{field}_valid")
+}
+
+fn result_class_name(function_name: &str) -> String {
+    format!("_{}Result", sanitize_ident(function_name))
+}
+
+fn emit_result_getattr(out: &mut String) -> Result<()> {
+    writeln!(out, "def _lir_result_getattr(self, name):")?;
+    writeln!(out, "    if name in type(self)._lir_absent_fields:")?;
+    writeln!(out, "        return _LIR_ABSENT")?;
+    writeln!(out, "    raise AttributeError(name)")?;
+    Ok(())
+}
+
+fn emit_result_class(out: &mut String, function_name: &str, layout: &OutputLayout) -> Result<()> {
+    let class_name = result_class_name(function_name);
+    writeln!(out, "@dataclass(init=False)")?;
+    writeln!(out, "class {class_name}:")?;
+    let slots = layout.result_slots();
+    writeln!(out, "    __slots__ = {:?}", slots)?;
+    writeln!(out, "    _lir_absent_fields = frozenset({})", python_tuple(&layout.fields))?;
+    writeln!(out, "    __getattr__ = _lir_result_getattr")?;
+    for field in &layout.fields {
+        writeln!(out, "    {field}: {}", python_result_annotation(layout.field_type(field)))?;
+    }
+    if layout.captures_effects {
+        writeln!(out, "    _flags: int")?;
+        writeln!(out, "    _invalid_params: List[str]")?;
+    }
+    if layout.captures_effects {
+        writeln!(out)?;
+        writeln!(out, "    def __init__(self):")?;
+        writeln!(out, "        self._flags = 0")?;
+        writeln!(out, "        self._invalid_params = []")?;
+    }
+    Ok(())
+}
+
+fn python_tuple(items: &[String]) -> String {
+    match items {
+        [] => "()".to_owned(),
+        [item] => format!("({item:?},)"),
+        _ => format!(
+            "({})",
+            items.iter().map(|item| format!("{item:?}")).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 fn validate_direct_helper_graph(structured: &lir_structure::StructuredFunction) -> Result<()> {
@@ -786,9 +1024,9 @@ fn entry_args_list(
 ) -> String {
     let mut args = if output_layout.captures_outputs() {
         output_layout
-            .capture_slots
+            .capture_keys
             .iter()
-            .flat_map(|_| ["None".to_owned(), "False".to_owned()])
+            .flat_map(|_| ["_LIR_ABSENT".to_owned(), "False".to_owned()])
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -958,21 +1196,24 @@ mod tests {
     };
 
     fn assert_no_trampoline_protocol(emitted: &str) {
-        for needle in
-            ["(\"call\",", "(\"return\",", "_lir_target", "_lir_result[0]", "_lir_result", "_pc"]
-        {
+        for needle in ["(\"call\",", "(\"return\",", "_lir_target", "_lir_result[0]", "_pc"] {
             assert!(!emitted.contains(needle), "found {needle:?} in:\n{emitted}");
         }
     }
 
-    fn assert_output_slot_writes_follow_exit_packing(emitted: &str) {
-        let first_pack = emitted.find("_lir_outputs = [None]").expect("missing output packing");
-        for (offset, _) in emitted.match_indices("_lir_outputs[") {
+    fn assert_result_field_writes_follow_exit_packing(emitted: &str) {
+        let first_pack = emitted.find("_lir_result = ").expect("missing output packing");
+        for (offset, _) in emitted.match_indices("_lir_result.") {
             assert!(
                 offset > first_pack,
-                "slot write before exit packing at byte {offset}:\n{emitted}"
+                "result field write before exit packing at byte {offset}:\n{emitted}"
             );
         }
+    }
+
+    fn assert_no_absent_result_field_init(emitted: &str, field: &str) {
+        let needle = format!("self.{field} = _LIR_ABSENT");
+        assert!(!emitted.contains(&needle), "found {needle:?} in:\n{emitted}");
     }
 
     #[test]
@@ -1009,6 +1250,7 @@ mod tests {
                 }]),
             }],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
 
         let emitted = emit_function(&function).unwrap();
@@ -1019,6 +1261,12 @@ mod tests {
             emitted.contains(r#"val = _lir_simparam_opt("gmin", 0.000000000001)"#),
             "{emitted}"
         );
+        assert!(emitted.contains("out: Union[float, _LirAbsent]"), "{emitted}");
+        assert!(emitted.contains("_flags: int"), "{emitted}");
+        assert!(emitted.contains("_invalid_params: List[str]"), "{emitted}");
+        assert!(emitted.contains(r#"_lir_absent_fields = frozenset(("out",))"#), "{emitted}");
+        assert!(emitted.contains("__getattr__ = _lir_result_getattr"), "{emitted}");
+        assert_no_absent_result_field_init(&emitted, "out");
         assert!(!emitted.contains(r#"_lir_state["diagnostics"].append"#), "{emitted}");
         assert!(!emitted.contains("diagnostics"), "{emitted}");
         assert!(emitted.contains(r#"_lir_invalid_params.append("p7")"#), "{emitted}");
@@ -1032,10 +1280,9 @@ mod tests {
             "{emitted}\n\
              def _lir_simparam_opt(name, default): return {{'gmin': 2e-12}}.get(name, default)\n\
              result = call_effects()\n\
-             assert result[0] == 2e-12, result\n\
-             assert result[1][0] == 0, result\n\
-             assert result[1][1] == ['p7'], result\n\
-             assert len(result[1]) == 2, result\n"
+             assert result.out == 2e-12, result.out\n\
+             assert result._flags == 0, result._flags\n\
+             assert result._invalid_params == ['p7'], result._invalid_params\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -1082,6 +1329,7 @@ mod tests {
                 term: Terminator::Return(Vec::new()),
             }],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
 
         let emitted = emit_function(&function).unwrap();
@@ -1121,6 +1369,7 @@ mod tests {
                 term: Terminator::Return(Vec::new()),
             }],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
 
         let error = emit_function(&function).unwrap_err().to_string();
@@ -1141,6 +1390,7 @@ mod tests {
                 term: Terminator::Return(Vec::new()),
             }],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
         let names = super::NameTable::new(&function);
         let optional_helper_live_ins = HashSet::new();
@@ -1229,16 +1479,17 @@ mod tests {
                 },
             ],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
 
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
-        assert!(emitted.contains(r#"_lir_outputs[0] = v"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_result.out = v"#), "{emitted}");
 
         let script = format!(
             "{emitted}\n\
-             assert diamond(True) == [1], diamond(True)\n\
-             assert diamond(False) == [2], diamond(False)\n"
+             assert diamond(True).out == 1, diamond(True).out\n\
+             assert diamond(False).out == 2, diamond(False).out\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -1318,6 +1569,7 @@ mod tests {
                 },
             ],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
 
         let emitted = emit_function(&function).unwrap();
@@ -1327,8 +1579,8 @@ mod tests {
 
         let script = format!(
             "{emitted}\n\
-             assert sum_to_n(0) == [0], sum_to_n(0)\n\
-             assert sum_to_n(5) == [10], sum_to_n(5)\n"
+             assert sum_to_n(0).out == 0, sum_to_n(0).out\n\
+             assert sum_to_n(5).out == 10, sum_to_n(5).out\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -1418,23 +1670,30 @@ mod tests {
                 },
             ],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
 
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
         assert!(emitted.contains("return _stale_capture_bb_1("), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_0 = None"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_0_valid = False"#), "{emitted}");
-        assert!(emitted.contains(r#"if _lir_capture_0_valid:"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_outputs[0] = _lir_capture_0"#), "{emitted}");
-        assert!(!emitted.contains(r#"_lir_outputs[0] = None"#), "{emitted}");
-        assert!(!emitted.contains("_lir_capture_0_present"), "{emitted}");
-        assert!(!emitted.contains("_lir_capture_0_defined"), "{emitted}");
+        assert!(emitted.contains(r#"_lir_capture_slot = _LIR_ABSENT"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_capture_slot_valid = False"#), "{emitted}");
+        assert!(emitted.contains(r#"if _lir_capture_slot_valid:"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_result.slot = _lir_capture_slot"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_absent_fields = frozenset(("slot",))"#), "{emitted}");
+        assert!(emitted.contains("__getattr__ = _lir_result_getattr"), "{emitted}");
+        assert_no_absent_result_field_init(&emitted, "slot");
+        assert!(!emitted.contains(r#"_lir_result.slot = None"#), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_slot_present"), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_slot_defined"), "{emitted}");
 
         let script = format!(
             "{emitted}\n\
-             assert stale_capture(True) == [None], stale_capture(True)\n\
-             assert stale_capture(False) == [9], stale_capture(False)\n"
+             result = stale_capture(True)\n\
+             assert result.slot is _LIR_ABSENT, result.slot\n\
+             assert not hasattr(result, '__dict__')\n\
+             assert not hasattr(result, 'not_an_output')\n\
+             assert stale_capture(False).slot == 9, stale_capture(False).slot\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -1479,22 +1738,29 @@ mod tests {
                 Block { label: Label(2), stmts: Vec::new(), term: Terminator::Return(Vec::new()) },
             ],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
 
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
-        assert!(emitted.contains(r#"_lir_capture_0_valid = True"#), "{emitted}");
-        assert!(emitted.contains(r#"if _lir_capture_0_valid:"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_outputs[0] = _lir_capture_0"#), "{emitted}");
-        assert!(!emitted.contains(r#"_lir_outputs[0] = value"#), "{emitted}");
-        assert!(!emitted.contains("_lir_capture_0_present"), "{emitted}");
-        assert!(!emitted.contains("_lir_capture_0_defined"), "{emitted}");
-        assert_output_slot_writes_follow_exit_packing(&emitted);
+        assert!(emitted.contains(r#"_lir_capture_slot_valid = True"#), "{emitted}");
+        assert!(emitted.contains(r#"if _lir_capture_slot_valid:"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_result.slot = _lir_capture_slot"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_absent_fields = frozenset(("slot",))"#), "{emitted}");
+        assert!(emitted.contains("__getattr__ = _lir_result_getattr"), "{emitted}");
+        assert_no_absent_result_field_init(&emitted, "slot");
+        assert!(!emitted.contains("    def __init__(self):"), "{emitted}");
+        assert!(!emitted.contains(r#"_lir_result.slot = value"#), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_slot_present"), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_slot_defined"), "{emitted}");
+        assert_result_field_writes_follow_exit_packing(&emitted);
 
         let script = format!(
             "{emitted}\n\
-             assert conditional_capture(True) == [5], conditional_capture(True)\n\
-             assert conditional_capture(False) == [None], conditional_capture(False)\n"
+             assert conditional_capture(True).slot == 5, conditional_capture(True).slot\n\
+             result = conditional_capture(False)\n\
+             assert result.slot is _LIR_ABSENT, result.slot\n\
+             assert not hasattr(result, '__dict__')\n"
         );
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
@@ -1523,21 +1789,23 @@ mod tests {
                 term: Terminator::Return(Vec::new()),
             }],
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
 
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
         assert!(!emitted.contains("is not _LIR_UNDEF"), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_0 = value"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_0_valid = True"#), "{emitted}");
-        assert!(emitted.contains(r#"if _lir_capture_0_valid:"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_outputs[0] = _lir_capture_0"#), "{emitted}");
-        assert!(!emitted.contains(r#"_lir_outputs[0] = None"#), "{emitted}");
-        assert!(!emitted.contains("_lir_capture_0_present"), "{emitted}");
-        assert!(!emitted.contains("_lir_capture_0_defined"), "{emitted}");
-        assert_output_slot_writes_follow_exit_packing(&emitted);
+        assert!(emitted.contains(r#"_lir_capture_slot = value"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_capture_slot_valid = True"#), "{emitted}");
+        assert!(emitted.contains(r#"if _lir_capture_slot_valid:"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_result.slot = _lir_capture_slot"#), "{emitted}");
+        assert_no_absent_result_field_init(&emitted, "slot");
+        assert!(!emitted.contains(r#"_lir_result.slot = None"#), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_slot_present"), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_slot_defined"), "{emitted}");
+        assert_result_field_writes_follow_exit_packing(&emitted);
 
-        let script = format!("{emitted}\nassert defined_capture() == [11]\n");
+        let script = format!("{emitted}\nassert defined_capture().slot == 11\n");
         let output =
             Command::new("python3").arg("-c").arg(script).output().expect("failed to run python3");
         assert!(

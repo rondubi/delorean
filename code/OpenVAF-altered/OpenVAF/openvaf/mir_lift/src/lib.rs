@@ -124,6 +124,45 @@ pub fn lift_function_with_hir_returns_and_param_hints(
     emit_function_unit(&unit, resolver)
 }
 
+pub fn lift_function_with_hir_returns_param_and_output_hints(
+    function: &Function,
+    return_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+    param_name_hints: HashMap<Param, String>,
+    output_name_hints: HashMap<Value, String>,
+) -> Result<String> {
+    lift_function_with_hir_returns_param_output_and_type_hints(
+        function,
+        return_values,
+        resolver,
+        intern,
+        param_name_hints,
+        output_name_hints,
+        HashMap::new(),
+    )
+}
+
+pub fn lift_function_with_hir_returns_param_output_and_type_hints(
+    function: &Function,
+    return_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+    param_name_hints: HashMap<Param, String>,
+    output_name_hints: HashMap<Value, String>,
+    output_type_hints: HashMap<Value, lir::LirType>,
+) -> Result<String> {
+    let unit = FunctionUnit::whole_with_hir_returns_param_and_output_hints(
+        function,
+        return_values,
+        intern,
+        param_name_hints,
+        output_name_hints,
+        output_type_hints,
+    )?;
+    emit_function_unit(&unit, resolver)
+}
+
 pub fn lift_function_with_returns_and_captures(
     function: &Function,
     return_values: &[Value],
@@ -174,6 +213,49 @@ pub fn lift_function_with_hir_returns_captures_and_param_hints(
     emit_function_unit(&unit, resolver)
 }
 
+pub fn lift_function_with_hir_returns_captures_param_and_output_hints(
+    function: &Function,
+    return_values: &[Value],
+    capture_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+    param_name_hints: HashMap<Param, String>,
+    output_name_hints: HashMap<Value, String>,
+) -> Result<String> {
+    lift_function_with_hir_returns_captures_param_output_and_type_hints(
+        function,
+        return_values,
+        capture_values,
+        resolver,
+        intern,
+        param_name_hints,
+        output_name_hints,
+        HashMap::new(),
+    )
+}
+
+pub fn lift_function_with_hir_returns_captures_param_output_and_type_hints(
+    function: &Function,
+    return_values: &[Value],
+    capture_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+    param_name_hints: HashMap<Param, String>,
+    output_name_hints: HashMap<Value, String>,
+    output_type_hints: HashMap<Value, lir::LirType>,
+) -> Result<String> {
+    let unit = FunctionUnit::whole_with_hir_returns_captures_param_and_output_hints(
+        function,
+        return_values,
+        capture_values,
+        intern,
+        param_name_hints,
+        output_name_hints,
+        output_type_hints,
+    )?;
+    emit_function_unit(&unit, resolver)
+}
+
 pub fn dump_function_lir_with_returns(
     function: &Function,
     return_values: &[Value],
@@ -212,6 +294,46 @@ pub fn dump_function_lir_with_hir_returns_and_param_hints(
         return_values,
         intern,
         param_name_hints,
+    )?;
+    let lir = lower_simplified_lir(&unit, resolver)?;
+    Ok(lir.to_string())
+}
+
+pub fn dump_function_lir_with_hir_returns_param_and_output_hints(
+    function: &Function,
+    return_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+    param_name_hints: HashMap<Param, String>,
+    output_name_hints: HashMap<Value, String>,
+) -> Result<String> {
+    dump_function_lir_with_hir_returns_param_output_and_type_hints(
+        function,
+        return_values,
+        resolver,
+        intern,
+        param_name_hints,
+        output_name_hints,
+        HashMap::new(),
+    )
+}
+
+pub fn dump_function_lir_with_hir_returns_param_output_and_type_hints(
+    function: &Function,
+    return_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+    param_name_hints: HashMap<Param, String>,
+    output_name_hints: HashMap<Value, String>,
+    output_type_hints: HashMap<Value, lir::LirType>,
+) -> Result<String> {
+    let unit = FunctionUnit::whole_with_hir_returns_param_and_output_hints(
+        function,
+        return_values,
+        intern,
+        param_name_hints,
+        output_name_hints,
+        output_type_hints,
     )?;
     let lir = lower_simplified_lir(&unit, resolver)?;
     Ok(lir.to_string())
@@ -265,6 +387,50 @@ pub fn dump_function_lir_with_hir_returns_captures_and_param_hints(
         capture_values,
         intern,
         param_name_hints,
+    )?;
+    let lir = lower_simplified_lir(&unit, resolver)?;
+    Ok(lir.to_string())
+}
+
+pub fn dump_function_lir_with_hir_returns_captures_param_and_output_hints(
+    function: &Function,
+    return_values: &[Value],
+    capture_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+    param_name_hints: HashMap<Param, String>,
+    output_name_hints: HashMap<Value, String>,
+) -> Result<String> {
+    dump_function_lir_with_hir_returns_captures_param_output_and_type_hints(
+        function,
+        return_values,
+        capture_values,
+        resolver,
+        intern,
+        param_name_hints,
+        output_name_hints,
+        HashMap::new(),
+    )
+}
+
+pub fn dump_function_lir_with_hir_returns_captures_param_output_and_type_hints(
+    function: &Function,
+    return_values: &[Value],
+    capture_values: &[Value],
+    resolver: &dyn Resolver,
+    intern: &HirInterner,
+    param_name_hints: HashMap<Param, String>,
+    output_name_hints: HashMap<Value, String>,
+    output_type_hints: HashMap<Value, lir::LirType>,
+) -> Result<String> {
+    let unit = FunctionUnit::whole_with_hir_returns_captures_param_and_output_hints(
+        function,
+        return_values,
+        capture_values,
+        intern,
+        param_name_hints,
+        output_name_hints,
+        output_type_hints,
     )?;
     let lir = lower_simplified_lir(&unit, resolver)?;
     Ok(lir.to_string())
@@ -438,6 +604,8 @@ struct FunctionUnit<'a> {
     capture_values: Vec<Value>,
     callbacks: Option<&'a HirInterner>,
     param_name_hints: HashMap<Param, String>,
+    output_name_hints: HashMap<Value, String>,
+    output_type_hints: HashMap<Value, lir::LirType>,
 }
 
 fn build_units<'a>(
@@ -512,6 +680,8 @@ impl<'a> FunctionUnit<'a> {
             capture_values: Vec::new(),
             callbacks: None,
             param_name_hints: HashMap::new(),
+            output_name_hints: HashMap::new(),
+            output_type_hints: HashMap::new(),
         })
     }
 
@@ -551,6 +721,8 @@ impl<'a> FunctionUnit<'a> {
             capture_values,
             callbacks: None,
             param_name_hints: HashMap::new(),
+            output_name_hints: HashMap::new(),
+            output_type_hints: HashMap::new(),
         })
     }
 
@@ -563,6 +735,25 @@ impl<'a> FunctionUnit<'a> {
         let mut unit = Self::whole_with_returns(source, return_values)?;
         unit.callbacks = Some(callbacks);
         unit.param_name_hints = param_name_hints;
+        Ok(unit)
+    }
+
+    fn whole_with_hir_returns_param_and_output_hints(
+        source: &'a Function,
+        return_values: &[Value],
+        callbacks: &'a HirInterner,
+        param_name_hints: HashMap<Param, String>,
+        output_name_hints: HashMap<Value, String>,
+        output_type_hints: HashMap<Value, lir::LirType>,
+    ) -> Result<Self> {
+        let mut unit = Self::whole_with_hir_returns_and_param_hints(
+            source,
+            return_values,
+            callbacks,
+            param_name_hints,
+        )?;
+        unit.output_name_hints = output_name_hints;
+        unit.output_type_hints = output_type_hints;
         Ok(unit)
     }
 
@@ -581,6 +772,27 @@ impl<'a> FunctionUnit<'a> {
         )?;
         unit.callbacks = Some(callbacks);
         unit.param_name_hints = param_name_hints;
+        Ok(unit)
+    }
+
+    fn whole_with_hir_returns_captures_param_and_output_hints(
+        source: &'a Function,
+        return_values: &[Value],
+        capture_values: &[Value],
+        callbacks: &'a HirInterner,
+        param_name_hints: HashMap<Param, String>,
+        output_name_hints: HashMap<Value, String>,
+        output_type_hints: HashMap<Value, lir::LirType>,
+    ) -> Result<Self> {
+        let mut unit = Self::whole_with_hir_returns_captures_and_param_hints(
+            source,
+            return_values,
+            capture_values,
+            callbacks,
+            param_name_hints,
+        )?;
+        unit.output_name_hints = output_name_hints;
+        unit.output_type_hints = output_type_hints;
         Ok(unit)
     }
 
@@ -618,6 +830,8 @@ impl<'a> FunctionUnit<'a> {
             capture_values: Vec::new(),
             callbacks: None,
             param_name_hints: HashMap::new(),
+            output_name_hints: HashMap::new(),
+            output_type_hints: HashMap::new(),
         })
     }
 
@@ -795,7 +1009,7 @@ mod tests {
         assert!(!lifted.contains("v36 = v35"));
         assert!(lifted.contains("if (v16) < (0):"));
         assert!(lifted.contains("v31 = (float(v16)) / (3.141)"));
-        assert!(lifted.contains("_lir_outputs[") && lifted.contains("] = v36"));
+        assert!(lifted.contains("_lir_result.v36 = v36"));
     }
 
     #[test]
@@ -823,7 +1037,7 @@ mod tests {
     #[test]
     fn applies_param_name_hints_only_when_provided() {
         let input = r#"
-function %param_hint(v0, v1) {
+function %param_hint(v0, v1, v2) {
                                 block0:
 }
 "#;
@@ -832,10 +1046,12 @@ function %param_hint(v0, v1) {
         let function = &functions[0];
 
         let standalone = lift_text(input, None).unwrap();
-        assert!(standalone.contains("def param_hint(v0, v1):"));
+        assert!(standalone.contains("def param_hint(v0, v1, v2):"));
 
         let mut hints = HashMap::new();
         hints.insert(mir::Param::from(0usize), "param_width".to_owned());
+        hints.insert(mir::Param::from(1usize), "given_width".to_owned());
+        hints.insert(mir::Param::from(2usize), "builtin_mfactor".to_owned());
         let lifted = lift_function_with_hir_returns_and_param_hints(
             function,
             &[],
@@ -845,7 +1061,27 @@ function %param_hint(v0, v1) {
         )
         .unwrap();
 
-        assert!(lifted.contains("def param_hint(param_width, v1):"));
+        assert!(lifted.contains("def param_hint(param_width, given_width, builtin_mfactor):"));
+    }
+
+    #[test]
+    fn names_simparam_opt_results_from_constant_name() {
+        let input = r#"
+function %simparam_name() {
+    fn0 = const fn %simparam_opt(2) -> 1
+    v0 = sconst "gmin"
+    v1 = fconst 0x1.19799812dea11p-40
+                                block0:
+                                    v2 = call fn0(v0, v1)
+                                    v3 = optbarrier v2
+                                    jmp block1
+
+                                block1:
+}
+"#;
+
+        let lifted = lift_text(input, None).unwrap();
+        assert!(lifted.contains("simparam_gmin = _lir_simparam_opt(\"gmin\", 0.000000000001)"));
     }
 
     #[test]

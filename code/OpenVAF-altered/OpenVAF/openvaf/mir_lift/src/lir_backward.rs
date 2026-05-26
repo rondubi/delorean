@@ -2519,6 +2519,7 @@ mod tests {
             entry: Label(0),
             blocks: Vec::new(),
             returns: Vec::new(),
+            output_types: HashMap::new(),
         };
         let mut structured = StructuredFunction {
             body: vec![
@@ -3215,6 +3216,7 @@ mod tests {
             entry: Label(0),
             blocks: Vec::new(),
             returns: Vec::new(),
+            output_types: HashMap::new(),
         }
     }
 
@@ -3229,6 +3231,7 @@ mod tests {
             entry: Label(0),
             blocks: Vec::new(),
             returns: Vec::new(),
+            output_types: HashMap::new(),
         }
     }
 }

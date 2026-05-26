@@ -346,6 +346,9 @@ fn compile_with_mir_lift(
         let init_capture_values = compiled.init.cached_vals.keys().copied().collect::<Vec<_>>();
         let python_osdi = PythonOsdiModule::new(base_name.to_string(), db, &compiled);
         let eval_output_values = python_osdi.return_values();
+        let model_output_name_hints = python_osdi.raw_model_fields.clone();
+        let init_output_name_hints = python_osdi.raw_init_fields.clone();
+        let eval_output_name_hints = python_osdi.raw_eval_fields.clone();
         let model_param_name_hints =
             mir_lift_param_name_hints(db, &compiled.model_param_intern);
         let init_param_name_hints = mir_lift_param_name_hints(db, &compiled.init.intern);
@@ -357,25 +360,29 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_hir_returns_captures_and_param_hints(
+                mir_lift::dump_function_lir_with_hir_returns_captures_param_output_and_type_hints(
                     &compiled.model_param_setup,
                     &[],
                     &model_output_values,
                     &literals,
                     &compiled.model_param_intern,
                     model_param_name_hints.clone(),
+                    model_output_name_hints.clone(),
+                    python_osdi.raw_model_types.clone(),
                 )?
             )?;
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_hir_returns_captures_and_param_hints(
+            &mir_lift::lift_function_with_hir_returns_captures_param_output_and_type_hints(
                 &compiled.model_param_setup,
                 &[],
                 &model_output_values,
                 &literals,
                 &compiled.model_param_intern,
                 model_param_name_hints,
+                model_output_name_hints,
+                python_osdi.raw_model_types.clone(),
             )?,
             &mut first_unit,
         )?;
@@ -385,25 +392,29 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_hir_returns_captures_and_param_hints(
+                mir_lift::dump_function_lir_with_hir_returns_captures_param_output_and_type_hints(
                     &compiled.init.func,
                     &init_output_values,
                     &init_capture_values,
                     &literals,
                     &compiled.init.intern,
                     init_param_name_hints.clone(),
+                    init_output_name_hints.clone(),
+                    python_osdi.raw_init_types.clone(),
                 )?
             )?;
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_hir_returns_captures_and_param_hints(
+            &mir_lift::lift_function_with_hir_returns_captures_param_output_and_type_hints(
                 &compiled.init.func,
                 &init_output_values,
                 &init_capture_values,
                 &literals,
                 &compiled.init.intern,
                 init_param_name_hints,
+                init_output_name_hints,
+                python_osdi.raw_init_types.clone(),
             )?,
             &mut first_unit,
         )?;
@@ -413,23 +424,27 @@ fn compile_with_mir_lift(
             writeln!(
                 &mut stderr,
                 "{}",
-                mir_lift::dump_function_lir_with_hir_returns_and_param_hints(
+                mir_lift::dump_function_lir_with_hir_returns_param_output_and_type_hints(
                     &compiled.eval,
                     &eval_output_values,
                     &literals,
                     &compiled.intern,
                     eval_param_name_hints.clone(),
+                    eval_output_name_hints.clone(),
+                    python_osdi.raw_eval_types.clone(),
                 )?
             )?;
         }
         append_lifted_python(
             &mut python,
-            &mir_lift::lift_function_with_hir_returns_and_param_hints(
+            &mir_lift::lift_function_with_hir_returns_param_output_and_type_hints(
                 &compiled.eval,
                 &eval_output_values,
                 &literals,
                 &compiled.intern,
                 eval_param_name_hints,
+                eval_output_name_hints,
+                python_osdi.raw_eval_types.clone(),
             )?,
             &mut first_unit,
         )?;
@@ -453,6 +468,12 @@ fn mir_lift_param_name_hints(
             hir_lower::ParamKind::Param(param_def) => {
                 Some((param, format!("param_{}", param_def.name(db))))
             }
+            hir_lower::ParamKind::ParamGiven { param: param_def } => {
+                Some((param, format!("given_{}", param_def.name(db))))
+            }
+            hir_lower::ParamKind::ParamSysFun(param_def) => {
+                Some((param, format!("builtin_{param_def:?}")))
+            }
             _ => None,
         })
         .collect()
@@ -469,9 +490,12 @@ struct PythonOsdiModule {
     model_args: Vec<String>,
     init_args: Vec<String>,
     eval_args: Vec<String>,
-    raw_model_slots: std::collections::HashMap<mir::Value, usize>,
-    raw_init_slots: std::collections::HashMap<mir::Value, usize>,
-    raw_eval_slots: std::collections::HashMap<mir::Value, usize>,
+    raw_model_fields: std::collections::HashMap<mir::Value, String>,
+    raw_init_fields: std::collections::HashMap<mir::Value, String>,
+    raw_eval_fields: std::collections::HashMap<mir::Value, String>,
+    raw_model_types: std::collections::HashMap<mir::Value, mir_lift::lir::LirType>,
+    raw_init_types: std::collections::HashMap<mir::Value, mir_lift::lir::LirType>,
+    raw_eval_types: std::collections::HashMap<mir::Value, mir_lift::lir::LirType>,
     model_params: Vec<(String, mir::Value)>,
     model_instance_defaults: Vec<(String, mir::Value)>,
     instance_params: Vec<(String, mir::Value)>,
@@ -501,18 +525,7 @@ impl PythonOsdiModule {
             .copied()
             .filter_map(|value| value.expand())
             .collect::<Vec<_>>();
-        let init_output_values = compiled
-            .init
-            .intern
-            .outputs
-            .values()
-            .copied()
-            .filter_map(|value| value.expand())
-            .collect::<Vec<_>>();
         let init_capture_values = compiled.init.cached_vals.keys().copied().collect::<Vec<_>>();
-        let init_slots = python_osdi_raw_slots(
-            init_output_values.iter().copied().chain(init_capture_values.iter().copied()),
-        );
         let init_hidden_values = python_osdi_hidden_outputs(db, &compiled.init.intern);
         let eval_hidden_values = python_osdi_hidden_outputs(db, &compiled.intern);
         let outputs = vec![
@@ -551,6 +564,79 @@ impl PythonOsdiModule {
             .iter()
             .flat_map(|group| group.values.iter().copied().flatten())
             .chain(eval_hidden_values.iter().map(|(_, value)| *value));
+        let model_params = python_osdi_param_outputs(
+            db,
+            compiled,
+            &compiled.model_param_intern,
+            false,
+        );
+        let model_instance_defaults = python_osdi_param_outputs(
+            db,
+            compiled,
+            &compiled.model_param_intern,
+            true,
+        );
+        let instance_params = python_osdi_param_outputs(db, compiled, &compiled.init.intern, true);
+        let cache_values = python_osdi_cache_values(compiled);
+        let cache_defaults = python_osdi_cache_defaults(compiled);
+        let builtin_params = python_osdi_builtin_params(compiled);
+        let hidden_slots = python_osdi_hidden_slots(db, compiled);
+        let raw_model_fields = python_osdi_raw_fields(
+            model_params
+                .iter()
+                .map(|(name, value)| (*value, format!("model_param_{name}")))
+                .chain(
+                    model_instance_defaults
+                        .iter()
+                        .map(|(name, value)| (*value, format!("model_default_{name}"))),
+                )
+                .chain(model_output_values.iter().map(|value| (*value, python_osdi_raw_key(*value)))),
+        );
+        let raw_init_fields = python_osdi_raw_fields(
+            instance_params
+                .iter()
+                .map(|(name, value)| (*value, format!("instance_param_{name}")))
+                .chain(
+                    cache_values
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, value)| value.map(|value| (value, format!("cache_{idx}")))),
+                )
+                .chain(
+                    init_hidden_values
+                        .iter()
+                        .map(|(name, value)| (*value, format!("hidden_{name}"))),
+                )
+                .chain(init_capture_values.iter().map(|value| (*value, python_osdi_raw_key(*value))))
+                .chain(
+                    compiled
+                        .init
+                        .intern
+                        .outputs
+                        .values()
+                        .copied()
+                        .filter_map(|value| value.expand())
+                        .map(|value| (value, python_osdi_raw_key(value))),
+                ),
+        );
+        let raw_eval_fields = python_osdi_raw_fields(
+            outputs
+                .iter()
+                .flat_map(|group| {
+                    group.values.iter().enumerate().filter_map(move |(idx, value)| {
+                        value.map(|value| (value, format!("{}_{}", group.name, idx)))
+                    })
+                })
+                .chain(
+                    eval_hidden_values
+                        .iter()
+                        .map(|(name, value)| (*value, format!("hidden_{name}"))),
+                )
+                .chain(eval_output_values.map(|value| (value, python_osdi_raw_key(value)))),
+        );
+        let raw_model_types = python_osdi_raw_model_types(db, compiled);
+        let raw_init_types = python_osdi_raw_init_types(db, compiled, &cache_values);
+        let raw_eval_types = python_osdi_raw_eval_types(db, compiled, &outputs);
         Self {
             raw_model_function: sanitize_python_ident(&format!("_{name}_model_raw")),
             raw_init_function: sanitize_python_ident(&format!("_{name}_init_raw")),
@@ -571,26 +657,19 @@ impl PythonOsdiModule {
                 SetupPhase::Instance,
             ),
             eval_args: python_osdi_eval_args(db, compiled),
-            raw_model_slots: python_osdi_raw_slots(model_output_values),
-            raw_init_slots: init_slots,
-            raw_eval_slots: python_osdi_raw_slots(eval_output_values),
-            model_params: python_osdi_param_outputs(
-                db,
-                compiled,
-                &compiled.model_param_intern,
-                false,
-            ),
-            model_instance_defaults: python_osdi_param_outputs(
-                db,
-                compiled,
-                &compiled.model_param_intern,
-                true,
-            ),
-            instance_params: python_osdi_param_outputs(db, compiled, &compiled.init.intern, true),
-            cache_values: python_osdi_cache_values(compiled),
-            cache_defaults: python_osdi_cache_defaults(compiled),
-            builtin_params: python_osdi_builtin_params(compiled),
-            hidden_slots: python_osdi_hidden_slots(db, compiled),
+            raw_model_fields,
+            raw_init_fields,
+            raw_eval_fields,
+            raw_model_types,
+            raw_init_types,
+            raw_eval_types,
+            model_params,
+            model_instance_defaults,
+            instance_params,
+            cache_values,
+            cache_defaults,
+            builtin_params,
+            hidden_slots,
             init_hidden_values,
             eval_hidden_values,
             num_states: compiled.intern.lim_state.len(),
@@ -617,37 +696,142 @@ impl PythonOsdiModule {
     }
 }
 
-fn python_osdi_raw_slots(
-    values: impl IntoIterator<Item = mir::Value>,
-) -> std::collections::HashMap<mir::Value, usize> {
-    let values = values.into_iter().collect::<Vec<_>>();
-    let mut key_slots = std::collections::BTreeMap::<String, usize>::new();
-    for value in &values {
-        key_slots.entry(python_osdi_raw_key(*value)).or_insert(0);
+fn python_osdi_raw_fields(
+    values: impl IntoIterator<Item = (mir::Value, String)>,
+) -> std::collections::HashMap<mir::Value, String> {
+    let mut used = std::collections::HashSet::new();
+    let mut fields = std::collections::HashMap::new();
+    for (value, hint) in values {
+        if fields.contains_key(&value) {
+            continue;
+        }
+        let base = sanitize_python_ident(&hint);
+        let mut field = base.clone();
+        let mut suffix = 1;
+        while !used.insert(field.clone()) {
+            field = format!("{base}_{suffix}");
+            suffix += 1;
+        }
+        fields.insert(value, field);
     }
-    for (slot, value_slot) in key_slots.values_mut().enumerate() {
-        *value_slot = slot;
+    fields
+}
+
+fn python_osdi_raw_model_types(
+    db: &CompilationDB,
+    compiled: &sim_back::CompiledModule<'_>,
+) -> std::collections::HashMap<mir::Value, mir_lift::lir::LirType> {
+    python_osdi_interner_output_types(db, &compiled.model_param_intern)
+}
+
+fn python_osdi_raw_init_types(
+    db: &CompilationDB,
+    compiled: &sim_back::CompiledModule<'_>,
+    cache_values: &[Option<mir::Value>],
+) -> std::collections::HashMap<mir::Value, mir_lift::lir::LirType> {
+    let mut types = python_osdi_interner_output_types(db, &compiled.init.intern);
+    for (idx, value) in cache_values.iter().enumerate() {
+        if let Some(value) = value {
+            let slot = sim_back::init::CacheSlot::from(idx);
+            python_osdi_insert_type(
+                &mut types,
+                *value,
+                python_osdi_hir_type(&compiled.init.cache_slots[slot]),
+            );
+        }
     }
-    values
-        .into_iter()
-        .map(|value| {
-            let slot = key_slots[&python_osdi_raw_key(value)];
-            (value, slot)
-        })
-        .collect()
+    types
+}
+
+fn python_osdi_raw_eval_types(
+    db: &CompilationDB,
+    compiled: &sim_back::CompiledModule<'_>,
+    outputs: &[PythonOsdiOutputGroup],
+) -> std::collections::HashMap<mir::Value, mir_lift::lir::LirType> {
+    let mut types = python_osdi_interner_output_types(db, &compiled.intern);
+    for value in outputs.iter().flat_map(|group| group.values.iter().copied().flatten()) {
+        python_osdi_insert_type(&mut types, value, mir_lift::lir::LirType::Real);
+    }
+    types
+}
+
+fn python_osdi_interner_output_types(
+    db: &CompilationDB,
+    intern: &hir_lower::HirInterner,
+) -> std::collections::HashMap<mir::Value, mir_lift::lir::LirType> {
+    let mut types = std::collections::HashMap::new();
+    for (kind, value) in &intern.outputs {
+        if let Some(value) = value.expand() {
+            python_osdi_insert_type(&mut types, value, python_osdi_hir_type(&kind.ty(db)));
+        }
+    }
+    types
+}
+
+fn python_osdi_hir_type(ty: &hir::Type) -> mir_lift::lir::LirType {
+    match ty {
+        hir::Type::Real => mir_lift::lir::LirType::Real,
+        hir::Type::Integer => mir_lift::lir::LirType::Int,
+        hir::Type::Bool => mir_lift::lir::LirType::Bool,
+        hir::Type::String => mir_lift::lir::LirType::Str,
+        hir::Type::Err | hir::Type::Array { .. } | hir::Type::EmptyArray | hir::Type::Void => {
+            mir_lift::lir::LirType::Unknown
+        }
+    }
+}
+
+fn python_osdi_insert_type(
+    types: &mut std::collections::HashMap<mir::Value, mir_lift::lir::LirType>,
+    value: mir::Value,
+    ty: mir_lift::lir::LirType,
+) {
+    types
+        .entry(value)
+        .and_modify(|current| *current = python_osdi_merge_lir_type(*current, ty))
+        .or_insert(ty);
+}
+
+fn python_osdi_merge_lir_type(
+    lhs: mir_lift::lir::LirType,
+    rhs: mir_lift::lir::LirType,
+) -> mir_lift::lir::LirType {
+    use mir_lift::lir::LirType::*;
+    match (lhs, rhs) {
+        (same_lhs, same_rhs) if same_lhs == same_rhs => same_lhs,
+        (Unknown, ty) | (ty, Unknown) => ty,
+        (Real, Int | Bool) | (Int | Bool, Real) => Real,
+        (Int, Bool) | (Bool, Int) => Int,
+        _ => Unknown,
+    }
 }
 
 fn python_osdi_raw_key(value: mir::Value) -> String {
     format!("{value}").replace('.', "_")
 }
 
-fn python_osdi_raw_slot(
-    slots: &std::collections::HashMap<mir::Value, usize>,
+fn python_osdi_raw_field(
+    fields: &std::collections::HashMap<mir::Value, String>,
     value: mir::Value,
-) -> usize {
-    *slots.get(&value).unwrap_or_else(|| {
-        panic!("missing Python OSDI raw slot for {}", python_osdi_raw_key(value))
-    })
+) -> &str {
+    fields
+        .get(&value)
+        .map(String::as_str)
+        .unwrap_or_else(|| panic!("missing Python OSDI raw field for {}", python_osdi_raw_key(value)))
+}
+
+fn python_osdi_raw_attr(
+    fields: &std::collections::HashMap<mir::Value, String>,
+    value: mir::Value,
+) -> String {
+    format!("_raw.{}", python_osdi_raw_field(fields, value))
+}
+
+fn python_osdi_raw_value_expr(
+    fields: &std::collections::HashMap<mir::Value, String>,
+    value: mir::Value,
+) -> String {
+    let field = python_osdi_raw_field(fields, value);
+    format!("_pyosdi_raw_value(_raw.{field}, {field:?})")
 }
 
 #[derive(Clone, Copy)]
@@ -1247,34 +1431,22 @@ def _pyosdi_merge_given_params(base, params, given):
     return merged
 
 
-def _pyosdi_raw_missing(slot):
-    raise RuntimeError(f"missing raw output slot {slot}")
+def _pyosdi_raw_missing(name):
+    raise RuntimeError(f"missing raw output field {name}")
 
 
-def _pyosdi_raw_present(items, slot):
-    if items is None:
-        _pyosdi_raw_missing(slot)
-    try:
-        val = items[slot]
-    except IndexError:
-        return False
-    except TypeError:
-        raise RuntimeError("raw outputs are not indexable") from None
-    return val is not None and val is not _PYOSDI_UNSET
+def _pyosdi_raw_absent(value):
+    return value is None or value is _PYOSDI_UNSET or value is _LIR_ABSENT
 
 
-def _pyosdi_raw_slot(items, slot):
-    if items is None:
-        _pyosdi_raw_missing(slot)
-    try:
-        val = items[slot]
-    except IndexError:
-        _pyosdi_raw_missing(slot)
-    except TypeError:
-        raise RuntimeError("raw outputs are not indexable") from None
-    if val is None or val is _PYOSDI_UNSET:
-        _pyosdi_raw_missing(slot)
-    return val
+def _pyosdi_raw_present(value):
+    return not _pyosdi_raw_absent(value)
+
+
+def _pyosdi_raw_value(value, name):
+    if _pyosdi_raw_absent(value):
+        _pyosdi_raw_missing(name)
+    return value
 
 
 _PYOSDI_SIMPARAM_STACK = []
@@ -1396,29 +1568,18 @@ def _pyosdi_output(instance, idx, name):
     return val
 
 
-def _pyosdi_return_flags(raw, state_slot=None):
-    state = None
-    if isinstance(raw, list):
-        if state_slot is not None:
-            try:
-                candidate = raw[state_slot]
-            except IndexError:
-                candidate = None
-        else:
-            candidate = raw[-1] if raw else None
-        if (
-            isinstance(candidate, list)
-            and len(candidate) == 2
-            and isinstance(candidate[0], int)
-            and isinstance(candidate[1], list)
-        ):
-            state = candidate
-    if state is None:
-        return 0
-    invalid_params = state[1]
+def _pyosdi_return_flags(raw):
+    if raw is None:
+        _pyosdi_raw_missing("_flags")
+    flags = getattr(raw, "_flags", 0)
+    invalid_params = getattr(raw, "_invalid_params", [])
+    if invalid_params is None or invalid_params is _LIR_ABSENT:
+        invalid_params = []
     if invalid_params:
         raise RuntimeError(f"unsupported invalid parameter flag(s): {invalid_params!r}")
-    return int(state[0])
+    if flags is None or flags is _LIR_ABSENT:
+        return 0
+    return int(flags)
 
 
 def _pyosdi_missing_hidden(name):
@@ -1449,16 +1610,16 @@ def _pyosdi_missing_hidden(name):
     out.push_str("    _params = _pyosdi_given_params(params, given)\n");
     out.push_str("    _inst_defaults = {}\n");
     for (name, value) in &module.model_params {
-        let slot = python_osdi_raw_slot(&module.raw_model_slots, *value);
-        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
-        out.push_str(&format!("        _params[{name:?}] = _pyosdi_raw_slot(_raw, {slot})\n"));
+        let attr = python_osdi_raw_attr(&module.raw_model_fields, *value);
+        let value_expr = python_osdi_raw_value_expr(&module.raw_model_fields, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present({attr}):\n"));
+        out.push_str(&format!("        _params[{name:?}] = {value_expr}\n"));
     }
     for (name, value) in &module.model_instance_defaults {
-        let slot = python_osdi_raw_slot(&module.raw_model_slots, *value);
-        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
-        out.push_str(&format!(
-            "        _inst_defaults[{name:?}] = _pyosdi_raw_slot(_raw, {slot})\n"
-        ));
+        let attr = python_osdi_raw_attr(&module.raw_model_fields, *value);
+        let value_expr = python_osdi_raw_value_expr(&module.raw_model_fields, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present({attr}):\n"));
+        out.push_str(&format!("        _inst_defaults[{name:?}] = {value_expr}\n"));
     }
     out.push_str(&format!(
         "    return _PyOsdiModel({:?}, _raw, _params, dict(given), _inst_defaults, dict(builtin_params), dict(sim_params))\n",
@@ -1505,11 +1666,10 @@ def _pyosdi_missing_hidden(name):
     out.push_str("        _PYOSDI_SIMPARAM_STACK.pop()\n");
     out.push_str("    instance.raw = _raw\n");
     for (name, value) in &module.instance_params {
-        let slot = python_osdi_raw_slot(&module.raw_init_slots, *value);
-        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
-        out.push_str(&format!(
-            "        instance.params[{name:?}] = _pyosdi_raw_slot(_raw, {slot})\n"
-        ));
+        let attr = python_osdi_raw_attr(&module.raw_init_fields, *value);
+        let value_expr = python_osdi_raw_value_expr(&module.raw_init_fields, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present({attr}):\n"));
+        out.push_str(&format!("        instance.params[{name:?}] = {value_expr}\n"));
     }
     out.push_str("    _cache = instance.cache\n");
     for (idx, value) in module.cache_values.iter().enumerate() {
@@ -1517,19 +1677,19 @@ def _pyosdi_missing_hidden(name):
             if let Some(default) = module.cache_defaults[idx] {
                 out.push_str(&format!("    _cache[{idx}] = {default}\n"));
             }
-            let slot = python_osdi_raw_slot(&module.raw_init_slots, *value);
-            out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
-            out.push_str(&format!("        _cache[{idx}] = _pyosdi_raw_slot(_raw, {slot})\n"));
+            let attr = python_osdi_raw_attr(&module.raw_init_fields, *value);
+            let value_expr = python_osdi_raw_value_expr(&module.raw_init_fields, *value);
+            out.push_str(&format!("    if _pyosdi_raw_present({attr}):\n"));
+            out.push_str(&format!("        _cache[{idx}] = {value_expr}\n"));
         }
     }
     out.push_str("    _hidden = instance.hidden\n");
     for (name, value) in &module.init_hidden_values {
         let hidden_slot = python_osdi_hidden_slot(&module.hidden_slots, name);
-        let slot = python_osdi_raw_slot(&module.raw_init_slots, *value);
-        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
-        out.push_str(&format!(
-            "        _hidden[{hidden_slot}] = _pyosdi_raw_slot(_raw, {slot})\n"
-        ));
+        let attr = python_osdi_raw_attr(&module.raw_init_fields, *value);
+        let value_expr = python_osdi_raw_value_expr(&module.raw_init_fields, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present({attr}):\n"));
+        out.push_str(&format!("        _hidden[{hidden_slot}] = {value_expr}\n"));
     }
     out.push_str(&format!("    return instance\n"));
 
@@ -1561,8 +1721,7 @@ def _pyosdi_missing_hidden(name):
             }
             match value {
                 Some(value) => {
-                    let slot = python_osdi_raw_slot(&module.raw_eval_slots, *value);
-                    out.push_str(&format!("_pyosdi_raw_slot(_raw, {slot})"));
+                    out.push_str(&python_osdi_raw_value_expr(&module.raw_eval_fields, *value));
                 }
                 None => out.push_str("0.0"),
             }
@@ -1580,17 +1739,13 @@ def _pyosdi_missing_hidden(name):
     out.push_str("    _hidden = instance.hidden\n");
     for (name, value) in &module.eval_hidden_values {
         let hidden_slot = python_osdi_hidden_slot(&module.hidden_slots, name);
-        let slot = python_osdi_raw_slot(&module.raw_eval_slots, *value);
-        out.push_str(&format!("    if _pyosdi_raw_present(_raw, {slot}):\n"));
-        out.push_str(&format!(
-            "        _hidden[{hidden_slot}] = _pyosdi_raw_slot(_raw, {slot})\n"
-        ));
+        let attr = python_osdi_raw_attr(&module.raw_eval_fields, *value);
+        let value_expr = python_osdi_raw_value_expr(&module.raw_eval_fields, *value);
+        out.push_str(&format!("    if _pyosdi_raw_present({attr}):\n"));
+        out.push_str(&format!("        _hidden[{hidden_slot}] = {value_expr}\n"));
     }
     out.push_str("    return {\n");
-    out.push_str(&format!(
-        "        \"flags\": _pyosdi_return_flags(_raw, {}),\n",
-        module.raw_eval_slots.len()
-    ));
+    out.push_str("        \"flags\": _pyosdi_return_flags(_raw),\n");
     for group in &module.outputs {
         out.push_str(&format!(
             "        {:?}: {},\n",
@@ -1676,7 +1831,9 @@ fn strip_unused_lir_undef_sentinel(python: &mut String) {
 }
 
 fn strip_lift_prelude(lifted: &str) -> &str {
-    lifted.find("\ndef ").map(|idx| &lifted[idx + 1..]).unwrap_or(lifted)
+    lifted
+        .strip_prefix("import math\n\n\ninf = math.inf\n\n\n")
+        .unwrap_or(lifted)
 }
 
 #[cfg(test)]
@@ -1686,8 +1843,8 @@ mod tests {
     #[test]
     fn generated_python_osdi_cache_slots_start_unset() {
         let cached_value = mir::Value::with_number_(42);
-        let mut raw_init_slots = std::collections::HashMap::new();
-        raw_init_slots.insert(cached_value, 0);
+        let mut raw_init_fields = std::collections::HashMap::new();
+        raw_init_fields.insert(cached_value, "cache_0".to_owned());
 
         let module = PythonOsdiModule {
             name: "device".to_owned(),
@@ -1700,9 +1857,9 @@ mod tests {
             model_args: Vec::new(),
             init_args: Vec::new(),
             eval_args: vec!["_pyosdi_cache(instance, 1)".to_owned()],
-            raw_model_slots: std::collections::HashMap::new(),
-            raw_init_slots,
-            raw_eval_slots: std::collections::HashMap::new(),
+            raw_model_fields: std::collections::HashMap::new(),
+            raw_init_fields,
+            raw_eval_fields: std::collections::HashMap::new(),
             model_params: Vec::new(),
             model_instance_defaults: Vec::new(),
             instance_params: Vec::new(),
@@ -1729,8 +1886,8 @@ mod tests {
     #[test]
     fn generated_python_osdi_explicitly_defaults_conditional_cache_slots() {
         let cached_value = mir::Value::with_number_(42);
-        let mut raw_init_slots = std::collections::HashMap::new();
-        raw_init_slots.insert(cached_value, 0);
+        let mut raw_init_fields = std::collections::HashMap::new();
+        raw_init_fields.insert(cached_value, "cache_0".to_owned());
 
         let module = PythonOsdiModule {
             name: "device".to_owned(),
@@ -1743,9 +1900,9 @@ mod tests {
             model_args: Vec::new(),
             init_args: Vec::new(),
             eval_args: vec!["_pyosdi_cache(instance, 0)".to_owned()],
-            raw_model_slots: std::collections::HashMap::new(),
-            raw_init_slots,
-            raw_eval_slots: std::collections::HashMap::new(),
+            raw_model_fields: std::collections::HashMap::new(),
+            raw_init_fields,
+            raw_eval_fields: std::collections::HashMap::new(),
             model_params: Vec::new(),
             model_instance_defaults: Vec::new(),
             instance_params: Vec::new(),
@@ -1764,7 +1921,7 @@ mod tests {
         append_python_osdi_module(&mut python, &module);
 
         assert!(python.contains("_cache[0] = 0.0"));
-        assert!(python.contains("if _pyosdi_raw_present(_raw, 0):"));
-        assert!(python.contains("_cache[0] = _pyosdi_raw_slot(_raw, 0)"));
+        assert!(python.contains("if _pyosdi_raw_present(_raw.cache_0):"));
+        assert!(python.contains("_cache[0] = _pyosdi_raw_value(_raw.cache_0, \"cache_0\")"));
     }
 }

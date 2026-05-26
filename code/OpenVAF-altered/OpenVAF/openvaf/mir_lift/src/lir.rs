@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -13,6 +14,7 @@ pub struct Function {
     pub entry: Label,
     pub blocks: Vec<Block>,
     pub returns: Vec<ReturnSlot>,
+    pub output_types: HashMap<String, LirType>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
