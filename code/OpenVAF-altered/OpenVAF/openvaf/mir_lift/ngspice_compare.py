@@ -47,7 +47,7 @@ def main() -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
 
     osdi_path = work_dir / f"{module}.osdi"
-    python_path = work_dir / f"{module}.py"
+    python_path = default_lifted_python_path(verilog_file)
     summary_path = work_dir / "summary.json"
 
     env = runner_env()
@@ -109,6 +109,12 @@ def parse_module_name(verilog_file: Path) -> str:
         if stripped.startswith("module "):
             return stripped.split()[1].split("(")[0]
     raise SystemExit(f"could not find module declaration in {verilog_file}")
+
+
+def default_lifted_python_path(verilog_file: Path) -> Path:
+    path = Path(tempfile.gettempdir()) / "mir_lift_current" / f"{verilog_file.stem}.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def runner_env() -> dict[str, str]:

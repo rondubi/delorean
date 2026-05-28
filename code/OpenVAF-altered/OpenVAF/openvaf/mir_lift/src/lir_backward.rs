@@ -13,6 +13,7 @@ const SMALL_HELPER_STMT_LIMIT: usize = 12;
 const COST_INLINE_HELPER_CALL_LIMIT: usize = 3;
 const COST_INLINE_MIN_SAVINGS: usize = 32;
 const PUSH_UP_HELPER_CALL_LIMIT: usize = 4;
+const PREDICATE_INLINE_EXPR_NODE_LIMIT: usize = 12;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BackwardFacts {
@@ -54,15 +55,20 @@ const CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::CostBasedHelperInlining,
     BackwardPassKind::StructuredSimplify,
     BackwardPassKind::BranchInvariantHoist,
+    BackwardPassKind::PredicateInlining,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperComputationPushUp,
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::CopyAliasPropagation,
+    BackwardPassKind::UnaryTempInlining,
     BackwardPassKind::DeadAssignments,
+    BackwardPassKind::PredicateInlining,
     BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::CopyAliasPropagation,
+    BackwardPassKind::UnaryTempInlining,
     BackwardPassKind::DeadAssignments,
+    BackwardPassKind::PredicateInlining,
     BackwardPassKind::HelperSignaturePruning,
 ];
 const STRUCTURAL_PASSES: &[BackwardPassKind] = &[
@@ -82,10 +88,12 @@ const FINAL_DCE_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::CopyAliasPropagation,
+    BackwardPassKind::UnaryTempInlining,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::CopyAliasPropagation,
+    BackwardPassKind::UnaryTempInlining,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
 ];
@@ -153,11 +161,13 @@ enum BackwardPassKind {
     CostBasedHelperInlining,
     StructuredSimplify,
     BranchInvariantHoist,
+    PredicateInlining,
     BranchSquash,
     HelperComputationPushUp,
     HelperLiveIns,
     OptionalHelperLiveIns,
     CopyAliasPropagation,
+    UnaryTempInlining,
     DeadAssignments,
 }
 
@@ -171,11 +181,13 @@ impl BackwardPassKind {
             Self::CostBasedHelperInlining => "cost-based-helper-inlining",
             Self::StructuredSimplify => "structured-simplify",
             Self::BranchInvariantHoist => "branch-invariant-hoist",
+            Self::PredicateInlining => "predicate-inlining",
             Self::BranchSquash => "branch-squash",
             Self::HelperComputationPushUp => "helper-computation-push-up",
             Self::HelperLiveIns => "helper-live-ins",
             Self::OptionalHelperLiveIns => "optional-helper-live-ins",
             Self::CopyAliasPropagation => "copy-alias-propagation",
+            Self::UnaryTempInlining => "unary-temp-inlining",
             Self::DeadAssignments => "dead-assignments",
         }
     }
@@ -189,11 +201,13 @@ impl BackwardPassKind {
             Self::CostBasedHelperInlining => run_backward_pass::<CostBasedHelperInlining>(cx),
             Self::StructuredSimplify => run_backward_pass::<StructuredSimplify>(cx),
             Self::BranchInvariantHoist => run_backward_pass::<BranchInvariantHoist>(cx),
+            Self::PredicateInlining => run_backward_pass::<PredicateInlining>(cx),
             Self::BranchSquash => run_backward_pass::<BranchSquash>(cx),
             Self::HelperComputationPushUp => run_backward_pass::<HelperComputationPushUp>(cx),
             Self::HelperLiveIns => run_backward_pass::<HelperLiveIns>(cx),
             Self::OptionalHelperLiveIns => run_backward_pass::<OptionalHelperLiveIns>(cx),
             Self::CopyAliasPropagation => run_backward_pass::<CopyAliasPropagation>(cx),
+            Self::UnaryTempInlining => run_backward_pass::<UnaryTempInlining>(cx),
             Self::DeadAssignments => run_backward_pass::<DeadAssignments>(cx),
         }
     }
@@ -876,6 +890,226 @@ fn hoistable_pure_assignment_dst(stmt: &StructuredStmt) -> Option<LocalId> {
 }
 
 #[derive(Default)]
+struct PredicateInlining;
+
+impl BackwardLirPass for PredicateInlining {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let local_types = local_types(cx.function);
+        let blocked_after = HashSet::new();
+        let mut changed =
+            inline_predicates_in_body(&mut cx.structured.body, &local_types, &blocked_after);
+        for helper in &mut cx.structured.helpers {
+            changed |= inline_predicates_in_body(&mut helper.body, &local_types, &blocked_after);
+        }
+        changed
+    }
+}
+
+fn inline_predicates_in_body(
+    body: &mut Vec<StructuredStmt>,
+    local_types: &[LirType],
+    blocked_after_body: &HashSet<LocalId>,
+) -> bool {
+    let mut changed = false;
+    for index in 0..body.len() {
+        let mut blocked_after_stmt = blocked_after_body.clone();
+        if suffix_may_observe_locals(body, index + 1, &mut blocked_after_stmt) {
+            continue;
+        }
+        if let StructuredStmt::If { then_body, else_body, .. } = &mut body[index] {
+            changed |= inline_predicates_in_body(then_body, local_types, &blocked_after_stmt);
+            changed |= inline_predicates_in_body(else_body, local_types, &blocked_after_stmt);
+        }
+    }
+
+    let mut index = 0;
+    while index + 1 < body.len() {
+        if let Some((dst, value)) = inlineable_predicate_assignment(body, index, local_types) {
+            if !blocked_after_body.contains(&dst)
+                && !local_observed_before_redefinition(body, index + 2, dst)
+            {
+                if let StructuredStmt::If { cond, .. } = &mut body[index + 1] {
+                    *cond = value;
+                }
+                body.remove(index);
+                changed = true;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    changed
+}
+
+fn inlineable_predicate_assignment(
+    body: &[StructuredStmt],
+    index: usize,
+    local_types: &[LirType],
+) -> Option<(LocalId, Expr)> {
+    let StructuredStmt::Stmt(Stmt::Assign { dst, value }) = body.get(index)? else {
+        return None;
+    };
+    let StructuredStmt::If { cond, then_body, else_body } = body.get(index + 1)? else {
+        return None;
+    };
+
+    let (cond_local, inline_value) = match cond {
+        Expr::Local(cond) => (*cond, value.clone()),
+        Expr::Unary { op: UnaryOp::Not, arg } => match arg.as_ref() {
+            Expr::Local(cond) => {
+                (*cond, Expr::Unary { op: UnaryOp::Not, arg: Box::new(value.clone()) })
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+
+    if *dst != cond_local {
+        return None;
+    }
+    if body_has_control_boundary(then_body) || body_has_control_boundary(else_body) {
+        return None;
+    }
+    if body_uses_local(then_body, *dst) || body_uses_local(else_body, *dst) {
+        return None;
+    }
+    if expr_node_count(value) > PREDICATE_INLINE_EXPR_NODE_LIMIT {
+        return None;
+    }
+    is_total_predicate_expr(value, local_types).then_some((*dst, inline_value))
+}
+
+fn suffix_may_observe_locals(
+    body: &[StructuredStmt],
+    start: usize,
+    observed: &mut HashSet<LocalId>,
+) -> bool {
+    for stmt in body.iter().skip(start) {
+        if stmt_has_control_boundary(stmt) {
+            return true;
+        }
+        collect_structured_stmt_uses_into_set(stmt, observed);
+    }
+    false
+}
+
+fn local_observed_before_redefinition(
+    body: &[StructuredStmt],
+    start: usize,
+    needle: LocalId,
+) -> bool {
+    for stmt in body.iter().skip(start) {
+        if stmt_has_control_boundary(stmt) || structured_stmt_uses_local(stmt, needle) {
+            return true;
+        }
+        if structured_stmt_redefines_local(stmt, needle) {
+            return false;
+        }
+    }
+    false
+}
+
+fn expr_node_count(expr: &Expr) -> usize {
+    match expr {
+        Expr::Local(_) | Expr::Const(_) => 1,
+        Expr::Unary { arg, .. } => 1 + expr_node_count(arg),
+        Expr::Binary { lhs, rhs, .. } => 1 + expr_node_count(lhs) + expr_node_count(rhs),
+        Expr::SimparamOpt { name, default } => 1 + expr_node_count(name) + expr_node_count(default),
+        Expr::Call { args, .. } | Expr::Unsupported { args, .. } => {
+            1 + args.iter().map(expr_node_count).sum::<usize>()
+        }
+    }
+}
+
+fn is_total_predicate_expr(expr: &Expr, local_types: &[LirType]) -> bool {
+    if expr_has_side_effects(expr) || expr_type(expr, local_types) != Some(LirType::Bool) {
+        return false;
+    }
+
+    match expr {
+        Expr::Const(ConstValue::Bool(_)) => true,
+        Expr::Local(local) => local_types.get(local.0) == Some(&LirType::Bool),
+        Expr::Unary { op: UnaryOp::Not, arg } => is_total_predicate_expr(arg, local_types),
+        Expr::Unary { op: UnaryOp::Cast(LirType::Bool), arg } => is_total_bool_cast_operand(arg),
+        Expr::Binary { op: BinaryOp::BitAnd | BinaryOp::BitOr, lhs, rhs } => {
+            is_total_predicate_expr(lhs, local_types) && is_total_predicate_expr(rhs, local_types)
+        }
+        Expr::Binary {
+            op:
+                BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge,
+            lhs,
+            rhs,
+        } => {
+            is_total_comparison_operand(lhs, local_types)
+                && is_total_comparison_operand(rhs, local_types)
+        }
+        _ => false,
+    }
+}
+
+fn is_total_bool_cast_operand(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Local(_)
+            | Expr::Const(
+                ConstValue::Bool(_)
+                    | ConstValue::Int(_)
+                    | ConstValue::Real(_)
+                    | ConstValue::Str(_)
+                    | ConstValue::None,
+            )
+    )
+}
+
+fn is_total_comparison_operand(expr: &Expr, local_types: &[LirType]) -> bool {
+    match expr {
+        Expr::Local(local) => matches!(
+            local_types.get(local.0),
+            Some(LirType::Bool | LirType::Int | LirType::Real | LirType::Str)
+        ),
+        Expr::Const(
+            ConstValue::Bool(_) | ConstValue::Int(_) | ConstValue::Real(_) | ConstValue::Str(_),
+        ) => true,
+        _ => false,
+    }
+}
+
+fn body_uses_local(body: &[StructuredStmt], needle: LocalId) -> bool {
+    body.iter().any(|stmt| structured_stmt_uses_local(stmt, needle))
+}
+
+fn structured_stmt_uses_local(stmt: &StructuredStmt, needle: LocalId) -> bool {
+    let mut uses = Vec::new();
+    collect_structured_stmt_uses(stmt, &mut uses);
+    uses.contains(&needle)
+}
+
+fn structured_stmt_redefines_local(stmt: &StructuredStmt, needle: LocalId) -> bool {
+    matches!(stmt, StructuredStmt::Stmt(Stmt::Assign { dst, .. }) if *dst == needle)
+}
+
+fn collect_structured_stmt_uses_into_set(stmt: &StructuredStmt, uses: &mut HashSet<LocalId>) {
+    let mut collected = Vec::new();
+    collect_structured_stmt_uses(stmt, &mut collected);
+    uses.extend(collected);
+}
+
+fn body_has_control_boundary(body: &[StructuredStmt]) -> bool {
+    body.iter().any(stmt_has_control_boundary)
+}
+
+fn stmt_has_control_boundary(stmt: &StructuredStmt) -> bool {
+    match stmt {
+        StructuredStmt::If { then_body, else_body, .. } => {
+            body_has_control_boundary(then_body) || body_has_control_boundary(else_body)
+        }
+        StructuredStmt::CallHelper(_) => true,
+        StructuredStmt::Stmt(_) | StructuredStmt::Return(_) | StructuredStmt::Raise(_) => false,
+    }
+}
+
+#[derive(Default)]
 struct BranchSquash;
 
 impl BackwardLirPass for BranchSquash {
@@ -935,18 +1169,46 @@ fn squashed_branch_assignment(
     }
 
     let dst_ty = *local_types.get(dst.0)?;
-    let value = squashed_boolish_branch_expr(cond, then_value, else_value, dst_ty)
+    let value = squashed_bool_expr_branch_expr(cond, then_value, else_value, dst_ty, local_types)
+        .or_else(|| squashed_boolish_branch_expr(cond, then_value, else_value, dst_ty))
         .or_else(|| squashed_int_const_branch_expr(cond, then_value, else_value, dst_ty))?;
 
     Some(StructuredStmt::Stmt(Stmt::Assign { dst, value }))
 }
 
+fn squashed_bool_expr_branch_expr(
+    cond: &Expr,
+    then_value: &Expr,
+    else_value: &Expr,
+    dst_ty: LirType,
+    _local_types: &[LirType],
+) -> Option<Expr> {
+    if !matches!(dst_ty, LirType::Bool | LirType::Unknown) {
+        return None;
+    }
+    if !is_eager_safe_bool_expr(then_value) || !is_eager_safe_bool_expr(else_value) {
+        return None;
+    }
+
+    let cond = bool_cast(cond.clone());
+    match (bool_const_expr(then_value), bool_const_expr(else_value)) {
+        (Some(true), None) => Some(bool_or(cond.clone(), else_value.clone())),
+        (Some(false), None) => Some(bool_and(bool_not(cond.clone()), else_value.clone())),
+        (None, Some(true)) => Some(bool_or(bool_not(cond.clone()), then_value.clone())),
+        (None, Some(false)) => Some(bool_and(cond.clone(), then_value.clone())),
+        _ => None,
+    }
+}
+
 fn squashed_boolish_branch_expr(
     cond: &Expr,
-    then_value: &ConstValue,
-    else_value: &ConstValue,
+    then_value: &Expr,
+    else_value: &Expr,
     dst_ty: LirType,
 ) -> Option<Expr> {
+    let (Expr::Const(then_value), Expr::Const(else_value)) = (then_value, else_value) else {
+        return None;
+    };
     let (kind, then_truthy, else_truthy) = boolish_const_pair(then_value, else_value)?;
     let kind = replacement_kind_for_dst(kind, dst_ty)?;
     match (kind, then_truthy, else_truthy) {
@@ -967,14 +1229,16 @@ fn squashed_boolish_branch_expr(
 
 fn squashed_int_const_branch_expr(
     cond: &Expr,
-    then_value: &ConstValue,
-    else_value: &ConstValue,
+    then_value: &Expr,
+    else_value: &Expr,
     dst_ty: LirType,
 ) -> Option<Expr> {
     if dst_ty != LirType::Int {
         return None;
     }
-    let (ConstValue::Int(then_int), ConstValue::Int(else_int)) = (then_value, else_value) else {
+    let (Expr::Const(ConstValue::Int(then_int)), Expr::Const(ConstValue::Int(else_int))) =
+        (then_value, else_value)
+    else {
         return None;
     };
     let delta = checked_int_branch_delta(*then_int, *else_int)?;
@@ -1006,11 +1270,46 @@ fn checked_int_branch_delta(then_int: i32, else_int: i32) -> Option<i32> {
     Some(delta)
 }
 
-fn single_assignment(body: &[StructuredStmt]) -> Option<(LocalId, &ConstValue)> {
-    let [StructuredStmt::Stmt(Stmt::Assign { dst, value: Expr::Const(value) })] = body else {
+fn single_assignment(body: &[StructuredStmt]) -> Option<(LocalId, &Expr)> {
+    let [StructuredStmt::Stmt(Stmt::Assign { dst, value })] = body else {
         return None;
     };
     Some((*dst, value))
+}
+
+fn bool_const_expr(expr: &Expr) -> Option<bool> {
+    let Expr::Const(ConstValue::Bool(value)) = expr else {
+        return None;
+    };
+    Some(*value)
+}
+
+fn is_eager_safe_bool_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Const(ConstValue::Bool(_)) => true,
+        Expr::Unary { op: UnaryOp::Not, arg } => is_eager_safe_bool_expr(arg),
+        Expr::Unary { op: UnaryOp::Cast(LirType::Bool), arg } => is_total_bool_cast_operand(arg),
+        Expr::Binary { op: BinaryOp::BitAnd | BinaryOp::BitOr, lhs, rhs } => {
+            is_eager_safe_bool_expr(lhs) && is_eager_safe_bool_expr(rhs)
+        }
+        _ => false,
+    }
+}
+
+fn bool_not(arg: Expr) -> Expr {
+    Expr::Unary { op: UnaryOp::Not, arg: Box::new(arg) }
+}
+
+fn bool_cast(arg: Expr) -> Expr {
+    Expr::Unary { op: UnaryOp::Cast(LirType::Bool), arg: Box::new(arg) }
+}
+
+fn bool_and(lhs: Expr, rhs: Expr) -> Expr {
+    Expr::Binary { op: BinaryOp::BitAnd, lhs: Box::new(lhs), rhs: Box::new(rhs) }
+}
+
+fn bool_or(lhs: Expr, rhs: Expr) -> Expr {
+    Expr::Binary { op: BinaryOp::BitOr, lhs: Box::new(lhs), rhs: Box::new(rhs) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1786,6 +2085,204 @@ fn intersect_alias_maps(left: &CopyAliasMap, right: &CopyAliasMap) -> CopyAliasM
 }
 
 #[derive(Default)]
+struct UnaryTempInlining;
+
+impl BackwardLirPass for UnaryTempInlining {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let helper_params = cx.facts.helper_live_ins.clone();
+        let entry_params = cx.function.params.iter().copied().collect();
+        let mut changed =
+            inline_unary_temps_in_body(&mut cx.structured.body, &helper_params, &entry_params);
+        for helper in &mut cx.structured.helpers {
+            let protected = helper.params.iter().copied().collect();
+            changed |= inline_unary_temps_in_body(&mut helper.body, &helper_params, &protected);
+        }
+        changed
+    }
+}
+
+fn inline_unary_temps_in_body(
+    body: &mut Vec<StructuredStmt>,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+    protected_locals: &HashSet<LocalId>,
+) -> bool {
+    let mut changed = false;
+
+    for stmt in body.iter_mut() {
+        if let StructuredStmt::If { then_body, else_body, .. } = stmt {
+            changed |= inline_unary_temps_in_body(then_body, helper_params, protected_locals);
+            changed |= inline_unary_temps_in_body(else_body, helper_params, protected_locals);
+        }
+    }
+
+    let mut index = 0;
+    while index + 1 < body.len() {
+        if let Some((dst, replacement)) = inlineable_unary_temp_assignment(body, index) {
+            if !protected_locals.contains(&dst)
+                && !unary_temp_observed_before_redefinition(body, index + 2, dst, helper_params)
+                && replace_single_local_use_in_stmt(&mut body[index + 1], dst, &replacement)
+            {
+                body.remove(index);
+                changed = true;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    changed
+}
+
+fn inlineable_unary_temp_assignment(
+    body: &[StructuredStmt],
+    index: usize,
+) -> Option<(LocalId, Expr)> {
+    let StructuredStmt::Stmt(Stmt::Assign { dst, value }) = body.get(index)? else {
+        return None;
+    };
+    let Expr::Unary { op, arg } = value else {
+        return None;
+    };
+    match op {
+        UnaryOp::Neg if matches!(arg.as_ref(), Expr::Local(_) | Expr::Const(_)) => {}
+        _ => return None,
+    }
+    let next = body.get(index + 1)?;
+    if single_rewrite_stmt_local_use_count(next, *dst) == 1 {
+        Some((*dst, value.clone()))
+    } else {
+        None
+    }
+}
+
+fn unary_temp_observed_before_redefinition(
+    body: &[StructuredStmt],
+    start: usize,
+    needle: LocalId,
+    _helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> bool {
+    for stmt in body.iter().skip(start) {
+        if structured_stmt_uses_local(stmt, needle) {
+            return true;
+        }
+        if let StructuredStmt::CallHelper(_) = stmt {
+            return true;
+        }
+        if structured_stmt_redefines_local(stmt, needle) {
+            return false;
+        }
+    }
+    false
+}
+
+fn single_rewrite_stmt_local_use_count(stmt: &StructuredStmt, needle: LocalId) -> usize {
+    match stmt {
+        StructuredStmt::Stmt(Stmt::Assign { value, .. })
+        | StructuredStmt::Stmt(Stmt::Capture { value, .. }) => expr_local_use_count(value, needle),
+        StructuredStmt::If { cond, then_body, else_body } => {
+            if body_uses_local(then_body, needle) || body_uses_local(else_body, needle) {
+                usize::MAX
+            } else {
+                expr_local_use_count(cond, needle)
+            }
+        }
+        StructuredStmt::Return(values) => values
+            .iter()
+            .map(|value| match value {
+                ReturnValue::Named { value, .. } => expr_local_use_count(value, needle),
+            })
+            .sum(),
+        StructuredStmt::Stmt(Stmt::Expr(_))
+        | StructuredStmt::Stmt(Stmt::CallEffect(_))
+        | StructuredStmt::Stmt(Stmt::Unsupported { .. })
+        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::Raise(_) => usize::MAX,
+    }
+}
+
+fn replace_single_local_use_in_stmt(
+    stmt: &mut StructuredStmt,
+    needle: LocalId,
+    replacement: &Expr,
+) -> bool {
+    match stmt {
+        StructuredStmt::Stmt(Stmt::Assign { value, .. })
+        | StructuredStmt::Stmt(Stmt::Capture { value, .. }) => {
+            replace_single_local_use_in_expr(value, needle, replacement)
+        }
+        StructuredStmt::If { cond, .. } => {
+            replace_single_local_use_in_expr(cond, needle, replacement)
+        }
+        StructuredStmt::Return(values) => {
+            let mut changed = false;
+            for value in values {
+                match value {
+                    ReturnValue::Named { value, .. } => {
+                        changed |= replace_single_local_use_in_expr(value, needle, replacement);
+                    }
+                }
+            }
+            changed
+        }
+        StructuredStmt::Stmt(Stmt::Expr(_))
+        | StructuredStmt::Stmt(Stmt::CallEffect(_))
+        | StructuredStmt::Stmt(Stmt::Unsupported { .. })
+        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::Raise(_) => false,
+    }
+}
+
+fn replace_single_local_use_in_expr(expr: &mut Expr, needle: LocalId, replacement: &Expr) -> bool {
+    if expr_local_use_count(expr, needle) != 1 {
+        return false;
+    }
+    replace_local_use_in_expr(expr, needle, replacement)
+}
+
+fn replace_local_use_in_expr(expr: &mut Expr, needle: LocalId, replacement: &Expr) -> bool {
+    match expr {
+        Expr::Local(local) if *local == needle => {
+            *expr = replacement.clone();
+            true
+        }
+        Expr::Local(_) | Expr::Const(_) => false,
+        Expr::Unary { arg, .. } => replace_local_use_in_expr(arg, needle, replacement),
+        Expr::Binary { lhs, rhs, .. } => {
+            replace_local_use_in_expr(lhs, needle, replacement)
+                | replace_local_use_in_expr(rhs, needle, replacement)
+        }
+        Expr::SimparamOpt { name, default } => {
+            replace_local_use_in_expr(name, needle, replacement)
+                | replace_local_use_in_expr(default, needle, replacement)
+        }
+        Expr::Call { args, .. } | Expr::Unsupported { args, .. } => {
+            let mut changed = false;
+            for arg in args {
+                changed |= replace_local_use_in_expr(arg, needle, replacement);
+            }
+            changed
+        }
+    }
+}
+
+fn expr_local_use_count(expr: &Expr, needle: LocalId) -> usize {
+    match expr {
+        Expr::Local(local) => usize::from(*local == needle),
+        Expr::Const(_) => 0,
+        Expr::Unary { arg, .. } => expr_local_use_count(arg, needle),
+        Expr::Binary { lhs, rhs, .. } => {
+            expr_local_use_count(lhs, needle) + expr_local_use_count(rhs, needle)
+        }
+        Expr::SimparamOpt { name, default } => {
+            expr_local_use_count(name, needle) + expr_local_use_count(default, needle)
+        }
+        Expr::Call { args, .. } | Expr::Unsupported { args, .. } => {
+            args.iter().map(|arg| expr_local_use_count(arg, needle)).sum()
+        }
+    }
+}
+
+#[derive(Default)]
 struct DeadAssignments;
 
 impl BackwardLirPass for DeadAssignments {
@@ -2017,56 +2514,6 @@ fn live_in_stmt_static(
         StructuredStmt::Raise(_) => live.clear(),
     }
     live
-}
-
-impl BackwardPassCx<'_> {
-    fn live_in_body(&self, body: &[StructuredStmt], mut live: LiveSet) -> LiveSet {
-        for stmt in body.iter().rev() {
-            live = self.live_in_stmt(stmt, live);
-        }
-        live
-    }
-
-    fn live_in_stmt(&self, stmt: &StructuredStmt, mut live: LiveSet) -> LiveSet {
-        match stmt {
-            StructuredStmt::Stmt(Stmt::Assign { dst, value }) => {
-                live.remove(*dst);
-                collect_expr_locals(value, &mut live);
-            }
-            StructuredStmt::Stmt(Stmt::Capture { value, .. }) => {
-                collect_expr_locals(value, &mut live)
-            }
-            StructuredStmt::Stmt(Stmt::CallEffect(effect)) => {
-                collect_call_effect_locals(effect, &mut live)
-            }
-            StructuredStmt::Stmt(Stmt::Expr(value)) => collect_expr_locals(value, &mut live),
-            StructuredStmt::Stmt(Stmt::Unsupported { dsts, .. }) => {
-                for dst in dsts {
-                    live.remove(*dst);
-                }
-            }
-            StructuredStmt::If { cond, then_body, else_body } => {
-                let mut then_live = self.live_in_body(then_body, live.clone());
-                let else_live = self.live_in_body(else_body, live);
-                then_live.union_with(&else_live);
-                collect_expr_locals(cond, &mut then_live);
-                live = then_live;
-            }
-            StructuredStmt::CallHelper(label) => {
-                live = LiveSet::from_locals(self.function.locals.len(), self.helper_params(*label));
-            }
-            StructuredStmt::Return(values) => {
-                live.clear();
-                for value in values {
-                    match value {
-                        ReturnValue::Named { value, .. } => collect_expr_locals(value, &mut live),
-                    }
-                }
-            }
-            StructuredStmt::Raise(_) => live.clear(),
-        }
-        live
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2746,6 +3193,292 @@ mod tests {
     }
 
     #[test]
+    fn predicate_inlining_replaces_single_use_total_bool_temp_before_if() {
+        let function = predicate_function();
+        let predicate = Expr::Binary {
+            op: BinaryOp::Lt,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Local(LocalId(1))),
+        };
+        let mut body = vec![
+            assign_expr(LocalId(2), predicate.clone()),
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(2)),
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            },
+        ];
+
+        assert!(inline_predicates_in_body(&mut body, &local_types(&function), &HashSet::new(),));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond: predicate,
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            }]
+        );
+    }
+
+    #[test]
+    fn predicate_inlining_allows_repeated_local_ids_in_disjoint_regions() {
+        let function = predicate_function();
+        let first_predicate = Expr::Binary {
+            op: BinaryOp::Lt,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Local(LocalId(1))),
+        };
+        let second_predicate = Expr::Binary {
+            op: BinaryOp::Ne,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Const(ConstValue::Int(0))),
+        };
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Binary {
+                op: BinaryOp::Gt,
+                lhs: Box::new(Expr::Local(LocalId(0))),
+                rhs: Box::new(Expr::Const(ConstValue::Int(0))),
+            },
+            then_body: vec![
+                assign_expr(LocalId(2), first_predicate.clone()),
+                StructuredStmt::If {
+                    cond: Expr::Local(LocalId(2)),
+                    then_body: vec![assign_int(LocalId(3), 1)],
+                    else_body: vec![assign_int(LocalId(3), 0)],
+                },
+            ],
+            else_body: vec![
+                assign_expr(LocalId(2), second_predicate.clone()),
+                StructuredStmt::If {
+                    cond: Expr::Local(LocalId(2)),
+                    then_body: vec![assign_int(LocalId(3), 2)],
+                    else_body: vec![assign_int(LocalId(3), 3)],
+                },
+            ],
+        }];
+
+        assert!(inline_predicates_in_body(&mut body, &local_types(&function), &HashSet::new(),));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond: Expr::Binary {
+                    op: BinaryOp::Gt,
+                    lhs: Box::new(Expr::Local(LocalId(0))),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(0))),
+                },
+                then_body: vec![StructuredStmt::If {
+                    cond: first_predicate,
+                    then_body: vec![assign_int(LocalId(3), 1)],
+                    else_body: vec![assign_int(LocalId(3), 0)],
+                }],
+                else_body: vec![StructuredStmt::If {
+                    cond: second_predicate,
+                    then_body: vec![assign_int(LocalId(3), 2)],
+                    else_body: vec![assign_int(LocalId(3), 3)],
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn predicate_inlining_replaces_negated_total_bool_temp_before_if() {
+        let function = predicate_function();
+        let predicate = Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Local(LocalId(1))),
+        };
+        let mut body = vec![
+            assign_expr(LocalId(2), predicate.clone()),
+            StructuredStmt::If {
+                cond: Expr::Unary { op: UnaryOp::Not, arg: Box::new(Expr::Local(LocalId(2))) },
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            },
+        ];
+
+        assert!(inline_predicates_in_body(&mut body, &local_types(&function), &HashSet::new(),));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond: Expr::Unary { op: UnaryOp::Not, arg: Box::new(predicate) },
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            }]
+        );
+    }
+
+    #[test]
+    fn predicate_inlining_replaces_bool_cast_temp_before_if() {
+        let function = predicate_function();
+        let predicate = Expr::Unary {
+            op: UnaryOp::Cast(LirType::Bool),
+            arg: Box::new(Expr::Local(LocalId(0))),
+        };
+        let mut body = vec![
+            assign_expr(LocalId(2), predicate.clone()),
+            StructuredStmt::If {
+                cond: Expr::Unary { op: UnaryOp::Not, arg: Box::new(Expr::Local(LocalId(2))) },
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            },
+        ];
+
+        assert!(inline_predicates_in_body(&mut body, &local_types(&function), &HashSet::new(),));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond: Expr::Unary { op: UnaryOp::Not, arg: Box::new(predicate) },
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            }]
+        );
+    }
+
+    #[test]
+    fn predicate_inlining_rejects_later_or_branch_uses() {
+        let function = predicate_function();
+        let predicate = Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Local(LocalId(1))),
+        };
+        let original = vec![
+            assign_expr(LocalId(2), predicate),
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(2)),
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            },
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "pred".to_owned(),
+                value: Expr::Local(LocalId(2)),
+            }),
+        ];
+        let mut body = original.clone();
+
+        assert!(!inline_predicates_in_body(&mut body, &local_types(&function), &HashSet::new(),));
+        assert_eq!(body, original);
+
+        let original = vec![
+            assign_expr(
+                LocalId(2),
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(Expr::Local(LocalId(0))),
+                    rhs: Box::new(Expr::Local(LocalId(1))),
+                },
+            ),
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(2)),
+                then_body: vec![StructuredStmt::Stmt(Stmt::Capture {
+                    key: "pred".to_owned(),
+                    value: Expr::Local(LocalId(2)),
+                })],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!inline_predicates_in_body(&mut body, &local_types(&function), &HashSet::new(),));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn predicate_inlining_rejects_nested_temp_live_after_parent_if() {
+        let function = predicate_function();
+        let predicate = Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Local(LocalId(1))),
+        };
+        let original = vec![
+            StructuredStmt::If {
+                cond: Expr::Binary {
+                    op: BinaryOp::Gt,
+                    lhs: Box::new(Expr::Local(LocalId(0))),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(0))),
+                },
+                then_body: vec![
+                    assign_expr(LocalId(2), predicate),
+                    StructuredStmt::If {
+                        cond: Expr::Local(LocalId(2)),
+                        then_body: vec![assign_int(LocalId(3), 1)],
+                        else_body: vec![assign_int(LocalId(3), 0)],
+                    },
+                ],
+                else_body: vec![assign_int(LocalId(3), 2)],
+            },
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "pred".to_owned(),
+                value: Expr::Local(LocalId(2)),
+            }),
+        ];
+        let mut body = original.clone();
+
+        assert!(!inline_predicates_in_body(&mut body, &local_types(&function), &HashSet::new(),));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn predicate_inlining_rejects_branch_control_boundaries() {
+        let function = predicate_function();
+        let predicate = Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Local(LocalId(1))),
+        };
+        let original = vec![
+            assign_expr(LocalId(2), predicate),
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(2)),
+                then_body: vec![StructuredStmt::CallHelper(Label(7))],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!inline_predicates_in_body(&mut body, &local_types(&function), &HashSet::new(),));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn predicate_inlining_rejects_calls_and_non_total_comparison_operands() {
+        let function = predicate_function();
+        let mut with_call = vec![
+            assign_expr(LocalId(2), Expr::Call { target: "probe".to_owned(), args: Vec::new() }),
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(2)),
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            },
+        ];
+        let mut with_div_comparison = vec![
+            assign_expr(
+                LocalId(2),
+                Expr::Binary {
+                    op: BinaryOp::Lt,
+                    lhs: Box::new(Expr::Binary {
+                        op: BinaryOp::Div,
+                        lhs: Box::new(Expr::Local(LocalId(0))),
+                        rhs: Box::new(Expr::Local(LocalId(1))),
+                    }),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(1))),
+                },
+            ),
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(2)),
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            },
+        ];
+
+        for body in [&mut with_call, &mut with_div_comparison] {
+            assert!(!inline_predicates_in_body(body, &local_types(&function), &HashSet::new(),));
+        }
+    }
+
+    #[test]
     fn branch_squash_replaces_direct_int_branch_with_cast_condition() {
         let function = bool_condition_function(LirType::Int);
         let mut body = vec![StructuredStmt::If {
@@ -2863,6 +3596,156 @@ mod tests {
     }
 
     #[test]
+    fn branch_squash_rejects_true_then_bool_local_else_to_preserve_short_circuiting() {
+        let function = bool_condition_function(LirType::Bool);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), true)],
+            else_body: vec![assign_expr(LocalId(1), Expr::Local(LocalId(2)))],
+        }];
+        let original = body.clone();
+
+        assert!(!squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_squash_rejects_false_then_bool_local_else_to_preserve_short_circuiting() {
+        let function = bool_condition_function(LirType::Bool);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), false)],
+            else_body: vec![assign_expr(LocalId(1), Expr::Local(LocalId(2)))],
+        }];
+        let original = body.clone();
+
+        assert!(!squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_squash_rejects_bool_local_then_true_else_to_preserve_short_circuiting() {
+        let function = bool_condition_function(LirType::Bool);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_expr(LocalId(1), Expr::Local(LocalId(2)))],
+            else_body: vec![assign_bool(LocalId(1), true)],
+        }];
+        let original = body.clone();
+
+        assert!(!squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_squash_rejects_bool_local_then_false_else_to_preserve_short_circuiting() {
+        let function = bool_condition_function(LirType::Bool);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_expr(LocalId(1), Expr::Local(LocalId(2)))],
+            else_body: vec![assign_bool(LocalId(1), false)],
+        }];
+        let original = body.clone();
+
+        assert!(!squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_squash_rejects_comparison_bool_expr_arm_to_preserve_short_circuiting() {
+        let function = Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "value".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(1), name_hint: "dst".to_owned(), ty: LirType::Bool },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        };
+        let cond = Expr::Binary {
+            op: BinaryOp::Ne,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Const(ConstValue::Int(0))),
+        };
+        let arm = Expr::Binary {
+            op: BinaryOp::Ne,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Const(ConstValue::Int(1))),
+        };
+        let mut body = vec![StructuredStmt::If {
+            cond: cond.clone(),
+            then_body: vec![assign_expr(LocalId(1), arm.clone())],
+            else_body: vec![assign_bool(LocalId(1), false)],
+        }];
+        let original = body.clone();
+
+        assert!(!squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_squash_rejects_effectful_and_non_bool_expr_arms() {
+        let bool_function = bool_condition_function(LirType::Bool);
+        let mut effectful = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), true)],
+            else_body: vec![assign_expr(
+                LocalId(1),
+                Expr::Call { target: "probe".to_owned(), args: Vec::new() },
+            )],
+        }];
+        let int_function = bool_condition_function(LirType::Int);
+        let mut non_bool = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), true)],
+            else_body: vec![assign_expr(LocalId(1), Expr::Local(LocalId(2)))],
+        }];
+
+        assert!(!squash_branches_in_body(&mut effectful, &local_types(&bool_function)));
+        assert!(!squash_branches_in_body(&mut non_bool, &local_types(&int_function)));
+    }
+
+    #[test]
+    fn branch_squash_rejects_comparison_over_arithmetic_bool_expr_arm() {
+        let function = Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "cond".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(1), name_hint: "dst".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(2), name_hint: "value".to_owned(), ty: LirType::Int },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        };
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), true)],
+            else_body: vec![assign_expr(
+                LocalId(1),
+                Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(Expr::Binary {
+                        op: BinaryOp::Div,
+                        lhs: Box::new(Expr::Local(LocalId(2))),
+                        rhs: Box::new(Expr::Const(ConstValue::Int(0))),
+                    }),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(1))),
+                },
+            )],
+        }];
+        let original = body.clone();
+
+        assert!(!squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
     fn branch_squash_replaces_unknown_direct_int_branch_with_cast_condition() {
         let function = bool_condition_function(LirType::Unknown);
         let mut body = vec![StructuredStmt::If {
@@ -2948,6 +3831,93 @@ mod tests {
     }
 
     #[test]
+    fn branch_squash_replaces_bool_cast_then_false_else_with_condition_and_cast() {
+        let function = bool_condition_function(LirType::Bool);
+        let cast = Expr::Unary {
+            op: UnaryOp::Cast(LirType::Bool),
+            arg: Box::new(Expr::Local(LocalId(2))),
+        };
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_expr(LocalId(1), cast.clone())],
+            else_body: vec![assign_bool(LocalId(1), false)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: Expr::Binary {
+                    op: BinaryOp::BitAnd,
+                    lhs: Box::new(Expr::Unary {
+                        op: UnaryOp::Cast(LirType::Bool),
+                        arg: Box::new(Expr::Local(LocalId(0))),
+                    }),
+                    rhs: Box::new(cast),
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_replaces_false_then_bool_cast_else_with_not_condition_and_cast() {
+        let function = bool_condition_function(LirType::Bool);
+        let cast = Expr::Unary {
+            op: UnaryOp::Cast(LirType::Bool),
+            arg: Box::new(Expr::Local(LocalId(2))),
+        };
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), false)],
+            else_body: vec![assign_expr(LocalId(1), cast.clone())],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(1),
+                value: Expr::Binary {
+                    op: BinaryOp::BitAnd,
+                    lhs: Box::new(Expr::Unary {
+                        op: UnaryOp::Not,
+                        arg: Box::new(Expr::Unary {
+                            op: UnaryOp::Cast(LirType::Bool),
+                            arg: Box::new(Expr::Local(LocalId(0))),
+                        }),
+                    }),
+                    rhs: Box::new(cast),
+                },
+            })]
+        );
+    }
+
+    #[test]
+    fn branch_squash_rejects_bool_cast_over_arithmetic_arm() {
+        let function = bool_condition_function(LirType::Bool);
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_expr(
+                LocalId(1),
+                Expr::Unary {
+                    op: UnaryOp::Cast(LirType::Bool),
+                    arg: Box::new(Expr::Binary {
+                        op: BinaryOp::Div,
+                        lhs: Box::new(Expr::Local(LocalId(2))),
+                        rhs: Box::new(Expr::Const(ConstValue::Int(0))),
+                    }),
+                },
+            )],
+            else_body: vec![assign_bool(LocalId(1), false)],
+        }];
+        let original = body.clone();
+
+        assert!(!squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
     fn branch_squash_rejects_known_incompatible_destination_type() {
         let real_function = bool_condition_function(LirType::Real);
         let mut real_body = vec![StructuredStmt::If {
@@ -2998,6 +3968,170 @@ mod tests {
         collect_optional_helper_live_ins(&body, &mut defined, &helper_params, &mut optional);
 
         assert_eq!(optional, HashSet::from([(target, LocalId(1))]));
+    }
+
+    #[test]
+    fn unary_temp_inlining_rewrites_adjacent_assignment_use() {
+        let neg = Expr::Unary { op: UnaryOp::Neg, arg: Box::new(Expr::Local(LocalId(0))) };
+        let mut body = vec![
+            assign_expr(LocalId(1), neg.clone()),
+            assign_expr(
+                LocalId(2),
+                Expr::Binary {
+                    op: BinaryOp::Mul,
+                    lhs: Box::new(Expr::Local(LocalId(1))),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(2))),
+                },
+            ),
+        ];
+
+        assert!(inline_unary_temps_in_body(&mut body, &HashMap::new(), &HashSet::new()));
+        assert_eq!(
+            body,
+            vec![assign_expr(
+                LocalId(2),
+                Expr::Binary {
+                    op: BinaryOp::Mul,
+                    lhs: Box::new(neg),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(2))),
+                },
+            )]
+        );
+    }
+
+    #[test]
+    fn unary_temp_inlining_rewrites_capture_return_and_if_condition() {
+        let neg = Expr::Unary { op: UnaryOp::Neg, arg: Box::new(Expr::Local(LocalId(0))) };
+
+        let mut capture_body = vec![
+            assign_expr(LocalId(1), neg.clone()),
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(1)),
+            }),
+        ];
+        assert!(inline_unary_temps_in_body(&mut capture_body, &HashMap::new(), &HashSet::new()));
+        assert_eq!(
+            capture_body,
+            vec![StructuredStmt::Stmt(Stmt::Capture { key: "x".to_owned(), value: neg.clone() })]
+        );
+
+        let mut return_body = vec![
+            assign_expr(LocalId(1), neg.clone()),
+            StructuredStmt::Return(vec![ReturnValue::Named {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(1)),
+            }]),
+        ];
+        assert!(inline_unary_temps_in_body(&mut return_body, &HashMap::new(), &HashSet::new()));
+        assert_eq!(
+            return_body,
+            vec![StructuredStmt::Return(vec![ReturnValue::Named {
+                key: "x".to_owned(),
+                value: neg.clone(),
+            }])]
+        );
+
+        let mut if_body = vec![
+            assign_expr(LocalId(1), neg.clone()),
+            StructuredStmt::If {
+                cond: Expr::Binary {
+                    op: BinaryOp::Lt,
+                    lhs: Box::new(Expr::Local(LocalId(1))),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(0))),
+                },
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 0)],
+            },
+        ];
+        assert!(inline_unary_temps_in_body(&mut if_body, &HashMap::new(), &HashSet::new()));
+        assert_eq!(
+            if_body,
+            vec![StructuredStmt::If {
+                cond: Expr::Binary {
+                    op: BinaryOp::Lt,
+                    lhs: Box::new(neg),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(0))),
+                },
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 0)],
+            }]
+        );
+    }
+
+    #[test]
+    fn unary_temp_inlining_rejects_multiple_use_and_non_adjacent_cases() {
+        let neg = Expr::Unary { op: UnaryOp::Neg, arg: Box::new(Expr::Local(LocalId(0))) };
+        let original = vec![
+            assign_expr(LocalId(1), neg.clone()),
+            assign_expr(
+                LocalId(2),
+                Expr::Binary {
+                    op: BinaryOp::Add,
+                    lhs: Box::new(Expr::Local(LocalId(1))),
+                    rhs: Box::new(Expr::Local(LocalId(1))),
+                },
+            ),
+        ];
+        let mut body = original.clone();
+        assert!(!inline_unary_temps_in_body(&mut body, &HashMap::new(), &HashSet::new()));
+        assert_eq!(body, original);
+
+        let original = vec![
+            assign_expr(LocalId(1), neg),
+            assign_int(LocalId(3), 4),
+            assign_expr(LocalId(2), Expr::Local(LocalId(1))),
+        ];
+        let mut body = original.clone();
+        assert!(!inline_unary_temps_in_body(&mut body, &HashMap::new(), &HashSet::new()));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn unary_temp_inlining_rejects_protected_helper_or_entry_params() {
+        let neg = Expr::Unary { op: UnaryOp::Neg, arg: Box::new(Expr::Local(LocalId(0))) };
+        let original = vec![
+            assign_expr(LocalId(1), neg),
+            assign_expr(
+                LocalId(2),
+                Expr::Binary {
+                    op: BinaryOp::Mul,
+                    lhs: Box::new(Expr::Local(LocalId(1))),
+                    rhs: Box::new(Expr::Const(ConstValue::Int(2))),
+                },
+            ),
+        ];
+        let mut body = original.clone();
+        let protected = HashSet::from([LocalId(1)]);
+
+        assert!(!inline_unary_temps_in_body(&mut body, &HashMap::new(), &protected));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn unary_temp_inlining_rejects_helper_boundary_and_later_use() {
+        let neg = Expr::Unary { op: UnaryOp::Neg, arg: Box::new(Expr::Local(LocalId(0))) };
+        let original = vec![
+            assign_expr(LocalId(1), neg.clone()),
+            StructuredStmt::CallHelper(Label(2)),
+            assign_expr(LocalId(2), Expr::Local(LocalId(1))),
+        ];
+        let mut body = original.clone();
+        let helper_params = HashMap::from([(Label(2), vec![LocalId(1)])]);
+        assert!(!inline_unary_temps_in_body(&mut body, &helper_params, &HashSet::new()));
+        assert_eq!(body, original);
+
+        let original = vec![
+            assign_expr(LocalId(1), neg),
+            assign_expr(LocalId(2), Expr::Local(LocalId(1))),
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(1)),
+            }),
+        ];
+        let mut body = original.clone();
+        assert!(!inline_unary_temps_in_body(&mut body, &HashMap::new(), &HashSet::new()));
+        assert_eq!(body, original);
     }
 
     #[test]
@@ -3185,6 +4319,10 @@ mod tests {
         StructuredStmt::Stmt(Stmt::Assign { dst, value: Expr::Const(ConstValue::Bool(value)) })
     }
 
+    fn assign_expr(dst: LocalId, value: Expr) -> StructuredStmt {
+        StructuredStmt::Stmt(Stmt::Assign { dst, value })
+    }
+
     fn assign_real(dst: LocalId, value: f64) -> StructuredStmt {
         StructuredStmt::Stmt(Stmt::Assign { dst, value: Expr::Const(ConstValue::Real(value)) })
     }
@@ -3212,6 +4350,23 @@ mod tests {
                 Local { id: LocalId(0), name_hint: "cond".to_owned(), ty: LirType::Bool },
                 Local { id: LocalId(1), name_hint: "x".to_owned(), ty: value_ty },
                 Local { id: LocalId(2), name_hint: "y".to_owned(), ty: value_ty },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        }
+    }
+
+    fn predicate_function() -> Function {
+        Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0), LocalId(1)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "a".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(1), name_hint: "b".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(2), name_hint: "pred".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(3), name_hint: "out".to_owned(), ty: LirType::Int },
             ],
             entry: Label(0),
             blocks: Vec::new(),

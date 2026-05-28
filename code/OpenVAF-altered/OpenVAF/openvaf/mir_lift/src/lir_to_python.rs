@@ -366,7 +366,9 @@ fn emit_self_loop_continue(
     let args = helper_param_arg_exprs(label, cx, assigned)?;
     if !params.is_empty() {
         let targets = params.iter().map(|param| cx.names.local(*param)).collect::<Vec<_>>();
-        writeln!(out, "{}{} = {}", pad(indent), tuple_items(&targets), tuple_items(&args))?;
+        if targets != args {
+            writeln!(out, "{}{} = {}", pad(indent), tuple_items(&targets), tuple_items(&args))?;
+        }
     }
     writeln!(out, "{}continue", pad(indent))?;
     Ok(())
@@ -1590,6 +1592,81 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn skips_identity_self_loop_transfer() {
+        let a = LocalId(0);
+        let b = LocalId(1);
+        let label = Label(4);
+        let function = Function {
+            name: "identity_loop".to_owned(),
+            params: Vec::new(),
+            locals: vec![
+                Local { id: a, name_hint: "a".to_owned(), ty: LirType::Int },
+                Local { id: b, name_hint: "b".to_owned(), ty: LirType::Int },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        };
+        let names = super::NameTable::new(&function);
+        let optional_helper_live_ins = HashSet::new();
+        let cx = super::EmitCx {
+            names: &names,
+            helper_params: HashMap::from([(label, vec![a, b])]),
+            optional_helper_live_ins: &optional_helper_live_ins,
+            helper_prefix: "identity_loop",
+            captures_outputs: false,
+            captures_effects: false,
+            output_layout: super::OutputLayout::new(&function, false),
+            current_helper: Some(label),
+        };
+        let assigned = HashSet::from([a, b]);
+        let mut emitted = String::new();
+
+        super::emit_self_loop_continue(&mut emitted, label, &cx, 2, &assigned).unwrap();
+
+        assert_eq!(emitted, "        continue\n");
+        assert!(!emitted.contains("a, b = a, b"), "{emitted}");
+    }
+
+    #[test]
+    fn preserves_non_identity_self_loop_transfer() {
+        let a = LocalId(0);
+        let b = LocalId(1);
+        let label = Label(4);
+        let function = Function {
+            name: "non_identity_loop".to_owned(),
+            params: Vec::new(),
+            locals: vec![
+                Local { id: a, name_hint: "a".to_owned(), ty: LirType::Int },
+                Local { id: b, name_hint: "b".to_owned(), ty: LirType::Int },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        };
+        let names = super::NameTable::new(&function);
+        let optional_helper_live_ins = HashSet::from([(label, b)]);
+        let cx = super::EmitCx {
+            names: &names,
+            helper_params: HashMap::from([(label, vec![a, b])]),
+            optional_helper_live_ins: &optional_helper_live_ins,
+            helper_prefix: "non_identity_loop",
+            captures_outputs: false,
+            captures_effects: false,
+            output_layout: super::OutputLayout::new(&function, false),
+            current_helper: Some(label),
+        };
+        let assigned = HashSet::from([a]);
+        let mut emitted = String::new();
+
+        super::emit_self_loop_continue(&mut emitted, label, &cx, 2, &assigned).unwrap();
+
+        assert_eq!(emitted, "        a, b = a, _LIR_UNDEF\n        continue\n");
     }
 
     #[test]

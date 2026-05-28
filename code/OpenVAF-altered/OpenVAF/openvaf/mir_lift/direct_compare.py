@@ -363,7 +363,7 @@ def main() -> int:
     work = Path(tempfile.gettempdir()) / f"mir_lift_compare_{module}"
     work.mkdir(parents=True, exist_ok=True)
     osdi = work / f"{module}.osdi"
-    py = work / f"{module}.py"
+    py = default_lifted_python_path(verilog)
 
     compile_osdi(root, verilog, osdi)
     lift_python(root, verilog, py)
@@ -1307,6 +1307,12 @@ def compile_osdi(root: Path, verilog: Path, osdi: Path) -> None:
 
 def lift_python(root: Path, verilog: Path, py: Path) -> None:
     run([sys.executable, str(root / "mir_lift_runner.py"), str(verilog), "-o", str(py)], cwd=root)
+
+
+def default_lifted_python_path(verilog: Path) -> Path:
+    output = Path(tempfile.gettempdir()) / "mir_lift_current" / f"{verilog.stem}.py"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    return output
 
 
 def run(cmd: list[str], cwd: Path) -> None:

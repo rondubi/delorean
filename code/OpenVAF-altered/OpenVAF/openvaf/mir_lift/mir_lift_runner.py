@@ -8,6 +8,11 @@ import subprocess
 from pathlib import Path
 
 
+def default_output_path(verilog_file: Path) -> Path:
+    output_dir = Path("/tmp/mir_lift_current")
+    return output_dir / f"{verilog_file.stem}.py"
+
+
 def main() -> int:
     script_path = Path(__file__).resolve()
     crate_root = script_path.parent
@@ -24,8 +29,9 @@ def main() -> int:
     output = (
         Path(args.output).expanduser().resolve()
         if args.output
-        else verilog_file.with_suffix(".py")
+        else default_output_path(verilog_file)
     )
+    output.parent.mkdir(parents=True, exist_ok=True)
     before_mtime = output.stat().st_mtime_ns if output.exists() else None
 
     env = os.environ.copy()

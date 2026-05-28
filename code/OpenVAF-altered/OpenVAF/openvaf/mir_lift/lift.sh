@@ -26,6 +26,8 @@ usage:
 
 Any extra arguments are passed through to the runner, for example:
   ./lift.sh diode -o /tmp/diode_lir.py
+
+Without -o, lifted Python is written to /tmp/mir_lift_current/<input-stem>.py.
 EOF
         exit 0
         ;;
