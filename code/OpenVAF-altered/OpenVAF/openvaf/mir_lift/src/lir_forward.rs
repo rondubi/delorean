@@ -164,6 +164,15 @@ fn reduce_strength_expr(expr: Expr, local_types: &[crate::lir::LirType]) -> Expr
             lhs: Box::new(reduce_strength_expr(*lhs, local_types)),
             rhs: Box::new(reduce_strength_expr(*rhs, local_types)),
         },
+        Expr::Abs { arg } => Expr::Abs { arg: Box::new(reduce_strength_expr(*arg, local_types)) },
+        Expr::Max { lhs, rhs } => Expr::Max {
+            lhs: Box::new(reduce_strength_expr(*lhs, local_types)),
+            rhs: Box::new(reduce_strength_expr(*rhs, local_types)),
+        },
+        Expr::Min { lhs, rhs } => Expr::Min {
+            lhs: Box::new(reduce_strength_expr(*lhs, local_types)),
+            rhs: Box::new(reduce_strength_expr(*rhs, local_types)),
+        },
         Expr::SimparamOpt { name, default } => Expr::SimparamOpt {
             name: Box::new(reduce_strength_expr(*name, local_types)),
             default: Box::new(reduce_strength_expr(*default, local_types)),
@@ -382,6 +391,17 @@ fn rewrite_common_subexpressions(
             lhs: Box::new(rewrite_common_subexpressions(*lhs, versions, available)),
             rhs: Box::new(rewrite_common_subexpressions(*rhs, versions, available)),
         },
+        Expr::Abs { arg } => {
+            Expr::Abs { arg: Box::new(rewrite_common_subexpressions(*arg, versions, available)) }
+        }
+        Expr::Max { lhs, rhs } => Expr::Max {
+            lhs: Box::new(rewrite_common_subexpressions(*lhs, versions, available)),
+            rhs: Box::new(rewrite_common_subexpressions(*rhs, versions, available)),
+        },
+        Expr::Min { lhs, rhs } => Expr::Min {
+            lhs: Box::new(rewrite_common_subexpressions(*lhs, versions, available)),
+            rhs: Box::new(rewrite_common_subexpressions(*rhs, versions, available)),
+        },
         Expr::SimparamOpt { name, default } => Expr::SimparamOpt {
             name: Box::new(rewrite_common_subexpressions(*name, versions, available)),
             default: Box::new(rewrite_common_subexpressions(*default, versions, available)),
@@ -425,6 +445,10 @@ fn expr_has_side_effects(expr: &Expr) -> bool {
         Expr::Call { .. } | Expr::Unsupported { .. } => true,
         Expr::Unary { arg, .. } => expr_has_side_effects(arg),
         Expr::Binary { lhs, rhs, .. } => expr_has_side_effects(lhs) || expr_has_side_effects(rhs),
+        Expr::Abs { arg } => expr_has_side_effects(arg),
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            expr_has_side_effects(lhs) || expr_has_side_effects(rhs)
+        }
         Expr::SimparamOpt { name, default } => {
             expr_has_side_effects(name) || expr_has_side_effects(default)
         }
@@ -448,6 +472,7 @@ fn expr_type(expr: &Expr, local_types: &[crate::lir::LirType]) -> Option<crate::
         Expr::Unary { op: UnaryOp::Neg, arg } => expr_type(arg, local_types),
         Expr::Unary { op: UnaryOp::Cast(ty), .. } => Some(*ty),
         Expr::Unary { op: UnaryOp::Math1(_), .. } => Some(crate::lir::LirType::Real),
+        Expr::Abs { arg } => expr_type(arg, local_types),
         Expr::Binary { op, lhs, .. } => match op {
             BinaryOp::Add
             | BinaryOp::Sub
@@ -467,8 +492,22 @@ fn expr_type(expr: &Expr, local_types: &[crate::lir::LirType]) -> Option<crate::
             | BinaryOp::Ge => Some(crate::lir::LirType::Bool),
             BinaryOp::Math2(_) => Some(crate::lir::LirType::Real),
         },
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            Some(merge_expr_types(expr_type(lhs, local_types)?, expr_type(rhs, local_types)?))
+        }
         Expr::SimparamOpt { default, .. } => expr_type(default, local_types),
         Expr::Call { .. } | Expr::Unsupported { .. } => None,
+    }
+}
+
+fn merge_expr_types(lhs: crate::lir::LirType, rhs: crate::lir::LirType) -> crate::lir::LirType {
+    use crate::lir::LirType::*;
+    match (lhs, rhs) {
+        (same_lhs, same_rhs) if same_lhs == same_rhs => same_lhs,
+        (Unknown, ty) | (ty, Unknown) => ty,
+        (Real, Int | Bool) | (Int | Bool, Real) => Real,
+        (Int, Bool) | (Bool, Int) => Int,
+        _ => Unknown,
     }
 }
 
@@ -478,6 +517,9 @@ enum ExprKey {
     Const(ConstKey),
     Unary { op: UnaryOp, arg: Box<ExprKey> },
     Binary { op: BinaryOp, lhs: Box<ExprKey>, rhs: Box<ExprKey> },
+    Abs { arg: Box<ExprKey> },
+    Max { lhs: Box<ExprKey>, rhs: Box<ExprKey> },
+    Min { lhs: Box<ExprKey>, rhs: Box<ExprKey> },
     SimparamOpt { name: Box<ExprKey>, default: Box<ExprKey> },
 }
 
@@ -499,6 +541,15 @@ fn expr_key(expr: &Expr, versions: &[usize]) -> Option<ExprKey> {
         }
         Expr::Binary { op, lhs, rhs } => Some(ExprKey::Binary {
             op: *op,
+            lhs: Box::new(expr_key(lhs, versions)?),
+            rhs: Box::new(expr_key(rhs, versions)?),
+        }),
+        Expr::Abs { arg } => Some(ExprKey::Abs { arg: Box::new(expr_key(arg, versions)?) }),
+        Expr::Max { lhs, rhs } => Some(ExprKey::Max {
+            lhs: Box::new(expr_key(lhs, versions)?),
+            rhs: Box::new(expr_key(rhs, versions)?),
+        }),
+        Expr::Min { lhs, rhs } => Some(ExprKey::Min {
             lhs: Box::new(expr_key(lhs, versions)?),
             rhs: Box::new(expr_key(rhs, versions)?),
         }),
@@ -674,8 +725,17 @@ fn rewrite_expr(expr: Expr, env: &ConstEnv) -> Expr {
             return get_const(env, local).cloned().map(Expr::Const).unwrap_or(Expr::Local(local));
         }
         Expr::Unary { op, arg } => Expr::Unary { op, arg: Box::new(rewrite_expr(*arg, env)) },
+        Expr::Abs { arg } => Expr::Abs { arg: Box::new(rewrite_expr(*arg, env)) },
         Expr::Binary { op, lhs, rhs } => Expr::Binary {
             op,
+            lhs: Box::new(rewrite_expr(*lhs, env)),
+            rhs: Box::new(rewrite_expr(*rhs, env)),
+        },
+        Expr::Max { lhs, rhs } => Expr::Max {
+            lhs: Box::new(rewrite_expr(*lhs, env)),
+            rhs: Box::new(rewrite_expr(*rhs, env)),
+        },
+        Expr::Min { lhs, rhs } => Expr::Min {
             lhs: Box::new(rewrite_expr(*lhs, env)),
             rhs: Box::new(rewrite_expr(*rhs, env)),
         },

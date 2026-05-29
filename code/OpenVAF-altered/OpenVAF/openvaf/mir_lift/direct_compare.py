@@ -1310,7 +1310,12 @@ def lift_python(root: Path, verilog: Path, py: Path) -> None:
 
 
 def default_lifted_python_path(verilog: Path) -> Path:
-    output = Path(tempfile.gettempdir()) / "mir_lift_current" / f"{verilog.stem}.py"
+    output_dir = os.environ.get("MIR_LIFT_CURRENT_DIR")
+    output = (
+        Path(output_dir).expanduser()
+        if output_dir
+        else Path(tempfile.gettempdir()) / "mir_lift_current"
+    ) / f"{verilog.stem}.py"
     output.parent.mkdir(parents=True, exist_ok=True)
     return output
 

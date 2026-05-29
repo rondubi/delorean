@@ -221,6 +221,9 @@ fn expr(value: &Expr, names: &NameTable) -> Result<String> {
         Expr::Const(ConstValue::None) => "None".to_owned(),
         Expr::Unary { op, arg } => unary_expr(*op, expr(arg, names)?),
         Expr::Binary { op, lhs, rhs } => binary_expr(*op, expr(lhs, names)?, expr(rhs, names)?),
+        Expr::Abs { arg } => format!("abs({})", expr(arg, names)?),
+        Expr::Max { lhs, rhs } => format!("max({}, {})", expr(lhs, names)?, expr(rhs, names)?),
+        Expr::Min { lhs, rhs } => format!("min({}, {})", expr(lhs, names)?, expr(rhs, names)?),
         Expr::SimparamOpt { name, default } => {
             format!("_lir_simparam_opt({}, {})", expr(name, names)?, expr(default, names)?)
         }
@@ -558,6 +561,11 @@ fn collect_expr_local_ids(expr: &Expr, locals: &mut Vec<LocalId>) {
             collect_expr_local_ids(lhs, locals);
             collect_expr_local_ids(rhs, locals);
         }
+        Expr::Abs { arg } => collect_expr_local_ids(arg, locals),
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            collect_expr_local_ids(lhs, locals);
+            collect_expr_local_ids(rhs, locals);
+        }
         Expr::SimparamOpt { name, default } => {
             collect_expr_local_ids(name, locals);
             collect_expr_local_ids(default, locals);
@@ -705,6 +713,7 @@ fn expr_lir_type(value: &Expr, function: &Function) -> LirType {
             UnaryOp::Cast(ty) => *ty,
             UnaryOp::Math1(_) => LirType::Real,
         },
+        Expr::Abs { arg } => expr_lir_type(arg, function),
         Expr::Binary { op, lhs, rhs } => match op {
             BinaryOp::Eq
             | BinaryOp::Ne
@@ -722,6 +731,9 @@ fn expr_lir_type(value: &Expr, function: &Function) -> LirType {
                 merged_lir_type(expr_lir_type(lhs, function), expr_lir_type(rhs, function))
             }
         },
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            merged_lir_type(expr_lir_type(lhs, function), expr_lir_type(rhs, function))
+        }
         Expr::SimparamOpt { default, .. } => expr_lir_type(default, function),
         Expr::Call { .. } | Expr::Unsupported { .. } => LirType::Unknown,
     }
@@ -1294,6 +1306,37 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn emits_abs_expression_directly() {
+        let x = LocalId(0);
+        let out = LocalId(1);
+        let function = Function {
+            name: "abs_expr".to_owned(),
+            params: vec![x],
+            locals: vec![
+                Local { id: x, name_hint: "x".to_owned(), ty: LirType::Real },
+                Local { id: out, name_hint: "out".to_owned(), ty: LirType::Real },
+            ],
+            entry: Label(0),
+            blocks: vec![Block {
+                label: Label(0),
+                stmts: vec![Stmt::Assign {
+                    dst: out,
+                    value: Expr::Abs { arg: Box::new(Expr::Local(x)) },
+                }],
+                term: Terminator::Return(vec![ReturnValue::Named {
+                    key: "value".to_owned(),
+                    value: Expr::Local(out),
+                }]),
+            }],
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        };
+
+        let emitted = emit_function(&function).unwrap();
+        assert!(emitted.contains("out = abs(x)"), "{emitted}");
     }
 
     #[test]

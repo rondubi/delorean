@@ -7,7 +7,7 @@ use crate::lir::{
 use crate::lir_structure::{StructuredFunction, StructuredStmt};
 
 const DEFAULT_CLEANUP_ROUNDS: usize = 12;
-const DEFAULT_FINAL_DCE_ROUNDS: usize = 3;
+const DEFAULT_LATE_CLEANUP_ROUNDS: usize = 3;
 const DEFAULT_POST_DCE_CLEANUP_ROUNDS: usize = 0;
 const SMALL_HELPER_STMT_LIMIT: usize = 12;
 const COST_INLINE_HELPER_CALL_LIMIT: usize = 3;
@@ -25,7 +25,7 @@ pub(crate) struct BackwardFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BackwardRoundCounts {
     cleanup: usize,
-    final_dce: usize,
+    late_cleanup: usize,
     post_dce_cleanup: usize,
 }
 
@@ -33,7 +33,11 @@ impl BackwardRoundCounts {
     fn from_env() -> Self {
         Self {
             cleanup: env_round_count("MIR_LIFT_LIR_CLEANUP_ROUNDS", DEFAULT_CLEANUP_ROUNDS),
-            final_dce: env_round_count("MIR_LIFT_LIR_FINAL_DCE_ROUNDS", DEFAULT_FINAL_DCE_ROUNDS),
+            late_cleanup: env_round_count_with_fallback(
+                "MIR_LIFT_LIR_LATE_CLEANUP_ROUNDS",
+                "MIR_LIFT_LIR_FINAL_DCE_ROUNDS",
+                DEFAULT_LATE_CLEANUP_ROUNDS,
+            ),
             post_dce_cleanup: env_round_count(
                 "MIR_LIFT_LIR_POST_DCE_CLEANUP_ROUNDS",
                 DEFAULT_POST_DCE_CLEANUP_ROUNDS,
@@ -44,6 +48,14 @@ impl BackwardRoundCounts {
 
 fn env_round_count(name: &str, default: usize) -> usize {
     std::env::var(name).ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(default)
+}
+
+fn env_round_count_with_fallback(name: &str, fallback_name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .or_else(|| std::env::var(fallback_name).ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 const DISABLED_PASSES: &[BackwardPassKind] = &[BackwardPassKind::HelperLiveIns];
@@ -82,16 +94,20 @@ const STRUCTURAL_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::HelperComputationPushUp,
     BackwardPassKind::HelperSignaturePruning,
 ];
-const FINAL_DCE_PASSES: &[BackwardPassKind] = &[
+const LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::DropNonSemanticEffects,
     BackwardPassKind::BranchInvariantHoist,
+    BackwardPassKind::BranchMerge,
     BackwardPassKind::BranchSquash,
+    BackwardPassKind::AggressiveScalarSelectRecovery,
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::UnaryTempInlining,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::BranchInvariantHoist,
+    BackwardPassKind::BranchMerge,
     BackwardPassKind::BranchSquash,
+    BackwardPassKind::AggressiveScalarSelectRecovery,
     BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::UnaryTempInlining,
     BackwardPassKind::DeadAssignments,
@@ -116,8 +132,8 @@ pub(crate) fn run_backward_passes(
         BackwardPipeline { name: "lir-backward-cleanup", passes: CLEANUP_PASSES };
     let structural_pipeline =
         BackwardPipeline { name: "lir-backward-structural", passes: STRUCTURAL_PASSES };
-    let final_dce_pipeline =
-        BackwardPipeline { name: "lir-backward-final-dce", passes: FINAL_DCE_PASSES };
+    let late_cleanup_pipeline =
+        BackwardPipeline { name: "lir-backward-late-cleanup", passes: LATE_CLEANUP_PASSES };
     let rounds = BackwardRoundCounts::from_env();
 
     for _ in 0..rounds.cleanup {
@@ -128,9 +144,12 @@ pub(crate) fn run_backward_passes(
 
     structural_pipeline.run(&mut BackwardPassCx { function, structured, facts: &mut facts });
 
-    for _ in 0..rounds.final_dce {
-        if !final_dce_pipeline.run(&mut BackwardPassCx { function, structured, facts: &mut facts })
-        {
+    for _ in 0..rounds.late_cleanup {
+        if !late_cleanup_pipeline.run(&mut BackwardPassCx {
+            function,
+            structured,
+            facts: &mut facts,
+        }) {
             break;
         }
     }
@@ -161,8 +180,10 @@ enum BackwardPassKind {
     CostBasedHelperInlining,
     StructuredSimplify,
     BranchInvariantHoist,
+    BranchMerge,
     PredicateInlining,
     BranchSquash,
+    AggressiveScalarSelectRecovery,
     HelperComputationPushUp,
     HelperLiveIns,
     OptionalHelperLiveIns,
@@ -181,8 +202,10 @@ impl BackwardPassKind {
             Self::CostBasedHelperInlining => "cost-based-helper-inlining",
             Self::StructuredSimplify => "structured-simplify",
             Self::BranchInvariantHoist => "branch-invariant-hoist",
+            Self::BranchMerge => "branch-merge",
             Self::PredicateInlining => "predicate-inlining",
             Self::BranchSquash => "branch-squash",
+            Self::AggressiveScalarSelectRecovery => "aggressive-scalar-select-recovery",
             Self::HelperComputationPushUp => "helper-computation-push-up",
             Self::HelperLiveIns => "helper-live-ins",
             Self::OptionalHelperLiveIns => "optional-helper-live-ins",
@@ -201,8 +224,12 @@ impl BackwardPassKind {
             Self::CostBasedHelperInlining => run_backward_pass::<CostBasedHelperInlining>(cx),
             Self::StructuredSimplify => run_backward_pass::<StructuredSimplify>(cx),
             Self::BranchInvariantHoist => run_backward_pass::<BranchInvariantHoist>(cx),
+            Self::BranchMerge => run_backward_pass::<BranchMerge>(cx),
             Self::PredicateInlining => run_backward_pass::<PredicateInlining>(cx),
             Self::BranchSquash => run_backward_pass::<BranchSquash>(cx),
+            Self::AggressiveScalarSelectRecovery => {
+                run_backward_pass::<AggressiveScalarSelectRecovery>(cx)
+            }
             Self::HelperComputationPushUp => run_backward_pass::<HelperComputationPushUp>(cx),
             Self::HelperLiveIns => run_backward_pass::<HelperLiveIns>(cx),
             Self::OptionalHelperLiveIns => run_backward_pass::<OptionalHelperLiveIns>(cx),
@@ -701,6 +728,10 @@ fn expr_text_cost(function: &Function, expr: &Expr) -> usize {
         Expr::Binary { lhs, rhs, .. } => {
             8 + expr_text_cost(function, lhs) + expr_text_cost(function, rhs)
         }
+        Expr::Abs { arg } => 5 + expr_text_cost(function, arg),
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            8 + expr_text_cost(function, lhs) + expr_text_cost(function, rhs)
+        }
         Expr::SimparamOpt { name, default } => {
             16 + expr_text_cost(function, name) + expr_text_cost(function, default)
         }
@@ -890,6 +921,303 @@ fn hoistable_pure_assignment_dst(stmt: &StructuredStmt) -> Option<LocalId> {
 }
 
 #[derive(Default)]
+struct BranchMerge;
+
+impl BackwardLirPass for BranchMerge {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let local_types = local_types(cx.function);
+        let mut changed =
+            merge_matching_condition_branches_in_body(&mut cx.structured.body, &local_types);
+        for helper in &mut cx.structured.helpers {
+            changed |= merge_matching_condition_branches_in_body(&mut helper.body, &local_types);
+        }
+        changed
+    }
+}
+
+fn merge_matching_condition_branches_in_body(
+    body: &mut Vec<StructuredStmt>,
+    local_types: &[LirType],
+) -> bool {
+    let mut changed = false;
+    for stmt in body.iter_mut() {
+        changed |= merge_matching_condition_branches_in_stmt(stmt, local_types);
+    }
+
+    let mut stmt_summaries = body.iter().map(summarize_structured_stmt).collect::<Vec<_>>();
+    let mut index = 0;
+    while index + 1 < body.len() {
+        if let Some((second_index, merged, middle)) =
+            merged_branch_pair(body, &stmt_summaries, index, local_types)
+        {
+            body[index] = merged;
+            body.splice(index + 1..=second_index, middle);
+            stmt_summaries = body.iter().map(summarize_structured_stmt).collect::<Vec<_>>();
+            changed = true;
+            continue;
+        }
+        index += 1;
+    }
+
+    changed
+}
+
+fn merge_matching_condition_branches_in_stmt(
+    stmt: &mut StructuredStmt,
+    local_types: &[LirType],
+) -> bool {
+    match stmt {
+        StructuredStmt::If { then_body, else_body, .. } => {
+            merge_matching_condition_branches_in_body(then_body, local_types)
+                | merge_matching_condition_branches_in_body(else_body, local_types)
+        }
+        StructuredStmt::Stmt(_)
+        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::Return(_)
+        | StructuredStmt::Raise(_) => false,
+    }
+}
+
+fn merged_branch_pair(
+    body: &[StructuredStmt],
+    stmt_summaries: &[RegionSummary],
+    index: usize,
+    local_types: &[LirType],
+) -> Option<(usize, StructuredStmt, Vec<StructuredStmt>)> {
+    let mut middle_summary = RegionSummary::default();
+    for second_index in index + 1..body.len() {
+        if !middle_summary.is_allowed_intervening_region() {
+            return None;
+        }
+        if let Some((merged, middle)) =
+            merged_branch_pair_at(body, index, second_index, local_types, &middle_summary)
+        {
+            return Some((second_index, merged, middle));
+        }
+        middle_summary.absorb(stmt_summaries[second_index].clone());
+    }
+    None
+}
+
+fn merged_branch_pair_at(
+    body: &[StructuredStmt],
+    index: usize,
+    second_index: usize,
+    local_types: &[LirType],
+    middle_summary: &RegionSummary,
+) -> Option<(StructuredStmt, Vec<StructuredStmt>)> {
+    let StructuredStmt::If { cond: first_cond, then_body: first_then, else_body: first_else } =
+        body.get(index)?
+    else {
+        return None;
+    };
+    let StructuredStmt::If { cond: second_cond, then_body: second_then, else_body: second_else } =
+        body.get(second_index)?
+    else {
+        return None;
+    };
+    let middle = &body[index + 1..second_index];
+
+    if first_cond != second_cond || !is_stable_branch_merge_condition(first_cond, local_types) {
+        return None;
+    }
+    let first_then_summary = summarize_region(first_then);
+    let first_else_summary = summarize_region(first_else);
+    let second_then_summary = summarize_region(second_then);
+    let second_else_summary = summarize_region(second_else);
+    if !first_then_summary.is_allowed_branch_region()
+        || !first_else_summary.is_allowed_branch_region()
+        || !second_then_summary.is_allowed_branch_region()
+        || !second_else_summary.is_allowed_branch_region()
+    {
+        return None;
+    }
+    let mut cond_locals = Vec::new();
+    collect_expr_local_ids(first_cond, &mut cond_locals);
+    if region_writes_any(&first_then_summary, &cond_locals)
+        || region_writes_any(&first_else_summary, &cond_locals)
+        || region_writes_any(middle_summary, &cond_locals)
+    {
+        return None;
+    }
+    if !separated_branch_merge_dependencies_are_safe(
+        middle_summary,
+        &second_then_summary,
+        &second_else_summary,
+    ) {
+        return None;
+    }
+
+    let mut then_body = Vec::with_capacity(first_then.len() + second_then.len());
+    then_body.extend(first_then.iter().cloned());
+    then_body.extend(second_then.iter().cloned());
+
+    let mut else_body = Vec::with_capacity(first_else.len() + second_else.len());
+    else_body.extend(first_else.iter().cloned());
+    else_body.extend(second_else.iter().cloned());
+
+    Some((StructuredStmt::If { cond: first_cond.clone(), then_body, else_body }, middle.to_vec()))
+}
+
+fn separated_branch_merge_dependencies_are_safe(
+    middle: &RegionSummary,
+    second_then: &RegionSummary,
+    second_else: &RegionSummary,
+) -> bool {
+    if middle.is_empty() {
+        return true;
+    }
+
+    let mut branch_reads = second_then.reads.clone();
+    branch_reads.extend(second_else.reads.iter().copied());
+
+    let mut second_writes = second_then.writes.clone();
+    second_writes.extend(second_else.writes.iter().copied());
+
+    let mut second_capture_keys = second_then.capture_keys.clone();
+    second_capture_keys.extend(second_else.capture_keys.iter().cloned());
+    branch_reads.is_disjoint(&middle.writes)
+        && second_writes.is_disjoint(&middle.reads)
+        && second_writes.is_disjoint(&middle.writes)
+        && second_capture_keys.is_disjoint(&middle.capture_keys)
+}
+
+fn is_stable_branch_merge_condition(expr: &Expr, local_types: &[LirType]) -> bool {
+    if is_total_predicate_expr(expr, local_types) {
+        return true;
+    }
+
+    matches!(expr, Expr::Local(local) if local_types.get(local.0).is_some())
+}
+
+#[derive(Clone, Debug, Default)]
+struct RegionSummary {
+    reads: HashSet<LocalId>,
+    writes: HashSet<LocalId>,
+    has_control_exit: bool,
+    has_helper_call: bool,
+    has_unsupported: bool,
+    has_call_effect: bool,
+    has_capture: bool,
+    has_expr_side_effect: bool,
+    capture_keys: HashSet<String>,
+    stmt_count: usize,
+}
+
+impl RegionSummary {
+    fn is_empty(&self) -> bool {
+        self.stmt_count == 0
+    }
+
+    fn has_blocking_effect(&self) -> bool {
+        self.has_control_exit
+            || self.has_helper_call
+            || self.has_unsupported
+            || self.has_call_effect
+            || self.has_expr_side_effect
+    }
+
+    fn is_allowed_branch_region(&self) -> bool {
+        !self.has_blocking_effect()
+    }
+
+    fn is_allowed_intervening_region(&self) -> bool {
+        !self.has_blocking_effect()
+    }
+
+    fn absorb(&mut self, other: RegionSummary) {
+        self.reads.extend(other.reads);
+        self.writes.extend(other.writes);
+        self.has_control_exit |= other.has_control_exit;
+        self.has_helper_call |= other.has_helper_call;
+        self.has_unsupported |= other.has_unsupported;
+        self.has_call_effect |= other.has_call_effect;
+        self.has_capture |= other.has_capture;
+        self.has_expr_side_effect |= other.has_expr_side_effect;
+        self.capture_keys.extend(other.capture_keys);
+        self.stmt_count += other.stmt_count;
+    }
+}
+
+fn summarize_region(body: &[StructuredStmt]) -> RegionSummary {
+    let mut summary = RegionSummary::default();
+    for stmt in body {
+        summary.absorb(summarize_structured_stmt(stmt));
+    }
+    summary
+}
+
+fn summarize_structured_stmt(stmt: &StructuredStmt) -> RegionSummary {
+    let mut summary = RegionSummary { stmt_count: 1, ..RegionSummary::default() };
+    match stmt {
+        StructuredStmt::Stmt(Stmt::Assign { dst, value }) => {
+            summary.writes.insert(*dst);
+            collect_expr_locals_into_set(value, &mut summary.reads);
+            summary.has_expr_side_effect |= expr_has_side_effects(value);
+        }
+        StructuredStmt::Stmt(Stmt::Capture { key, value }) => {
+            collect_expr_locals_into_set(value, &mut summary.reads);
+            summary.has_capture = true;
+            summary.capture_keys.insert(key.clone());
+            summary.has_expr_side_effect |= expr_has_side_effects(value);
+        }
+        StructuredStmt::Stmt(Stmt::CallEffect(effect)) => {
+            collect_call_effect_locals_into_set(effect, &mut summary.reads);
+            summary.has_call_effect = true;
+        }
+        StructuredStmt::Stmt(Stmt::Expr(value)) => {
+            collect_expr_locals_into_set(value, &mut summary.reads);
+            summary.has_expr_side_effect |= expr_has_side_effects(value);
+        }
+        StructuredStmt::Stmt(Stmt::Unsupported { dsts, .. }) => {
+            summary.writes.extend(dsts.iter().copied());
+            summary.has_unsupported = true;
+        }
+        StructuredStmt::If { cond, then_body, else_body } => {
+            collect_expr_locals_into_set(cond, &mut summary.reads);
+            summary.has_expr_side_effect |= expr_has_side_effects(cond);
+            summary.absorb(summarize_region(then_body));
+            summary.absorb(summarize_region(else_body));
+        }
+        StructuredStmt::CallHelper(_) => {
+            summary.has_helper_call = true;
+        }
+        StructuredStmt::Return(values) => {
+            for value in values {
+                collect_return_value_locals_into_set(value, &mut summary.reads);
+            }
+            summary.has_control_exit = true;
+        }
+        StructuredStmt::Raise(_) => {
+            summary.has_control_exit = true;
+        }
+    }
+    summary
+}
+
+fn region_writes_any(summary: &RegionSummary, locals: &[LocalId]) -> bool {
+    locals.iter().any(|local| summary.writes.contains(local))
+}
+
+fn collect_expr_locals_into_set(expr: &Expr, locals: &mut HashSet<LocalId>) {
+    let mut ids = Vec::new();
+    collect_expr_local_ids(expr, &mut ids);
+    locals.extend(ids);
+}
+
+fn collect_return_value_locals_into_set(value: &ReturnValue, locals: &mut HashSet<LocalId>) {
+    match value {
+        ReturnValue::Named { value, .. } => collect_expr_locals_into_set(value, locals),
+    }
+}
+
+fn collect_call_effect_locals_into_set(effect: &CallEffect, locals: &mut HashSet<LocalId>) {
+    let mut ids = Vec::new();
+    collect_call_effect_local_ids(effect, &mut ids);
+    locals.extend(ids);
+}
+
+#[derive(Default)]
 struct PredicateInlining;
 
 impl BackwardLirPass for PredicateInlining {
@@ -1015,6 +1343,10 @@ fn expr_node_count(expr: &Expr) -> usize {
         Expr::Local(_) | Expr::Const(_) => 1,
         Expr::Unary { arg, .. } => 1 + expr_node_count(arg),
         Expr::Binary { lhs, rhs, .. } => 1 + expr_node_count(lhs) + expr_node_count(rhs),
+        Expr::Abs { arg } => 1 + expr_node_count(arg),
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            1 + expr_node_count(lhs) + expr_node_count(rhs)
+        }
         Expr::SimparamOpt { name, default } => 1 + expr_node_count(name) + expr_node_count(default),
         Expr::Call { args, .. } | Expr::Unsupported { args, .. } => {
             1 + args.iter().map(expr_node_count).sum::<usize>()
@@ -1123,16 +1455,27 @@ impl BackwardLirPass for BranchSquash {
     }
 }
 
-fn squash_branches_in_body(body: &mut [StructuredStmt], local_types: &[LirType]) -> bool {
+fn squash_branches_in_body(body: &mut Vec<StructuredStmt>, local_types: &[LirType]) -> bool {
     let mut changed = false;
-    for stmt in body {
+    for stmt in body.iter_mut() {
         changed |= squash_branches_in_stmt(stmt, local_types);
+    }
+
+    let mut index = 0;
+    while index < body.len() {
+        let Some(replacement) = squashed_branch_assignments(&body[index], local_types) else {
+            index += 1;
+            continue;
+        };
+        body.splice(index..=index, replacement);
+        index += 1;
+        changed = true;
     }
     changed
 }
 
 fn squash_branches_in_stmt(stmt: &mut StructuredStmt, local_types: &[LirType]) -> bool {
-    let mut changed = match stmt {
+    let changed = match stmt {
         StructuredStmt::If { then_body, else_body, .. } => {
             squash_branches_in_body(then_body, local_types)
                 | squash_branches_in_body(else_body, local_types)
@@ -1143,37 +1486,43 @@ fn squash_branches_in_stmt(stmt: &mut StructuredStmt, local_types: &[LirType]) -
         | StructuredStmt::Raise(_) => false,
     };
 
-    if let Some(replacement) = squashed_branch_assignment(stmt, local_types) {
-        *stmt = replacement;
-        changed = true;
-    }
-
     changed
 }
 
-fn squashed_branch_assignment(
+fn squashed_branch_assignments(
     stmt: &StructuredStmt,
     local_types: &[LirType],
-) -> Option<StructuredStmt> {
+) -> Option<Vec<StructuredStmt>> {
     let StructuredStmt::If { cond, then_body, else_body } = stmt else {
         return None;
     };
     if expr_has_side_effects(cond) || expr_type(cond, local_types) != Some(LirType::Bool) {
         return None;
     }
-
-    let (dst, then_value) = single_assignment(then_body)?;
-    let (else_dst, else_value) = single_assignment(else_body)?;
-    if dst != else_dst {
+    if then_body.len() != else_body.len() || then_body.is_empty() {
         return None;
     }
 
-    let dst_ty = *local_types.get(dst.0)?;
-    let value = squashed_bool_expr_branch_expr(cond, then_value, else_value, dst_ty, local_types)
-        .or_else(|| squashed_boolish_branch_expr(cond, then_value, else_value, dst_ty))
-        .or_else(|| squashed_int_const_branch_expr(cond, then_value, else_value, dst_ty))?;
+    let is_multi_assignment = then_body.len() > 1;
+    let mut replacements = Vec::with_capacity(then_body.len());
+    for (then_stmt, else_stmt) in then_body.iter().zip(else_body) {
+        let (dst, then_value) = assignment_stmt(then_stmt)?;
+        let (else_dst, else_value) = assignment_stmt(else_stmt)?;
+        if dst != else_dst {
+            return None;
+        }
+        let dst_ty = *local_types.get(dst.0)?;
+        let value =
+            squashed_bool_expr_branch_expr(cond, then_value, else_value, dst_ty, local_types)
+                .or_else(|| squashed_boolish_branch_expr(cond, then_value, else_value, dst_ty))
+                .or_else(|| squashed_int_const_branch_expr(cond, then_value, else_value, dst_ty))?;
+        if is_multi_assignment && expr_type(&value, local_types) != Some(LirType::Bool) {
+            return None;
+        }
+        replacements.push(StructuredStmt::Stmt(Stmt::Assign { dst, value }));
+    }
 
-    Some(StructuredStmt::Stmt(Stmt::Assign { dst, value }))
+    Some(replacements)
 }
 
 fn squashed_bool_expr_branch_expr(
@@ -1277,6 +1626,13 @@ fn single_assignment(body: &[StructuredStmt]) -> Option<(LocalId, &Expr)> {
     Some((*dst, value))
 }
 
+fn assignment_stmt(stmt: &StructuredStmt) -> Option<(LocalId, &Expr)> {
+    let StructuredStmt::Stmt(Stmt::Assign { dst, value }) = stmt else {
+        return None;
+    };
+    Some((*dst, value))
+}
+
 fn bool_const_expr(expr: &Expr) -> Option<bool> {
     let Expr::Const(ConstValue::Bool(value)) = expr else {
         return None;
@@ -1310,6 +1666,203 @@ fn bool_and(lhs: Expr, rhs: Expr) -> Expr {
 
 fn bool_or(lhs: Expr, rhs: Expr) -> Expr {
     Expr::Binary { op: BinaryOp::BitOr, lhs: Box::new(lhs), rhs: Box::new(rhs) }
+}
+
+#[derive(Default)]
+struct AggressiveScalarSelectRecovery;
+
+impl BackwardLirPass for AggressiveScalarSelectRecovery {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let local_types = local_types(cx.function);
+        let mut changed =
+            rewrite_aggressive_scalar_selects_in_body(&mut cx.structured.body, &local_types);
+        for helper in &mut cx.structured.helpers {
+            changed |= rewrite_aggressive_scalar_selects_in_body(&mut helper.body, &local_types);
+        }
+        changed
+    }
+}
+
+fn rewrite_aggressive_scalar_selects_in_body(
+    body: &mut [StructuredStmt],
+    local_types: &[LirType],
+) -> bool {
+    let mut changed = false;
+    for stmt in body {
+        changed |= rewrite_aggressive_scalar_selects_in_stmt(stmt, local_types);
+    }
+    changed
+}
+
+fn rewrite_aggressive_scalar_selects_in_stmt(
+    stmt: &mut StructuredStmt,
+    local_types: &[LirType],
+) -> bool {
+    let mut changed = match stmt {
+        StructuredStmt::If { then_body, else_body, .. } => {
+            rewrite_aggressive_scalar_selects_in_body(then_body, local_types)
+                | rewrite_aggressive_scalar_selects_in_body(else_body, local_types)
+        }
+        StructuredStmt::Stmt(_)
+        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::Return(_)
+        | StructuredStmt::Raise(_) => false,
+    };
+
+    if let Some(replacement) = aggressive_scalar_select_assignment(stmt, local_types) {
+        *stmt = replacement;
+        changed = true;
+    }
+
+    changed
+}
+
+fn aggressive_scalar_select_assignment(
+    stmt: &StructuredStmt,
+    local_types: &[LirType],
+) -> Option<StructuredStmt> {
+    let StructuredStmt::If { cond, then_body, else_body } = stmt else {
+        return None;
+    };
+    if expr_has_side_effects(cond) || expr_type(cond, local_types) != Some(LirType::Bool) {
+        return None;
+    }
+
+    let (dst, then_value) = single_assignment(then_body)?;
+    let (else_dst, else_value) = single_assignment(else_body)?;
+    if dst != else_dst || local_types.get(dst.0).copied()? != LirType::Real {
+        return None;
+    }
+
+    let value = max_min_branch_expr(cond, then_value, else_value, local_types)
+        .or_else(|| abs_branch_expr(cond, then_value, else_value, local_types))?;
+    Some(StructuredStmt::Stmt(Stmt::Assign { dst, value }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MaxMinKind {
+    Max,
+    Min,
+}
+
+fn max_min_branch_expr(
+    cond: &Expr,
+    then_value: &Expr,
+    else_value: &Expr,
+    local_types: &[LirType],
+) -> Option<Expr> {
+    let Expr::Binary { op: op @ (BinaryOp::Gt | BinaryOp::Lt), lhs, rhs } = cond else {
+        return None;
+    };
+    if !is_scalar_select_operand(lhs, local_types) || !is_scalar_select_operand(rhs, local_types) {
+        return None;
+    }
+    if !is_same_expr(then_value, lhs) && !is_same_expr(then_value, rhs) {
+        return None;
+    }
+    if !is_same_expr(else_value, lhs) && !is_same_expr(else_value, rhs) {
+        return None;
+    }
+
+    let selects_lhs = is_same_expr(then_value, lhs) && is_same_expr(else_value, rhs);
+    let selects_rhs = is_same_expr(then_value, rhs) && is_same_expr(else_value, lhs);
+    let kind = match (op, selects_lhs, selects_rhs) {
+        (BinaryOp::Gt, true, false) | (BinaryOp::Lt, false, true) => MaxMinKind::Max,
+        (BinaryOp::Gt, false, true) | (BinaryOp::Lt, true, false) => MaxMinKind::Min,
+        _ => return None,
+    };
+
+    let lhs = Box::new(else_value.clone());
+    let rhs = Box::new(then_value.clone());
+    match kind {
+        MaxMinKind::Max => Some(Expr::Max { lhs, rhs }),
+        MaxMinKind::Min => Some(Expr::Min { lhs, rhs }),
+    }
+}
+
+fn is_scalar_select_operand(expr: &Expr, local_types: &[LirType]) -> bool {
+    match expr {
+        Expr::Local(local) => local_types.get(local.0).copied() == Some(LirType::Real),
+        Expr::Const(ConstValue::Int(_) | ConstValue::Real(_)) => true,
+        _ => false,
+    }
+}
+
+fn is_same_expr(value: &Expr, expr: &Expr) -> bool {
+    value == expr
+}
+
+fn abs_branch_expr(
+    cond: &Expr,
+    then_value: &Expr,
+    else_value: &Expr,
+    local_types: &[LirType],
+) -> Option<Expr> {
+    let (arg, op) = strict_zero_compare(cond, local_types)?;
+    let then_polarity = abs_arm_polarity(then_value, arg)?;
+    let else_polarity = abs_arm_polarity(else_value, arg)?;
+    let is_math_abs_shape = matches!(
+        (op, then_polarity, else_polarity),
+        (BinaryOp::Lt, AbsArmPolarity::Neg, AbsArmPolarity::Pos)
+            | (BinaryOp::Gt, AbsArmPolarity::Pos, AbsArmPolarity::Neg)
+    );
+    if !is_math_abs_shape {
+        return None;
+    }
+
+    // Aggressive: strict-zero real diamonds are mathematically abs for ordinary nonzero numbers,
+    // but their tie/NaN arms are observable in Python. Rewriting to abs(x) can change signed-zero
+    // and NaN edge behavior; this pass accepts that tradeoff for path-count reduction.
+    Some(Expr::Abs { arg: Box::new(Expr::Local(arg)) })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AbsArmPolarity {
+    Pos,
+    Neg,
+}
+
+fn abs_arm_polarity(value: &Expr, arg: LocalId) -> Option<AbsArmPolarity> {
+    match value {
+        Expr::Local(local) if *local == arg => Some(AbsArmPolarity::Pos),
+        Expr::Unary { op: UnaryOp::Neg, arg: neg_arg } => match neg_arg.as_ref() {
+            Expr::Local(local) if *local == arg => Some(AbsArmPolarity::Neg),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn strict_zero_compare(cond: &Expr, local_types: &[LirType]) -> Option<(LocalId, BinaryOp)> {
+    let Expr::Binary { op: op @ (BinaryOp::Gt | BinaryOp::Lt), lhs, rhs } = cond else {
+        return None;
+    };
+
+    match (lhs.as_ref(), rhs.as_ref()) {
+        (Expr::Local(local), value) if is_zero_const(value) => {
+            (local_types.get(local.0).copied()? == LirType::Real).then_some((*local, *op))
+        }
+        (value, Expr::Local(local)) if is_zero_const(value) => {
+            if local_types.get(local.0).copied()? != LirType::Real {
+                return None;
+            }
+            let flipped = match op {
+                BinaryOp::Gt => BinaryOp::Lt,
+                BinaryOp::Lt => BinaryOp::Gt,
+                _ => return None,
+            };
+            Some((*local, flipped))
+        }
+        _ => None,
+    }
+}
+
+fn is_zero_const(expr: &Expr) -> bool {
+    match expr {
+        Expr::Const(ConstValue::Int(0)) => true,
+        Expr::Const(ConstValue::Real(value)) => *value == 0.0,
+        _ => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1361,6 +1914,7 @@ fn expr_type(expr: &Expr, local_types: &[LirType]) -> Option<LirType> {
         Expr::Unary { op: UnaryOp::Neg, arg } => expr_type(arg, local_types),
         Expr::Unary { op: UnaryOp::Cast(ty), .. } => Some(*ty),
         Expr::Unary { op: UnaryOp::Math1(_), .. } => Some(LirType::Real),
+        Expr::Abs { arg } => expr_type(arg, local_types),
         Expr::Binary { op, lhs, .. } => match op {
             BinaryOp::Add
             | BinaryOp::Sub
@@ -1380,8 +1934,22 @@ fn expr_type(expr: &Expr, local_types: &[LirType]) -> Option<LirType> {
             | BinaryOp::Ge => Some(LirType::Bool),
             BinaryOp::Math2(_) => Some(LirType::Real),
         },
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            Some(merge_expr_types(expr_type(lhs, local_types)?, expr_type(rhs, local_types)?))
+        }
         Expr::SimparamOpt { default, .. } => expr_type(default, local_types),
         Expr::Call { .. } | Expr::Unsupported { .. } => None,
+    }
+}
+
+fn merge_expr_types(lhs: LirType, rhs: LirType) -> LirType {
+    match (lhs, rhs) {
+        (same_lhs, same_rhs) if same_lhs == same_rhs => same_lhs,
+        (LirType::Unknown, ty) | (ty, LirType::Unknown) => ty,
+        (LirType::Real, LirType::Int | LirType::Bool)
+        | (LirType::Int | LirType::Bool, LirType::Real) => LirType::Real,
+        (LirType::Int, LirType::Bool) | (LirType::Bool, LirType::Int) => LirType::Int,
+        _ => LirType::Unknown,
     }
 }
 
@@ -2028,7 +2596,11 @@ fn rewrite_alias_expr(expr: &mut Expr, aliases: &CopyAliasMap) -> bool {
         }
         Expr::Const(_) => false,
         Expr::Unary { arg, .. } => rewrite_alias_expr(arg, aliases),
+        Expr::Abs { arg } => rewrite_alias_expr(arg, aliases),
         Expr::Binary { lhs, rhs, .. } => {
+            rewrite_alias_expr(lhs, aliases) | rewrite_alias_expr(rhs, aliases)
+        }
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
             rewrite_alias_expr(lhs, aliases) | rewrite_alias_expr(rhs, aliases)
         }
         Expr::SimparamOpt { name, default } => {
@@ -2247,7 +2819,12 @@ fn replace_local_use_in_expr(expr: &mut Expr, needle: LocalId, replacement: &Exp
         }
         Expr::Local(_) | Expr::Const(_) => false,
         Expr::Unary { arg, .. } => replace_local_use_in_expr(arg, needle, replacement),
+        Expr::Abs { arg } => replace_local_use_in_expr(arg, needle, replacement),
         Expr::Binary { lhs, rhs, .. } => {
+            replace_local_use_in_expr(lhs, needle, replacement)
+                | replace_local_use_in_expr(rhs, needle, replacement)
+        }
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
             replace_local_use_in_expr(lhs, needle, replacement)
                 | replace_local_use_in_expr(rhs, needle, replacement)
         }
@@ -2270,7 +2847,11 @@ fn expr_local_use_count(expr: &Expr, needle: LocalId) -> usize {
         Expr::Local(local) => usize::from(*local == needle),
         Expr::Const(_) => 0,
         Expr::Unary { arg, .. } => expr_local_use_count(arg, needle),
+        Expr::Abs { arg } => expr_local_use_count(arg, needle),
         Expr::Binary { lhs, rhs, .. } => {
+            expr_local_use_count(lhs, needle) + expr_local_use_count(rhs, needle)
+        }
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
             expr_local_use_count(lhs, needle) + expr_local_use_count(rhs, needle)
         }
         Expr::SimparamOpt { name, default } => {
@@ -2403,6 +2984,10 @@ fn expr_has_side_effects(expr: &Expr) -> bool {
         Expr::Call { .. } | Expr::Unsupported { .. } => true,
         Expr::Unary { arg, .. } => expr_has_side_effects(arg),
         Expr::Binary { lhs, rhs, .. } => expr_has_side_effects(lhs) || expr_has_side_effects(rhs),
+        Expr::Abs { arg } => expr_has_side_effects(arg),
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            expr_has_side_effects(lhs) || expr_has_side_effects(rhs)
+        }
         Expr::SimparamOpt { name, default } => {
             expr_has_side_effects(name) || expr_has_side_effects(default)
         }
@@ -2576,7 +3161,12 @@ fn collect_expr_locals(expr: &Expr, locals: &mut LiveSet) {
         }
         Expr::Const(_) => {}
         Expr::Unary { arg, .. } => collect_expr_locals(arg, locals),
+        Expr::Abs { arg } => collect_expr_locals(arg, locals),
         Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_locals(lhs, locals);
+            collect_expr_locals(rhs, locals);
+        }
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
             collect_expr_locals(lhs, locals);
             collect_expr_locals(rhs, locals);
         }
@@ -2639,7 +3229,12 @@ fn collect_expr_local_ids(expr: &Expr, locals: &mut Vec<LocalId>) {
         Expr::Local(local) => locals.push(*local),
         Expr::Const(_) => {}
         Expr::Unary { arg, .. } => collect_expr_local_ids(arg, locals),
+        Expr::Abs { arg } => collect_expr_local_ids(arg, locals),
         Expr::Binary { lhs, rhs, .. } => {
+            collect_expr_local_ids(lhs, locals);
+            collect_expr_local_ids(rhs, locals);
+        }
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
             collect_expr_local_ids(lhs, locals);
             collect_expr_local_ids(rhs, locals);
         }
@@ -3190,6 +3785,619 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn branch_merge_combines_adjacent_equal_condition_ifs() {
+        let function = branch_merge_function();
+        let cond = Expr::Binary {
+            op: BinaryOp::Eq,
+            lhs: Box::new(Expr::Local(LocalId(0))),
+            rhs: Box::new(Expr::Local(LocalId(1))),
+        };
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+
+        assert!(merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond,
+                then_body: vec![assign_int(LocalId(2), 1), assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(2), 2), assign_int(LocalId(3), 4)],
+            }]
+        );
+    }
+
+    #[test]
+    fn branch_merge_rejects_different_conditions() {
+        let function = branch_merge_function();
+        let original = vec![
+            StructuredStmt::If {
+                cond: Expr::Binary {
+                    op: BinaryOp::Eq,
+                    lhs: Box::new(Expr::Local(LocalId(0))),
+                    rhs: Box::new(Expr::Local(LocalId(1))),
+                },
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            StructuredStmt::If {
+                cond: Expr::Binary {
+                    op: BinaryOp::Ne,
+                    lhs: Box::new(Expr::Local(LocalId(0))),
+                    rhs: Box::new(Expr::Local(LocalId(1))),
+                },
+                then_body: vec![assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_merge_preserves_assignment_and_capture_order() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![
+                    assign_int(LocalId(2), 1),
+                    StructuredStmt::Stmt(Stmt::Capture {
+                        key: "then_a".to_owned(),
+                        value: Expr::Local(LocalId(2)),
+                    }),
+                ],
+                else_body: vec![
+                    assign_int(LocalId(2), 2),
+                    StructuredStmt::Stmt(Stmt::Capture {
+                        key: "else_a".to_owned(),
+                        value: Expr::Local(LocalId(2)),
+                    }),
+                ],
+            },
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![
+                    assign_int(LocalId(3), 3),
+                    StructuredStmt::Stmt(Stmt::Capture {
+                        key: "then_b".to_owned(),
+                        value: Expr::Local(LocalId(3)),
+                    }),
+                ],
+                else_body: vec![
+                    assign_int(LocalId(3), 4),
+                    StructuredStmt::Stmt(Stmt::Capture {
+                        key: "else_b".to_owned(),
+                        value: Expr::Local(LocalId(3)),
+                    }),
+                ],
+            },
+        ];
+
+        assert!(merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond,
+                then_body: vec![
+                    assign_int(LocalId(2), 1),
+                    StructuredStmt::Stmt(Stmt::Capture {
+                        key: "then_a".to_owned(),
+                        value: Expr::Local(LocalId(2)),
+                    }),
+                    assign_int(LocalId(3), 3),
+                    StructuredStmt::Stmt(Stmt::Capture {
+                        key: "then_b".to_owned(),
+                        value: Expr::Local(LocalId(3)),
+                    }),
+                ],
+                else_body: vec![
+                    assign_int(LocalId(2), 2),
+                    StructuredStmt::Stmt(Stmt::Capture {
+                        key: "else_a".to_owned(),
+                        value: Expr::Local(LocalId(2)),
+                    }),
+                    assign_int(LocalId(3), 4),
+                    StructuredStmt::Stmt(Stmt::Capture {
+                        key: "else_b".to_owned(),
+                        value: Expr::Local(LocalId(3)),
+                    }),
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn branch_merge_allows_nested_branch_arms_without_effects() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let nested = StructuredStmt::If {
+            cond: Expr::Local(LocalId(6)),
+            then_body: vec![assign_int(LocalId(2), 1)],
+            else_body: vec![assign_int(LocalId(2), 2)],
+        };
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![nested.clone()],
+                else_body: vec![assign_int(LocalId(2), 3)],
+            },
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(3), 4)],
+                else_body: vec![assign_int(LocalId(3), 5)],
+            },
+        ];
+
+        assert!(merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond,
+                then_body: vec![nested, assign_int(LocalId(3), 4)],
+                else_body: vec![assign_int(LocalId(2), 3), assign_int(LocalId(3), 5)],
+            }]
+        );
+    }
+
+    #[test]
+    fn branch_merge_rejects_helper_and_return() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let invalid_arms = [
+            vec![StructuredStmt::CallHelper(Label(9))],
+            vec![StructuredStmt::Return(vec![ReturnValue::Named {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(2)),
+            }])],
+        ];
+
+        for invalid_arm in invalid_arms {
+            let original = vec![
+                StructuredStmt::If {
+                    cond: cond.clone(),
+                    then_body: invalid_arm,
+                    else_body: vec![assign_int(LocalId(2), 2)],
+                },
+                StructuredStmt::If {
+                    cond: cond.clone(),
+                    then_body: vec![assign_int(LocalId(3), 3)],
+                    else_body: vec![assign_int(LocalId(3), 4)],
+                },
+            ];
+            let mut body = original.clone();
+
+            assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+            assert_eq!(body, original);
+        }
+    }
+
+    #[test]
+    fn branch_merge_handles_empty_branch_bodies() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let mut body = vec![
+            StructuredStmt::If { cond: cond.clone(), then_body: Vec::new(), else_body: Vec::new() },
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+        ];
+
+        assert!(merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond,
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            }]
+        );
+    }
+
+    #[test]
+    fn branch_merge_rejects_condition_redefinition_before_second_if() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let original = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_bool(LocalId(4), false)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            StructuredStmt::If {
+                cond,
+                then_body: vec![assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_merge_combines_separated_equal_condition_ifs_when_middle_is_independent() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let middle = assign_int(LocalId(5), 9);
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            middle.clone(),
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+
+        assert!(merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::If {
+                    cond,
+                    then_body: vec![assign_int(LocalId(2), 1), assign_int(LocalId(3), 3)],
+                    else_body: vec![assign_int(LocalId(2), 2), assign_int(LocalId(3), 4)],
+                },
+                middle,
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_merge_combines_separated_equal_condition_ifs_across_safe_capture() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let middle = StructuredStmt::Stmt(Stmt::Capture {
+            key: "mid".to_owned(),
+            value: Expr::Local(LocalId(2)),
+        });
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            middle.clone(),
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![StructuredStmt::Stmt(Stmt::Capture {
+                    key: "moved_then".to_owned(),
+                    value: Expr::Local(LocalId(3)),
+                })],
+                else_body: vec![StructuredStmt::Stmt(Stmt::Capture {
+                    key: "moved_else".to_owned(),
+                    value: Expr::Local(LocalId(3)),
+                })],
+            },
+        ];
+
+        assert!(merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::If {
+                    cond,
+                    then_body: vec![
+                        assign_int(LocalId(2), 1),
+                        StructuredStmt::Stmt(Stmt::Capture {
+                            key: "moved_then".to_owned(),
+                            value: Expr::Local(LocalId(3)),
+                        }),
+                    ],
+                    else_body: vec![
+                        assign_int(LocalId(2), 2),
+                        StructuredStmt::Stmt(Stmt::Capture {
+                            key: "moved_else".to_owned(),
+                            value: Expr::Local(LocalId(3)),
+                        }),
+                    ],
+                },
+                middle,
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_merge_rejects_separated_capture_same_key_reordering() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let middle = StructuredStmt::Stmt(Stmt::Capture {
+            key: "same".to_owned(),
+            value: Expr::Local(LocalId(2)),
+        });
+        let original = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            middle,
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![StructuredStmt::Stmt(Stmt::Capture {
+                    key: "same".to_owned(),
+                    value: Expr::Local(LocalId(3)),
+                })],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_merge_combines_exact_same_non_bool_local_condition() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(0));
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+
+        assert!(merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond,
+                then_body: vec![assign_int(LocalId(2), 1), assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(2), 2), assign_int(LocalId(3), 4)],
+            }]
+        );
+    }
+
+    #[test]
+    fn branch_merge_combines_separated_with_nested_independent_middle() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let middle = StructuredStmt::If {
+            cond: Expr::Local(LocalId(6)),
+            then_body: vec![assign_int(LocalId(5), 9)],
+            else_body: vec![assign_int(LocalId(5), 10)],
+        };
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            middle.clone(),
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+
+        assert!(merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::If {
+                    cond,
+                    then_body: vec![assign_int(LocalId(2), 1), assign_int(LocalId(3), 3)],
+                    else_body: vec![assign_int(LocalId(2), 2), assign_int(LocalId(3), 4)],
+                },
+                middle,
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_merge_allows_separated_when_middle_only_writes_first_branch_read() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let mut body = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(5)))],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            assign_int(LocalId(5), 9),
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+
+        assert!(merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::If {
+                    cond: cond.clone(),
+                    then_body: vec![
+                        assign_expr(LocalId(2), Expr::Local(LocalId(5))),
+                        assign_int(LocalId(3), 3),
+                    ],
+                    else_body: vec![assign_int(LocalId(2), 2), assign_int(LocalId(3), 4)],
+                },
+                assign_int(LocalId(5), 9),
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_merge_rejects_separated_when_middle_writes_second_branch_read() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let original = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            assign_int(LocalId(5), 9),
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_expr(LocalId(3), Expr::Local(LocalId(5)))],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_merge_rejects_separated_when_nested_middle_writes_second_branch_read() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let middle = StructuredStmt::If {
+            cond: Expr::Local(LocalId(6)),
+            then_body: vec![assign_int(LocalId(5), 9)],
+            else_body: vec![assign_int(LocalId(5), 10)],
+        };
+        let original = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            middle,
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_expr(LocalId(3), Expr::Local(LocalId(5)))],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_merge_rejects_separated_when_middle_reads_second_branch_write() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let original = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            assign_expr(LocalId(5), Expr::Local(LocalId(3))),
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(3), 3)],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_merge_rejects_separated_when_middle_and_second_branch_write_same_local() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let original = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            assign_int(LocalId(5), 9),
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(5), 3)],
+                else_body: vec![assign_int(LocalId(5), 4)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn branch_merge_rejects_separated_effectful_intervening_block() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let invalid_middle = [StructuredStmt::CallHelper(Label(9))];
+
+        for middle in invalid_middle {
+            let original = vec![
+                StructuredStmt::If {
+                    cond: cond.clone(),
+                    then_body: vec![assign_int(LocalId(2), 1)],
+                    else_body: vec![assign_int(LocalId(2), 2)],
+                },
+                middle,
+                StructuredStmt::If {
+                    cond: cond.clone(),
+                    then_body: vec![assign_int(LocalId(3), 3)],
+                    else_body: vec![assign_int(LocalId(3), 4)],
+                },
+            ];
+            let mut body = original.clone();
+
+            assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+            assert_eq!(body, original);
+        }
+    }
+
+    #[test]
+    fn branch_merge_rejects_separated_when_middle_writes_captured_value() {
+        let function = branch_merge_function();
+        let cond = Expr::Local(LocalId(4));
+        let original = vec![
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![assign_int(LocalId(2), 1)],
+                else_body: vec![assign_int(LocalId(2), 2)],
+            },
+            assign_int(LocalId(3), 9),
+            StructuredStmt::If {
+                cond: cond.clone(),
+                then_body: vec![StructuredStmt::Stmt(Stmt::Capture {
+                    key: "moved_then".to_owned(),
+                    value: Expr::Local(LocalId(3)),
+                })],
+                else_body: vec![assign_int(LocalId(3), 4)],
+            },
+        ];
+        let mut body = original.clone();
+
+        assert!(!merge_matching_condition_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
     }
 
     #[test]
@@ -3894,6 +5102,181 @@ mod tests {
     }
 
     #[test]
+    fn branch_squash_replaces_multi_bool_expr_then_false_else_with_ands() {
+        let function = branch_squash_bool_function();
+        let cast_2 = bool_cast_local(LocalId(2));
+        let cast_4 = bool_cast_local(LocalId(4));
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![
+                assign_expr(LocalId(1), cast_2.clone()),
+                assign_expr(LocalId(3), cast_4.clone()),
+            ],
+            else_body: vec![assign_bool(LocalId(1), false), assign_bool(LocalId(3), false)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Binary {
+                        op: BinaryOp::BitAnd,
+                        lhs: Box::new(Expr::Unary {
+                            op: UnaryOp::Cast(LirType::Bool),
+                            arg: Box::new(Expr::Local(LocalId(0))),
+                        }),
+                        rhs: Box::new(cast_2),
+                    },
+                }),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(3),
+                    value: Expr::Binary {
+                        op: BinaryOp::BitAnd,
+                        lhs: Box::new(Expr::Unary {
+                            op: UnaryOp::Cast(LirType::Bool),
+                            arg: Box::new(Expr::Local(LocalId(0))),
+                        }),
+                        rhs: Box::new(cast_4),
+                    },
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_squash_replaces_multi_bool_expr_false_then_else_with_negated_ands() {
+        let function = branch_squash_bool_function();
+        let cast_2 = bool_cast_local(LocalId(2));
+        let cast_4 = bool_cast_local(LocalId(4));
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), false), assign_bool(LocalId(3), false)],
+            else_body: vec![
+                assign_expr(LocalId(1), cast_2.clone()),
+                assign_expr(LocalId(3), cast_4.clone()),
+            ],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Binary {
+                        op: BinaryOp::BitAnd,
+                        lhs: Box::new(Expr::Unary {
+                            op: UnaryOp::Not,
+                            arg: Box::new(Expr::Unary {
+                                op: UnaryOp::Cast(LirType::Bool),
+                                arg: Box::new(Expr::Local(LocalId(0))),
+                            }),
+                        }),
+                        rhs: Box::new(cast_2),
+                    },
+                }),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(3),
+                    value: Expr::Binary {
+                        op: BinaryOp::BitAnd,
+                        lhs: Box::new(Expr::Unary {
+                            op: UnaryOp::Not,
+                            arg: Box::new(Expr::Unary {
+                                op: UnaryOp::Cast(LirType::Bool),
+                                arg: Box::new(Expr::Local(LocalId(0))),
+                            }),
+                        }),
+                        rhs: Box::new(cast_4),
+                    },
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_squash_replaces_multi_bool_expr_with_or_forms() {
+        let function = branch_squash_bool_function();
+        let cast_2 = bool_cast_local(LocalId(2));
+        let cast_4 = bool_cast_local(LocalId(4));
+        let mut body = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_bool(LocalId(1), true), assign_expr(LocalId(3), cast_4.clone())],
+            else_body: vec![assign_expr(LocalId(1), cast_2.clone()), assign_bool(LocalId(3), true)],
+        }];
+
+        assert!(squash_branches_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(1),
+                    value: Expr::Binary {
+                        op: BinaryOp::BitOr,
+                        lhs: Box::new(Expr::Unary {
+                            op: UnaryOp::Cast(LirType::Bool),
+                            arg: Box::new(Expr::Local(LocalId(0))),
+                        }),
+                        rhs: Box::new(cast_2),
+                    },
+                }),
+                StructuredStmt::Stmt(Stmt::Assign {
+                    dst: LocalId(3),
+                    value: Expr::Binary {
+                        op: BinaryOp::BitOr,
+                        lhs: Box::new(Expr::Unary {
+                            op: UnaryOp::Not,
+                            arg: Box::new(Expr::Unary {
+                                op: UnaryOp::Cast(LirType::Bool),
+                                arg: Box::new(Expr::Local(LocalId(0))),
+                            }),
+                        }),
+                        rhs: Box::new(cast_4),
+                    },
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_squash_rejects_multi_bool_mismatched_destinations_and_effects() {
+        let function = branch_squash_bool_function();
+        let int_function = bool_condition_function(LirType::Int);
+        let mut mismatched = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_expr(LocalId(1), bool_cast_local(LocalId(2)))],
+            else_body: vec![assign_bool(LocalId(3), false)],
+        }];
+        let mut effectful = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![
+                assign_expr(LocalId(1), bool_cast_local(LocalId(2))),
+                StructuredStmt::Stmt(Stmt::Capture {
+                    key: "x".to_owned(),
+                    value: Expr::Local(LocalId(2)),
+                }),
+            ],
+            else_body: vec![assign_bool(LocalId(1), false), assign_bool(LocalId(3), false)],
+        }];
+        let mut non_bool = vec![StructuredStmt::If {
+            cond: Expr::Local(LocalId(0)),
+            then_body: vec![assign_int(LocalId(1), 1), assign_int(LocalId(2), 3)],
+            else_body: vec![assign_int(LocalId(1), 0), assign_int(LocalId(2), 5)],
+        }];
+        let mismatched_original = mismatched.clone();
+        let effectful_original = effectful.clone();
+        let non_bool_original = non_bool.clone();
+
+        assert!(!squash_branches_in_body(&mut mismatched, &local_types(&function)));
+        assert_eq!(mismatched, mismatched_original);
+        assert!(!squash_branches_in_body(&mut effectful, &local_types(&function)));
+        assert_eq!(effectful, effectful_original);
+        assert!(!squash_branches_in_body(&mut non_bool, &local_types(&int_function)));
+        assert_eq!(non_bool, non_bool_original);
+    }
+
+    #[test]
     fn branch_squash_rejects_bool_cast_over_arithmetic_arm() {
         let function = bool_condition_function(LirType::Bool);
         let mut body = vec![StructuredStmt::If {
@@ -3952,6 +5335,314 @@ mod tests {
 
         assert!(!squash_branches_in_body(&mut side_effecting, &local_types(&function)));
         assert!(!squash_branches_in_body(&mut different_targets, &local_types(&function)));
+    }
+
+    #[test]
+    fn aggressive_scalar_select_rewrites_greater_select_to_max_with_false_arm_first() {
+        let function = max_min_function();
+        let mut body = vec![StructuredStmt::If {
+            cond: compare(BinaryOp::Gt, LocalId(0), LocalId(1)),
+            then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(1)))],
+        }];
+
+        assert!(rewrite_aggressive_scalar_selects_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(2),
+                value: max_expr(LocalId(1), LocalId(0)),
+            })]
+        );
+    }
+
+    #[test]
+    fn aggressive_scalar_select_rewrites_less_select_to_min_with_false_arm_first() {
+        let function = max_min_function();
+        let mut body = vec![StructuredStmt::If {
+            cond: compare(BinaryOp::Lt, LocalId(0), LocalId(1)),
+            then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(1)))],
+        }];
+
+        assert!(rewrite_aggressive_scalar_selects_in_body(&mut body, &local_types(&function)));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(2),
+                value: min_expr(LocalId(1), LocalId(0)),
+            })]
+        );
+    }
+
+    #[test]
+    fn aggressive_scalar_select_handles_flipped_min_max_branches() {
+        let function = max_min_function();
+        let mut min_body = vec![StructuredStmt::If {
+            cond: compare(BinaryOp::Gt, LocalId(0), LocalId(1)),
+            then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(1)))],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+        }];
+        let mut max_body = vec![StructuredStmt::If {
+            cond: compare(BinaryOp::Lt, LocalId(0), LocalId(1)),
+            then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(1)))],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+        }];
+
+        assert!(rewrite_aggressive_scalar_selects_in_body(&mut min_body, &local_types(&function)));
+        assert!(rewrite_aggressive_scalar_selects_in_body(&mut max_body, &local_types(&function)));
+        assert_eq!(
+            min_body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(2),
+                value: min_expr(LocalId(0), LocalId(1)),
+            })]
+        );
+        assert_eq!(
+            max_body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(2),
+                value: max_expr(LocalId(0), LocalId(1)),
+            })]
+        );
+    }
+
+    #[test]
+    fn aggressive_scalar_select_rejects_extra_branch_statements() {
+        let function = max_min_function();
+        let original = vec![StructuredStmt::If {
+            cond: compare(BinaryOp::Gt, LocalId(0), LocalId(1)),
+            then_body: vec![
+                assign_expr(LocalId(2), Expr::Local(LocalId(0))),
+                assign_real(LocalId(3), 0.0),
+            ],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(1)))],
+        }];
+        let mut body = original.clone();
+
+        assert!(!rewrite_aggressive_scalar_selects_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn aggressive_scalar_select_rejects_different_assignment_targets() {
+        let function = max_min_function();
+        let original = vec![StructuredStmt::If {
+            cond: compare(BinaryOp::Gt, LocalId(0), LocalId(1)),
+            then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+            else_body: vec![assign_expr(LocalId(3), Expr::Local(LocalId(1)))],
+        }];
+        let mut body = original.clone();
+
+        assert!(!rewrite_aggressive_scalar_selects_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn aggressive_scalar_select_rejects_non_strict_or_non_operand_selects() {
+        let function = max_min_function();
+        let mut non_strict = vec![StructuredStmt::If {
+            cond: compare(BinaryOp::Ge, LocalId(0), LocalId(1)),
+            then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(1)))],
+        }];
+        let original_non_strict = non_strict.clone();
+        let mut non_operand = vec![StructuredStmt::If {
+            cond: compare(BinaryOp::Gt, LocalId(0), LocalId(1)),
+            then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(3)))],
+        }];
+        let original_non_operand = non_operand.clone();
+
+        assert!(!rewrite_aggressive_scalar_selects_in_body(
+            &mut non_strict,
+            &local_types(&function)
+        ));
+        assert_eq!(non_strict, original_non_strict);
+        assert!(!rewrite_aggressive_scalar_selects_in_body(
+            &mut non_operand,
+            &local_types(&function)
+        ));
+        assert_eq!(non_operand, original_non_operand);
+    }
+
+    #[test]
+    fn aggressive_scalar_select_rejects_side_effecting_condition() {
+        let function = max_min_function();
+        let original = vec![StructuredStmt::If {
+            cond: Expr::Call { target: "probe".to_owned(), args: Vec::new() },
+            then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(1)))],
+        }];
+        let mut body = original.clone();
+
+        assert!(!rewrite_aggressive_scalar_selects_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn aggressive_scalar_select_recovers_local_constant_min_max() {
+        let function = max_min_function();
+        let c = Expr::Const(ConstValue::Real(1.5));
+        let mut max_body = vec![StructuredStmt::If {
+            cond: compare_expr(BinaryOp::Lt, Expr::Local(LocalId(0)), c.clone()),
+            then_body: vec![assign_expr(LocalId(2), c.clone())],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+        }];
+        let mut min_body = vec![StructuredStmt::If {
+            cond: compare_expr(BinaryOp::Gt, Expr::Local(LocalId(0)), c.clone()),
+            then_body: vec![assign_expr(LocalId(2), c.clone())],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+        }];
+
+        assert!(rewrite_aggressive_scalar_selects_in_body(&mut max_body, &local_types(&function)));
+        assert!(rewrite_aggressive_scalar_selects_in_body(&mut min_body, &local_types(&function)));
+        assert_eq!(
+            max_body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(2),
+                value: Expr::Max {
+                    lhs: Box::new(Expr::Local(LocalId(0))),
+                    rhs: Box::new(c.clone()),
+                },
+            })]
+        );
+        assert_eq!(
+            min_body,
+            vec![StructuredStmt::Stmt(Stmt::Assign {
+                dst: LocalId(2),
+                value: Expr::Min { lhs: Box::new(Expr::Local(LocalId(0))), rhs: Box::new(c) },
+            })]
+        );
+    }
+
+    #[test]
+    fn aggressive_scalar_select_recovers_abs_strict_zero_shapes() {
+        let function = max_min_function();
+        let local_types = local_types(&function);
+        let cases = [
+            (
+                StructuredStmt::If {
+                    cond: compare_expr(
+                        BinaryOp::Lt,
+                        Expr::Local(LocalId(0)),
+                        Expr::Const(ConstValue::Real(0.0)),
+                    ),
+                    then_body: vec![assign_expr(LocalId(2), neg_local(LocalId(0)))],
+                    else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+                },
+                Expr::Abs { arg: Box::new(Expr::Local(LocalId(0))) },
+            ),
+            (
+                StructuredStmt::If {
+                    cond: compare_expr(
+                        BinaryOp::Gt,
+                        Expr::Local(LocalId(0)),
+                        Expr::Const(ConstValue::Real(0.0)),
+                    ),
+                    then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+                    else_body: vec![assign_expr(LocalId(2), neg_local(LocalId(0)))],
+                },
+                Expr::Abs { arg: Box::new(Expr::Local(LocalId(0))) },
+            ),
+            (
+                StructuredStmt::If {
+                    cond: compare_expr(
+                        BinaryOp::Gt,
+                        Expr::Const(ConstValue::Int(0)),
+                        Expr::Local(LocalId(0)),
+                    ),
+                    then_body: vec![assign_expr(LocalId(2), neg_local(LocalId(0)))],
+                    else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+                },
+                Expr::Abs { arg: Box::new(Expr::Local(LocalId(0))) },
+            ),
+        ];
+
+        for (original, expected) in cases {
+            let mut body = vec![original];
+            assert!(rewrite_aggressive_scalar_selects_in_body(&mut body, &local_types));
+            assert_eq!(
+                body,
+                vec![StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(2), value: expected })]
+            );
+        }
+    }
+
+    #[test]
+    fn aggressive_scalar_select_rejects_abs_non_strict_and_non_exact_negation() {
+        let function = max_min_function();
+        let local_types = local_types(&function);
+        let mut non_strict = vec![StructuredStmt::If {
+            cond: compare_expr(
+                BinaryOp::Le,
+                Expr::Local(LocalId(0)),
+                Expr::Const(ConstValue::Real(0.0)),
+            ),
+            then_body: vec![assign_expr(LocalId(2), neg_local(LocalId(0)))],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+        }];
+        let original_non_strict = non_strict.clone();
+        let mut non_exact_negation = vec![StructuredStmt::If {
+            cond: compare_expr(
+                BinaryOp::Lt,
+                Expr::Local(LocalId(0)),
+                Expr::Const(ConstValue::Real(0.0)),
+            ),
+            then_body: vec![assign_expr(LocalId(2), neg_local(LocalId(1)))],
+            else_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+        }];
+        let original_non_exact_negation = non_exact_negation.clone();
+
+        assert!(!rewrite_aggressive_scalar_selects_in_body(&mut non_strict, &local_types));
+        assert_eq!(non_strict, original_non_strict);
+        assert!(!rewrite_aggressive_scalar_selects_in_body(&mut non_exact_negation, &local_types));
+        assert_eq!(non_exact_negation, original_non_exact_negation);
+    }
+
+    #[test]
+    fn aggressive_scalar_select_rejects_multi_statement_abs_derivative_bundle() {
+        let function = max_min_function();
+        let original = vec![StructuredStmt::If {
+            cond: compare_expr(
+                BinaryOp::Lt,
+                Expr::Local(LocalId(0)),
+                Expr::Const(ConstValue::Real(0.0)),
+            ),
+            then_body: vec![
+                assign_expr(LocalId(2), neg_local(LocalId(0))),
+                assign_real(LocalId(3), -1.0),
+            ],
+            else_body: vec![
+                assign_expr(LocalId(2), Expr::Local(LocalId(0))),
+                assign_real(LocalId(3), 1.0),
+            ],
+        }];
+        let mut body = original.clone();
+
+        assert!(!rewrite_aggressive_scalar_selects_in_body(&mut body, &local_types(&function)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn aggressive_scalar_select_rejects_non_abs_strict_zero_shapes() {
+        let function = max_min_function();
+        let local_types = local_types(&function);
+        let cases = [StructuredStmt::If {
+            cond: compare_expr(
+                BinaryOp::Lt,
+                Expr::Local(LocalId(0)),
+                Expr::Const(ConstValue::Real(0.0)),
+            ),
+            then_body: vec![assign_expr(LocalId(2), Expr::Local(LocalId(0)))],
+            else_body: vec![assign_expr(LocalId(2), neg_local(LocalId(0)))],
+        }];
+
+        for original in cases {
+            let mut body = vec![original.clone()];
+            assert!(!rewrite_aggressive_scalar_selects_in_body(&mut body, &local_types));
+            assert_eq!(body, vec![original]);
+        }
     }
 
     #[test]
@@ -4342,6 +6033,47 @@ mod tests {
         }
     }
 
+    fn compare(op: BinaryOp, lhs: LocalId, rhs: LocalId) -> Expr {
+        Expr::Binary { op, lhs: Box::new(Expr::Local(lhs)), rhs: Box::new(Expr::Local(rhs)) }
+    }
+
+    fn compare_expr(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }
+    }
+
+    fn neg_local(local: LocalId) -> Expr {
+        Expr::Unary { op: UnaryOp::Neg, arg: Box::new(Expr::Local(local)) }
+    }
+
+    fn max_expr(lhs: LocalId, rhs: LocalId) -> Expr {
+        Expr::Max { lhs: Box::new(Expr::Local(lhs)), rhs: Box::new(Expr::Local(rhs)) }
+    }
+
+    fn min_expr(lhs: LocalId, rhs: LocalId) -> Expr {
+        Expr::Min { lhs: Box::new(Expr::Local(lhs)), rhs: Box::new(Expr::Local(rhs)) }
+    }
+
+    fn bool_cast_local(local: LocalId) -> Expr {
+        Expr::Unary { op: UnaryOp::Cast(LirType::Bool), arg: Box::new(Expr::Local(local)) }
+    }
+
+    fn max_min_function() -> Function {
+        Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0), LocalId(1)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "x".to_owned(), ty: LirType::Real },
+                Local { id: LocalId(1), name_hint: "y".to_owned(), ty: LirType::Real },
+                Local { id: LocalId(2), name_hint: "res".to_owned(), ty: LirType::Real },
+                Local { id: LocalId(3), name_hint: "other".to_owned(), ty: LirType::Real },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        }
+    }
+
     fn bool_condition_function(value_ty: LirType) -> Function {
         Function {
             name: "test".to_owned(),
@@ -4350,6 +6082,24 @@ mod tests {
                 Local { id: LocalId(0), name_hint: "cond".to_owned(), ty: LirType::Bool },
                 Local { id: LocalId(1), name_hint: "x".to_owned(), ty: value_ty },
                 Local { id: LocalId(2), name_hint: "y".to_owned(), ty: value_ty },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        }
+    }
+
+    fn branch_squash_bool_function() -> Function {
+        Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "cond".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(1), name_hint: "x".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(2), name_hint: "raw_x".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(3), name_hint: "y".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(4), name_hint: "raw_y".to_owned(), ty: LirType::Int },
             ],
             entry: Label(0),
             blocks: Vec::new(),
@@ -4367,6 +6117,26 @@ mod tests {
                 Local { id: LocalId(1), name_hint: "b".to_owned(), ty: LirType::Int },
                 Local { id: LocalId(2), name_hint: "pred".to_owned(), ty: LirType::Bool },
                 Local { id: LocalId(3), name_hint: "out".to_owned(), ty: LirType::Int },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        }
+    }
+
+    fn branch_merge_function() -> Function {
+        Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0), LocalId(1), LocalId(4)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "a".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(1), name_hint: "b".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(2), name_hint: "x".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(3), name_hint: "y".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(4), name_hint: "cond".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(5), name_hint: "mid".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(6), name_hint: "other_cond".to_owned(), ty: LirType::Bool },
             ],
             entry: Label(0),
             blocks: Vec::new(),

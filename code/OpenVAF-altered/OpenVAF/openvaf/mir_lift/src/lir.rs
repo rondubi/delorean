@@ -76,6 +76,9 @@ pub enum Expr {
     Const(ConstValue),
     Unary { op: UnaryOp, arg: Box<Expr> },
     Binary { op: BinaryOp, lhs: Box<Expr>, rhs: Box<Expr> },
+    Abs { arg: Box<Expr> },
+    Max { lhs: Box<Expr>, rhs: Box<Expr> },
+    Min { lhs: Box<Expr>, rhs: Box<Expr> },
     SimparamOpt { name: Box<Expr>, default: Box<Expr> },
     Call { target: String, args: Vec<Expr> },
     Unsupported { text: String, args: Vec<Expr> },
@@ -289,6 +292,9 @@ impl fmt::Display for Expr {
             Expr::Const(value) => write!(f, "{value}"),
             Expr::Unary { op, arg } => write!(f, "{op}({arg})"),
             Expr::Binary { op, lhs, rhs } => write!(f, "({lhs} {op} {rhs})"),
+            Expr::Abs { arg } => write!(f, "abs({arg})"),
+            Expr::Max { lhs, rhs } => write!(f, "max({lhs}, {rhs})"),
+            Expr::Min { lhs, rhs } => write!(f, "min({lhs}, {rhs})"),
             Expr::SimparamOpt { name, default } => {
                 write!(f, "simparam_opt({name}, {default})")
             }
