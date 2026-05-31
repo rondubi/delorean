@@ -113,6 +113,14 @@ const LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
 ];
+const FINAL_LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
+    BackwardPassKind::BranchMerge,
+    BackwardPassKind::BranchSquash,
+    BackwardPassKind::AggressiveScalarSelectRecovery,
+    BackwardPassKind::DeadAssignments,
+    BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::DeadAssignments,
+];
 const POST_DCE_CLEANUP_PASSES: &[BackwardPassKind] = CLEANUP_PASSES;
 const FINALIZATION_PASSES: &[BackwardPassKind] =
     &[BackwardPassKind::HelperSignaturePruning, BackwardPassKind::OptionalHelperLiveIns];
@@ -134,6 +142,10 @@ pub(crate) fn run_backward_passes(
         BackwardPipeline { name: "lir-backward-structural", passes: STRUCTURAL_PASSES };
     let late_cleanup_pipeline =
         BackwardPipeline { name: "lir-backward-late-cleanup", passes: LATE_CLEANUP_PASSES };
+    let final_late_cleanup_pipeline = BackwardPipeline {
+        name: "lir-backward-final-late-cleanup",
+        passes: FINAL_LATE_CLEANUP_PASSES,
+    };
     let rounds = BackwardRoundCounts::from_env();
 
     for _ in 0..rounds.cleanup {
@@ -159,6 +171,12 @@ pub(crate) fn run_backward_passes(
             break;
         }
     }
+
+    final_late_cleanup_pipeline.run(&mut BackwardPassCx {
+        function,
+        structured,
+        facts: &mut facts,
+    });
 
     BackwardPipeline { name: "lir-backward-finalization", passes: FINALIZATION_PASSES }
         .run(&mut BackwardPassCx { function, structured, facts: &mut facts });
@@ -3010,24 +3028,183 @@ fn compute_helper_params(
     }
 
     visiting.push(label);
-    let live = bodies
+    let params = bodies
         .get(&label)
         .map(|body| {
-            live_in_body_static(
-                body,
-                LiveSet::new(locals_len),
+            read_before_def_body_static(body, locals_len, bodies, computed, visiting)
+                .read_before_def
+                .into_sorted_locals()
+        })
+        .unwrap_or_default();
+    visiting.pop();
+
+    computed.insert(label, params.clone());
+    params
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReadBeforeDefSummary {
+    read_before_def: LiveSet,
+    defined: LiveSet,
+    may_continue: bool,
+}
+
+impl ReadBeforeDefSummary {
+    fn new(locals_len: usize) -> Self {
+        Self {
+            read_before_def: LiveSet::new(locals_len),
+            defined: LiveSet::new(locals_len),
+            may_continue: true,
+        }
+    }
+
+    fn note_expr_reads(&mut self, expr: &Expr) {
+        let mut locals = Vec::new();
+        collect_expr_local_ids(expr, &mut locals);
+        for local in locals {
+            if !self.defined.contains(local) {
+                self.read_before_def.insert(local);
+            }
+        }
+    }
+
+    fn note_call_effect_reads(&mut self, effect: &CallEffect) {
+        let mut locals = Vec::new();
+        collect_call_effect_local_ids(effect, &mut locals);
+        for local in locals {
+            if !self.defined.contains(local) {
+                self.read_before_def.insert(local);
+            }
+        }
+    }
+
+    fn note_helper_reads(&mut self, params: Vec<LocalId>) {
+        for local in params {
+            if !self.defined.contains(local) {
+                self.read_before_def.insert(local);
+            }
+        }
+    }
+
+    fn define(&mut self, local: LocalId) {
+        self.defined.insert(local);
+    }
+
+    fn terminate(&mut self) {
+        self.may_continue = false;
+    }
+}
+
+fn read_before_def_body_static(
+    body: &[StructuredStmt],
+    locals_len: usize,
+    bodies: &HashMap<Label, Vec<StructuredStmt>>,
+    computed: &mut HashMap<Label, Vec<LocalId>>,
+    visiting: &mut Vec<Label>,
+) -> ReadBeforeDefSummary {
+    let mut summary = ReadBeforeDefSummary::new(locals_len);
+    read_before_def_body_from_state(body, &mut summary, locals_len, bodies, computed, visiting);
+    summary
+}
+
+fn read_before_def_body_from_state(
+    body: &[StructuredStmt],
+    summary: &mut ReadBeforeDefSummary,
+    locals_len: usize,
+    bodies: &HashMap<Label, Vec<StructuredStmt>>,
+    computed: &mut HashMap<Label, Vec<LocalId>>,
+    visiting: &mut Vec<Label>,
+) {
+    for stmt in body {
+        if !summary.may_continue {
+            break;
+        }
+        read_before_def_stmt_static(stmt, summary, locals_len, bodies, computed, visiting);
+    }
+}
+
+fn read_before_def_stmt_static(
+    stmt: &StructuredStmt,
+    summary: &mut ReadBeforeDefSummary,
+    locals_len: usize,
+    bodies: &HashMap<Label, Vec<StructuredStmt>>,
+    computed: &mut HashMap<Label, Vec<LocalId>>,
+    visiting: &mut Vec<Label>,
+) {
+    match stmt {
+        StructuredStmt::Stmt(Stmt::Assign { dst, value }) => {
+            summary.note_expr_reads(value);
+            summary.define(*dst);
+        }
+        StructuredStmt::Stmt(Stmt::Capture { value, .. }) => summary.note_expr_reads(value),
+        StructuredStmt::Stmt(Stmt::CallEffect(effect)) => summary.note_call_effect_reads(effect),
+        StructuredStmt::Stmt(Stmt::Expr(value)) => summary.note_expr_reads(value),
+        StructuredStmt::Stmt(Stmt::Unsupported { dsts, .. }) => {
+            for dst in dsts {
+                summary.define(*dst);
+            }
+        }
+        StructuredStmt::If { cond, then_body, else_body } => {
+            summary.note_expr_reads(cond);
+
+            let incoming_defined = summary.defined.clone();
+            let mut then_summary = summary.clone();
+            read_before_def_body_from_state(
+                then_body,
+                &mut then_summary,
                 locals_len,
                 bodies,
                 computed,
                 visiting,
-            )
-        })
-        .unwrap_or_else(|| LiveSet::new(locals_len));
-    visiting.pop();
+            );
 
-    let params = live.into_sorted_locals();
-    computed.insert(label, params.clone());
-    params
+            let mut else_summary = summary.clone();
+            else_summary.defined = incoming_defined;
+            read_before_def_body_from_state(
+                else_body,
+                &mut else_summary,
+                locals_len,
+                bodies,
+                computed,
+                visiting,
+            );
+
+            let mut read_before_def = then_summary.read_before_def;
+            read_before_def.union_with(&else_summary.read_before_def);
+            summary.read_before_def = read_before_def;
+
+            match (then_summary.may_continue, else_summary.may_continue) {
+                (true, true) => {
+                    then_summary.defined.intersect_with(&else_summary.defined);
+                    summary.defined = then_summary.defined;
+                    summary.may_continue = true;
+                }
+                (true, false) => {
+                    summary.defined = then_summary.defined;
+                    summary.may_continue = true;
+                }
+                (false, true) => {
+                    summary.defined = else_summary.defined;
+                    summary.may_continue = true;
+                }
+                (false, false) => summary.terminate(),
+            }
+        }
+        StructuredStmt::CallHelper(label) => {
+            let params = compute_helper_params(*label, locals_len, bodies, computed, visiting);
+            summary.note_helper_reads(params);
+            summary.terminate();
+        }
+        StructuredStmt::Return(values) => {
+            for value in values {
+                match value {
+                    ReturnValue::Named { value, .. } => summary.note_expr_reads(value),
+                }
+            }
+            summary.terminate();
+        }
+        StructuredStmt::Raise(_) => summary.terminate(),
+    }
 }
 
 fn live_in_body_static(
@@ -3142,6 +3319,12 @@ impl LiveSet {
     fn union_with(&mut self, other: &Self) {
         for (dst, src) in self.bits.iter_mut().zip(&other.bits) {
             *dst |= *src;
+        }
+    }
+
+    fn intersect_with(&mut self, other: &Self) {
+        for (dst, src) in self.bits.iter_mut().zip(&other.bits) {
+            *dst &= *src;
         }
     }
 
@@ -3429,6 +3612,21 @@ mod tests {
     use crate::lir::{BinaryOp, CallEffect, ConstValue, Function, LirType, Local, ReturnValue};
 
     #[test]
+    fn final_late_cleanup_tail_runs_branch_recovery_then_dead_cleanup() {
+        assert_eq!(
+            FINAL_LATE_CLEANUP_PASSES,
+            &[
+                BackwardPassKind::BranchMerge,
+                BackwardPassKind::BranchSquash,
+                BackwardPassKind::AggressiveScalarSelectRecovery,
+                BackwardPassKind::DeadAssignments,
+                BackwardPassKind::HelperSignaturePruning,
+                BackwardPassKind::DeadAssignments,
+            ]
+        );
+    }
+
+    #[test]
     fn sinks_common_tail_helper_after_branch_assignments() {
         let target = Label(7);
         let mut body = vec![StructuredStmt::If {
@@ -3585,6 +3783,114 @@ mod tests {
 
         assert!(pass.run(&mut cx));
         assert_eq!(facts.entry_live_ins, vec![LocalId(1)]);
+    }
+
+    #[test]
+    fn helper_live_ins_drop_straight_line_arg_reassigned_before_read() {
+        let params = helper_live_ins_for_body(vec![
+            assign_int(LocalId(0), 1),
+            StructuredStmt::Return(vec![ReturnValue::Named {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(0)),
+            }]),
+        ]);
+
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn helper_live_ins_keep_read_before_assign() {
+        let params = helper_live_ins_for_body(vec![
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(0)),
+            }),
+            assign_int(LocalId(0), 1),
+        ]);
+
+        assert_eq!(params, vec![LocalId(0)]);
+    }
+
+    #[test]
+    fn helper_live_ins_keep_branch_path_that_reads_before_assign() {
+        let params = helper_live_ins_for_body(vec![
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(2)),
+                then_body: vec![assign_int(LocalId(0), 1)],
+                else_body: vec![StructuredStmt::Stmt(Stmt::Capture {
+                    key: "x".to_owned(),
+                    value: Expr::Local(LocalId(0)),
+                })],
+            },
+            StructuredStmt::Return(vec![ReturnValue::Named {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(0)),
+            }]),
+        ]);
+
+        assert_eq!(params, vec![LocalId(0), LocalId(2)]);
+    }
+
+    #[test]
+    fn helper_live_ins_drop_branch_assigned_before_join_read() {
+        let params = helper_live_ins_for_body(vec![
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(2)),
+                then_body: vec![assign_int(LocalId(0), 1)],
+                else_body: vec![assign_int(LocalId(0), 2)],
+            },
+            StructuredStmt::Return(vec![ReturnValue::Named {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(0)),
+            }]),
+        ]);
+
+        assert_eq!(params, vec![LocalId(2)]);
+    }
+
+    #[test]
+    fn helper_live_ins_keep_capture_effect_and_helper_call_reads() {
+        let function = helper_live_in_function();
+        let caller = Label(1);
+        let callee = Label(2);
+        let mut structured = StructuredFunction {
+            body: vec![StructuredStmt::CallHelper(caller)],
+            helpers: vec![
+                crate::lir_structure::StructuredHelper {
+                    label: caller,
+                    params: vec![LocalId(0), LocalId(1), LocalId(3)],
+                    body: vec![
+                        StructuredStmt::Stmt(Stmt::Capture {
+                            key: "captured".to_owned(),
+                            value: Expr::Local(LocalId(0)),
+                        }),
+                        StructuredStmt::Stmt(Stmt::CallEffect(CallEffect::Diagnostic {
+                            target: "Display".to_owned(),
+                            args: vec![Expr::Local(LocalId(1))],
+                        })),
+                        StructuredStmt::CallHelper(callee),
+                    ],
+                },
+                crate::lir_structure::StructuredHelper {
+                    label: callee,
+                    params: vec![LocalId(3)],
+                    body: vec![StructuredStmt::Return(vec![ReturnValue::Named {
+                        key: "x".to_owned(),
+                        value: Expr::Local(LocalId(3)),
+                    }])],
+                },
+            ],
+            facts: BackwardFacts::default(),
+        };
+        let mut facts = BackwardFacts::default();
+
+        let mut pass = HelperSignaturePruning;
+        let mut cx =
+            BackwardPassCx { function: &function, structured: &mut structured, facts: &mut facts };
+
+        assert!(pass.run(&mut cx));
+        assert_eq!(structured.helpers[0].params, vec![LocalId(0), LocalId(1), LocalId(3)]);
+        assert_eq!(structured.helpers[1].params, vec![LocalId(3)]);
     }
 
     #[test]
@@ -6082,6 +6388,44 @@ mod tests {
                 Local { id: LocalId(0), name_hint: "cond".to_owned(), ty: LirType::Bool },
                 Local { id: LocalId(1), name_hint: "x".to_owned(), ty: value_ty },
                 Local { id: LocalId(2), name_hint: "y".to_owned(), ty: value_ty },
+            ],
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        }
+    }
+
+    fn helper_live_ins_for_body(body: Vec<StructuredStmt>) -> Vec<LocalId> {
+        let function = helper_live_in_function();
+        let label = Label(1);
+        let mut structured = StructuredFunction {
+            body: vec![StructuredStmt::CallHelper(label)],
+            helpers: vec![crate::lir_structure::StructuredHelper {
+                label,
+                params: vec![LocalId(0), LocalId(1), LocalId(2), LocalId(3)],
+                body,
+            }],
+            facts: BackwardFacts::default(),
+        };
+        let mut facts = BackwardFacts::default();
+        let mut pass = HelperSignaturePruning;
+        let mut cx =
+            BackwardPassCx { function: &function, structured: &mut structured, facts: &mut facts };
+
+        pass.run(&mut cx);
+        structured.helpers[0].params.clone()
+    }
+
+    fn helper_live_in_function() -> Function {
+        Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0), LocalId(1), LocalId(2), LocalId(3)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "x".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(1), name_hint: "y".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(2), name_hint: "cond".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(3), name_hint: "z".to_owned(), ty: LirType::Int },
             ],
             entry: Label(0),
             blocks: Vec::new(),
