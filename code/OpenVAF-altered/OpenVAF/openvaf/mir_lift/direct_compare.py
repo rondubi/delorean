@@ -6,15 +6,24 @@ import ctypes
 import importlib.util
 import inspect
 import math
-import os
 import random
-import shutil
 import subprocess
 import sys
-import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
+
+from mir_lift_paths import (
+    MANIFEST_PATH,
+    SCRIPT_DIR,
+    compare_root,
+    model_source,
+    output_path,
+    publish_current_output,
+    require_workspace_root,
+    rustup_path,
+    tool_env,
+)
 
 
 SETUP_MODEL = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
@@ -346,6 +355,9 @@ def main() -> int:
     ap.add_argument("target", nargs="?", default="diode")
     ap.add_argument("cases", nargs="?", type=int, default=8)
     ap.add_argument("seed", nargs="?", type=int, default=1)
+    ap.add_argument("--work-root", type=Path, default=compare_root())
+    ap.add_argument("--target-dir", type=Path)
+    ap.add_argument("--current-dir", type=Path)
     ap.add_argument(
         "--mode",
         choices=("realistic", "conservative"),
@@ -357,19 +369,26 @@ def main() -> int:
         raise SystemExit("cases must be positive")
 
     random.seed(args.seed)
-    root = Path(__file__).resolve().parent
-    verilog = resolve_target(root, args.target)
+    root = SCRIPT_DIR
+    require_workspace_root()
+    verilog = resolve_target(args.target)
     module = parse_module(verilog)
-    work = Path(tempfile.gettempdir()) / f"mir_lift_compare_{module}"
-    work.mkdir(parents=True, exist_ok=True)
-    osdi = work / f"{module}.osdi"
-    py = default_lifted_python_path(verilog)
+    work_root = args.work_root.expanduser().resolve()
+    target_dir = (args.target_dir.expanduser().resolve() if args.target_dir else work_root / "target")
+    current_dir = (args.current_dir.expanduser().resolve() if args.current_dir else work_root / "out")
+    osdi_dir = work_root / "osdi"
+    osdi_dir.mkdir(parents=True, exist_ok=True)
+    current_dir.mkdir(parents=True, exist_ok=True)
+    osdi = osdi_dir / f"{module}.osdi"
+    py = default_lifted_python_path(verilog, current_dir)
 
-    compile_osdi(root, verilog, osdi)
-    lift_python(root, verilog, py)
+    compile_osdi(verilog, osdi, target_dir)
+    lift_python(root, verilog, py, work_root, target_dir, current_dir)
+    current_py = publish_current_output(py, verilog)
 
     print(f"osdi: {osdi}")
-    print(f"python: {py}")
+    print(f"lifted python: {py}")
+    print(f"latest lifted python: {current_py}")
     osdi_results, python_cases, shape, report = run_osdi(osdi, args.cases, args.mode)
     print(f"osdi cases: {len(osdi_results)}")
     print_report(args.mode, report)
@@ -1257,13 +1276,8 @@ def same(lhs: object, rhs: object) -> bool:
     return lhs == rhs
 
 
-def resolve_target(root: Path, target: str) -> Path:
-    repo = root.parent.parent
-    known = {
-        "diode": repo / "integration_tests/DIODE/diode.va",
-        "bsim4": repo / "integration_tests/BSIM4/bsim4.va",
-    }
-    return known.get(target, Path(target)).resolve()
+def resolve_target(target: str) -> Path:
+    return model_source(target)
 
 
 def parse_module(path: Path) -> str:
@@ -1274,24 +1288,19 @@ def parse_module(path: Path) -> str:
     raise SystemExit(f"no module declaration in {path}")
 
 
-def env() -> dict[str, str]:
-    e = os.environ.copy()
-    e["PATH"] = ":".join(["/home/ron/.cargo/bin", "/root/.cargo/bin", "/opt/LLVM/bin", e.get("PATH", "")])
-    return e
-
-
-def compile_osdi(root: Path, verilog: Path, osdi: Path) -> None:
-    workspace = root.parent.parent
-    rustup = shutil.which("rustup", path=env()["PATH"]) or "/home/ron/.cargo/bin/rustup"
+def compile_osdi(verilog: Path, osdi: Path, target_dir: Path) -> None:
+    workspace = require_workspace_root()
+    osdi.parent.mkdir(parents=True, exist_ok=True)
+    osdi.unlink(missing_ok=True)
     run(
         [
-            rustup,
+            rustup_path(),
             "run",
             "stable-aarch64-unknown-linux-gnu",
             "cargo",
             "run",
             "--manifest-path",
-            str(workspace / "Cargo.toml"),
+            str(MANIFEST_PATH),
             "-p",
             "openvaf-driver",
             "--",
@@ -1302,26 +1311,39 @@ def compile_osdi(root: Path, verilog: Path, osdi: Path) -> None:
             str(verilog),
         ],
         cwd=workspace,
+        target_dir=target_dir,
+    )
+    if not osdi.is_file() or osdi.stat().st_size == 0:
+        raise SystemExit(f"OSDI build did not write output: {osdi}")
+
+
+def lift_python(root: Path, verilog: Path, py: Path, work_root: Path, target_dir: Path, current_dir: Path) -> None:
+    run(
+        [
+            sys.executable,
+            str(root / "mir_lift_runner.py"),
+            str(verilog),
+            "-o",
+            str(py),
+            "--work-root",
+            str(work_root),
+            "--target-dir",
+            str(target_dir),
+            "--current-dir",
+            str(current_dir),
+        ],
+        cwd=root,
     )
 
 
-def lift_python(root: Path, verilog: Path, py: Path) -> None:
-    run([sys.executable, str(root / "mir_lift_runner.py"), str(verilog), "-o", str(py)], cwd=root)
-
-
-def default_lifted_python_path(verilog: Path) -> Path:
-    output_dir = os.environ.get("MIR_LIFT_CURRENT_DIR")
-    output = (
-        Path(output_dir).expanduser()
-        if output_dir
-        else Path(tempfile.gettempdir()) / "mir_lift_current"
-    ) / f"{verilog.stem}.py"
+def default_lifted_python_path(verilog: Path, current_dir: Path) -> Path:
+    output = output_path(current_dir, verilog)
     output.parent.mkdir(parents=True, exist_ok=True)
     return output
 
 
-def run(cmd: list[str], cwd: Path) -> None:
-    res = subprocess.run(cmd, cwd=cwd, env=env(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def run(cmd: list[str], cwd: Path, target_dir: Path | None = None) -> None:
+    res = subprocess.run(cmd, cwd=cwd, env=tool_env(target_dir), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if res.returncode != 0:
         if res.stdout:
             print(res.stdout, end="")
