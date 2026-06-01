@@ -986,8 +986,9 @@ mod tests {
     use mir::{Function, Value};
 
     use super::{
-        dump_function_lir_with_returns_and_captures,
+        dump_function_lir_with_returns_and_captures, emit_function_unit,
         lift_function_with_hir_returns_and_param_hints, lift_text, normalize_mir_input,
+        FunctionUnit,
     };
 
     #[test]
@@ -1082,6 +1083,63 @@ function %simparam_name() {
 
         let lifted = lift_text(input, None).unwrap();
         assert!(lifted.contains("simparam_gmin = _lir_simparam_opt(\"gmin\", 0.000000000001)"));
+    }
+
+    #[test]
+    fn variable_taint_names_generic_temps_by_lowering_origin() {
+        let input = r#"
+function %taint_names(v0, v1, v2) {
+                                block0:
+                                    v3 = fadd v0, v1
+                                    v4 = fadd v2, v0
+                                    v5 = fadd v3, v4
+}
+"#;
+        let (functions, interner) =
+            mir_reader::parse_functions(&normalize_mir_input(input)).unwrap();
+        let function = &functions[0];
+        let returns = ["v3", "v4", "v5"]
+            .into_iter()
+            .map(|name| value_by_name(function, name))
+            .collect::<Vec<_>>();
+
+        let mut hints = HashMap::new();
+        hints.insert(mir::Param::from(0usize), "param_left".to_owned());
+        hints.insert(mir::Param::from(1usize), "given_right".to_owned());
+        let mut unit = FunctionUnit::whole_with_returns(function, &returns).unwrap();
+        unit.param_name_hints = hints;
+        let lifted = emit_function_unit(&unit, &interner).unwrap();
+
+        assert!(lifted.contains("p3 = (param_left) + (given_right)"), "{lifted}");
+        assert!(lifted.contains("v4 = (v2) + (param_left)"), "{lifted}");
+        assert!(lifted.contains("v5 = (p3) + (v4)"), "{lifted}");
+        assert!(!lifted.contains("p4 ="), "{lifted}");
+        assert!(!lifted.contains("p5 ="), "{lifted}");
+    }
+
+    #[test]
+    fn variable_taint_keeps_generic_call_result_variable_named() {
+        let input = r#"
+function %call_taint(v0) {
+    fn0 = const fn %simparam_opt(2) -> 1
+    v1 = fconst 0x1p0
+                                block0:
+                                    v2 = call fn0(v0, v1)
+}
+"#;
+        let (functions, interner) =
+            mir_reader::parse_functions(&normalize_mir_input(input)).unwrap();
+        let function = &functions[0];
+        let ret = value_by_name(function, "v2");
+
+        let mut hints = HashMap::new();
+        hints.insert(mir::Param::from(0usize), "param_name".to_owned());
+        let mut unit = FunctionUnit::whole_with_returns(function, &[ret]).unwrap();
+        unit.param_name_hints = hints;
+        let lifted = emit_function_unit(&unit, &interner).unwrap();
+
+        assert!(lifted.contains("v2 = _lir_simparam_opt(param_name, 1"), "{lifted}");
+        assert!(!lifted.contains("p2 = _lir_simparam_opt"), "{lifted}");
     }
 
     #[test]

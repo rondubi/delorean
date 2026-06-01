@@ -11,6 +11,8 @@ pub struct Function {
     pub name: String,
     pub params: Vec<LocalId>,
     pub locals: Vec<Local>,
+    pub local_variable_touched: HashMap<LocalId, bool>,
+    pub local_generic_temp_name: HashMap<LocalId, bool>,
     pub entry: Label,
     pub blocks: Vec<Block>,
     pub returns: Vec<ReturnSlot>,

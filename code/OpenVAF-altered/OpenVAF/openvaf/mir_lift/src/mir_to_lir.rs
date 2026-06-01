@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{bail, Result};
 use hir_lower::{CallBackKind, ParamInfoKind};
@@ -25,6 +25,10 @@ struct LowerCx<'a, 'r> {
     resolver: &'r dyn Resolver,
     locals: Vec<Local>,
     locals_by_value: HashMap<Value, LocalId>,
+    variable_touched_by_value: HashMap<Value, bool>,
+    variable_touched_in_progress: HashSet<Value>,
+    local_variable_touched: HashMap<LocalId, bool>,
+    local_generic_temp_name: HashMap<LocalId, bool>,
     facts: ForwardFacts,
     labels_by_block: HashMap<Block, Label>,
     blocks: Vec<crate::lir::Block>,
@@ -42,6 +46,10 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             resolver,
             locals: Vec::new(),
             locals_by_value: HashMap::new(),
+            variable_touched_by_value: HashMap::new(),
+            variable_touched_in_progress: HashSet::new(),
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             facts,
             labels_by_block,
             blocks: Vec::new(),
@@ -86,6 +94,8 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             name: self.unit.name.clone(),
             params,
             locals: self.locals.clone(),
+            local_variable_touched: self.local_variable_touched.clone(),
+            local_generic_temp_name: self.local_generic_temp_name.clone(),
             entry: self.labels_by_block[&self.unit.entry],
             blocks: self.blocks.clone(),
             returns,
@@ -325,11 +335,13 @@ impl<'a, 'r> LowerCx<'a, 'r> {
         if needs_parallel_temps {
             let mut temp_copies = Vec::with_capacity(copies.len());
             for (result, incoming, dst) in copies {
+                let value = self.expr_for_value(incoming);
                 let tmp = self.fresh_temp(
                     format!("phi_{}_from_{}", self.local_name_hint(result), block_name(pred)),
                     LirType::Unknown,
+                    expr_variable_touched(&value, &self.local_variable_touched),
                 );
-                stmts.push(Stmt::Assign { dst: tmp, value: self.expr_for_value(incoming) });
+                stmts.push(Stmt::Assign { dst: tmp, value });
                 temp_copies.push((result, dst, tmp));
             }
             for (result, dst, tmp) in temp_copies {
@@ -455,6 +467,8 @@ impl<'a, 'r> LowerCx<'a, 'r> {
         }
 
         let id = LocalId(self.locals.len());
+        let variable_touched = self.value_variable_touched(value);
+        let generic_temp_name = self.value_has_generic_temp_name(value);
         self.locals.push(Local {
             id,
             name_hint: self.name_hint_for_value(value),
@@ -467,6 +481,8 @@ impl<'a, 'r> LowerCx<'a, 'r> {
                 .unwrap_or_else(|| type_for_value(self.unit.source, value)),
         });
         self.locals_by_value.insert(value, id);
+        self.local_variable_touched.insert(id, variable_touched);
+        self.local_generic_temp_name.insert(id, generic_temp_name);
         id
     }
 
@@ -495,6 +511,14 @@ impl<'a, 'r> LowerCx<'a, 'r> {
             .first()
             .and_then(|value| self.string_const(*value))?;
         Some(format!("simparam_{name}"))
+    }
+
+    fn value_has_generic_temp_name(&self, value: Value) -> bool {
+        match self.unit.source.dfg.value_def(value) {
+            ValueDef::Param(param) => !self.unit.param_name_hints.contains_key(&param),
+            ValueDef::Result(inst, 0) => self.name_hint_for_call_result(inst).is_none(),
+            _ => true,
+        }
     }
 
     fn call_is_simparam_opt(&self, func_ref: FuncRef) -> bool {
@@ -548,10 +572,85 @@ impl<'a, 'r> LowerCx<'a, 'r> {
         }
     }
 
-    fn fresh_temp(&mut self, name_hint: String, ty: LirType) -> LocalId {
+    fn fresh_temp(&mut self, name_hint: String, ty: LirType, variable_touched: bool) -> LocalId {
         let id = LocalId(self.locals.len());
         self.locals.push(Local { id, name_hint, ty });
+        self.local_variable_touched.insert(id, variable_touched);
+        self.local_generic_temp_name.insert(id, false);
         id
+    }
+
+    fn value_variable_touched(&mut self, value: Value) -> bool {
+        if let Some(alias) = self.facts.aliases.exprs.get(&value).copied() {
+            return self.alias_expr_variable_touched(alias);
+        }
+
+        let value = self.canonical_value(value);
+        if let Some(&touched) = self.variable_touched_by_value.get(&value) {
+            return touched;
+        }
+        if !self.variable_touched_in_progress.insert(value) {
+            return true;
+        }
+
+        let touched = match self.unit.source.dfg.value_def(value) {
+            ValueDef::Const(_) => false,
+            ValueDef::Param(param) => !self.unit.param_name_hints.contains_key(&param),
+            ValueDef::Result(inst, _) => self.inst_variable_touched(inst),
+            ValueDef::Invalid => true,
+        };
+
+        self.variable_touched_in_progress.remove(&value);
+        self.variable_touched_by_value.insert(value, touched);
+        touched
+    }
+
+    fn inst_variable_touched(&mut self, inst: Inst) -> bool {
+        match self.unit.source.dfg.insts[inst].clone() {
+            InstructionData::Unary { opcode, arg } => {
+                if unary_op(opcode).is_some() {
+                    self.value_variable_touched(arg)
+                } else {
+                    true
+                }
+            }
+            InstructionData::Binary { opcode, args } => {
+                if binary_op(opcode).is_some() {
+                    args.iter().any(|arg| self.value_variable_touched(*arg))
+                } else {
+                    true
+                }
+            }
+            InstructionData::PhiNode(phi) => self
+                .unit
+                .blocks
+                .iter()
+                .filter_map(|pred| self.unit.source.dfg.phi_edge_val(&phi, *pred))
+                .any(|incoming| self.value_variable_touched(incoming)),
+            InstructionData::Call { .. } => true,
+            InstructionData::Jump { .. }
+            | InstructionData::Branch { .. }
+            | InstructionData::Exit => true,
+        }
+    }
+
+    fn alias_expr_variable_touched(&mut self, data: AliasExpr) -> bool {
+        match data {
+            AliasExpr::Unary { opcode, arg } => {
+                if unary_op(opcode).is_some() {
+                    self.value_variable_touched(arg)
+                } else {
+                    true
+                }
+            }
+            AliasExpr::Binary { opcode, args } => {
+                if binary_op(opcode).is_some() {
+                    args.iter().any(|arg| self.value_variable_touched(*arg))
+                } else {
+                    true
+                }
+            }
+        }
     }
 
     fn fresh_label(&self) -> Label {
@@ -839,6 +938,21 @@ fn value_name(value: Value) -> String {
 
 fn block_name(block: Block) -> String {
     format!("{block}").replace('.', "_")
+}
+
+fn expr_variable_touched(expr: &Expr, local_variable_touched: &HashMap<LocalId, bool>) -> bool {
+    match expr {
+        Expr::Local(local) => local_variable_touched.get(local).copied().unwrap_or(true),
+        Expr::Const(_) => false,
+        Expr::Unary { arg, .. } | Expr::Abs { arg } => {
+            expr_variable_touched(arg, local_variable_touched)
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            expr_variable_touched(lhs, local_variable_touched)
+                || expr_variable_touched(rhs, local_variable_touched)
+        }
+        Expr::SimparamOpt { .. } | Expr::Call { .. } | Expr::Unsupported { .. } => true,
+    }
 }
 
 #[cfg(test)]

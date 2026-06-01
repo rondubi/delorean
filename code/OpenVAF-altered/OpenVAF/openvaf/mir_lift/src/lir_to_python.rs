@@ -1128,7 +1128,7 @@ impl NameTable {
         let mut used = HashMap::<String, usize>::new();
         let mut locals = HashMap::new();
         for local in &function.locals {
-            let base = sanitize_ident(&local.name_hint);
+            let base = sanitize_ident(&python_name_hint(function, local.id, &local.name_hint));
             let count = used.entry(base.clone()).or_insert(0);
             let name = if *count == 0 { base.clone() } else { format!("{base}_{count}") };
             *count += 1;
@@ -1143,6 +1143,23 @@ impl NameTable {
 
     fn local(&self, local: LocalId) -> String {
         self.locals.get(&local).cloned().unwrap_or_else(|| format!("l{}", local.0))
+    }
+}
+
+fn python_name_hint(function: &Function, local: LocalId, hint: &str) -> String {
+    let Some(rest) = hint.strip_prefix('v') else {
+        return hint.to_owned();
+    };
+    if rest.is_empty() || !rest.chars().all(|ch| ch.is_ascii_digit()) {
+        return hint.to_owned();
+    }
+    if !function.local_generic_temp_name.get(&local).copied().unwrap_or(false) {
+        return hint.to_owned();
+    }
+    if function.local_variable_touched.get(&local).copied().unwrap_or(true) {
+        hint.to_owned()
+    } else {
+        format!("p{rest}")
     }
 }
 
@@ -1203,7 +1220,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::process::Command;
 
-    use super::emit_function;
+    use super::{emit_function, python_name_hint};
     use crate::lir::{
         Block, CallEffect, ConstValue, Expr, Function, Label, LirType, Local, LocalId, ReturnValue,
         Stmt, Terminator,
@@ -1230,6 +1247,48 @@ mod tests {
         assert!(!emitted.contains(&needle), "found {needle:?} in:\n{emitted}");
     }
 
+    fn name_hint_function(
+        local: LocalId,
+        variable_touched: bool,
+        generic_temp_name: bool,
+    ) -> Function {
+        Function {
+            name: "name_hints".to_owned(),
+            params: Vec::new(),
+            locals: vec![Local { id: local, name_hint: "v123".to_owned(), ty: LirType::Real }],
+            local_variable_touched: HashMap::from([(local, variable_touched)]),
+            local_generic_temp_name: HashMap::from([(local, generic_temp_name)]),
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn preserves_explicit_v_number_hint_without_variable_taint() {
+        let local = LocalId(0);
+        let function = name_hint_function(local, false, false);
+
+        assert_eq!(python_name_hint(&function, local, "v123"), "v123");
+    }
+
+    #[test]
+    fn renames_non_variable_generic_v_number_temp_to_parameter_name() {
+        let local = LocalId(0);
+        let function = name_hint_function(local, false, true);
+
+        assert_eq!(python_name_hint(&function, local, "v123"), "p123");
+    }
+
+    #[test]
+    fn preserves_variable_touched_generic_v_number_temp() {
+        let local = LocalId(0);
+        let function = name_hint_function(local, true, true);
+
+        assert_eq!(python_name_hint(&function, local, "v123"), "v123");
+    }
+
     #[test]
     fn emits_explicit_call_semantics_without_mir_call_runtime() {
         let value = LocalId(0);
@@ -1237,6 +1296,8 @@ mod tests {
             name: "call_effects".to_owned(),
             params: Vec::new(),
             locals: vec![Local { id: value, name_hint: "val".to_owned(), ty: LirType::Real }],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![Block {
                 label: Label(0),
@@ -1319,6 +1380,8 @@ mod tests {
                 Local { id: x, name_hint: "x".to_owned(), ty: LirType::Real },
                 Local { id: out, name_hint: "out".to_owned(), ty: LirType::Real },
             ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![Block {
                 label: Label(0),
@@ -1350,6 +1413,8 @@ mod tests {
                 Local { id: input, name_hint: "input".to_owned(), ty: LirType::Int },
                 Local { id: computed, name_hint: "computed".to_owned(), ty: LirType::Int },
             ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![Block {
                 label: Label(0),
@@ -1404,6 +1469,8 @@ mod tests {
             name: "bad_call".to_owned(),
             params: Vec::new(),
             locals: Vec::new(),
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![Block {
                 label: Label(0),
@@ -1428,6 +1495,8 @@ mod tests {
             name: "noop_branch".to_owned(),
             params: vec![cond],
             locals: vec![Local { id: cond, name_hint: "cond".to_owned(), ty: LirType::Bool }],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![Block {
                 label: Label(0),
@@ -1487,6 +1556,8 @@ mod tests {
                 Local { id: cond, name_hint: "cond".to_owned(), ty: LirType::Bool },
                 Local { id: value, name_hint: "v".to_owned(), ty: LirType::Int },
             ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![
                 Block {
@@ -1559,6 +1630,8 @@ mod tests {
                 Local { id: i, name_hint: "i".to_owned(), ty: LirType::Int },
                 Local { id: acc, name_hint: "acc".to_owned(), ty: LirType::Int },
             ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![
                 Block {
@@ -1649,6 +1722,8 @@ mod tests {
                 Local { id: a, name_hint: "a".to_owned(), ty: LirType::Int },
                 Local { id: b, name_hint: "b".to_owned(), ty: LirType::Int },
             ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: Vec::new(),
             returns: Vec::new(),
@@ -1687,6 +1762,8 @@ mod tests {
                 Local { id: a, name_hint: "a".to_owned(), ty: LirType::Int },
                 Local { id: b, name_hint: "b".to_owned(), ty: LirType::Int },
             ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: Vec::new(),
             returns: Vec::new(),
@@ -1758,6 +1835,8 @@ mod tests {
                 Local { id: stale, name_hint: "stale".to_owned(), ty: LirType::Int },
                 Local { id: maybe, name_hint: "maybe".to_owned(), ty: LirType::Int },
             ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![
                 Block {
@@ -1836,6 +1915,8 @@ mod tests {
                 Local { id: cond, name_hint: "cond".to_owned(), ty: LirType::Bool },
                 Local { id: value, name_hint: "value".to_owned(), ty: LirType::Int },
             ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![
                 Block {
@@ -1899,6 +1980,8 @@ mod tests {
             name: "defined_capture".to_owned(),
             params: Vec::new(),
             locals: vec![Local { id: value, name_hint: "value".to_owned(), ty: LirType::Int }],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![Block {
                 label: Label(0),

@@ -1069,6 +1069,8 @@ mod tests {
                 Local { id: LocalId(2), name_hint: "c".to_owned(), ty: LirType::Int },
                 Local { id: LocalId(3), name_hint: "d".to_owned(), ty: LirType::Int },
             ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
             entry: Label(0),
             blocks: vec![Block {
                 label: Label(0),
