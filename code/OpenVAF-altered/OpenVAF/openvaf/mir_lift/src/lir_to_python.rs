@@ -192,7 +192,6 @@ fn emit_capture(
     let undefined = expr_undefined_local_ids(value, defined);
     if undefined.is_empty() {
         writeln!(out, "{}{} = {}", pad(indent), capture_value_name(field), expr(value, cx.names)?)?;
-        writeln!(out, "{}{} = True", pad(indent), capture_valid_name(field))?;
         return Ok(());
     }
 
@@ -203,10 +202,8 @@ fn emit_capture(
         .join(" and ");
     writeln!(out, "{}if {guard}:", pad(indent))?;
     writeln!(out, "{}{} = {}", pad(indent + 1), capture_value_name(field), expr(value, cx.names)?)?;
-    writeln!(out, "{}{} = True", pad(indent + 1), capture_valid_name(field))?;
     writeln!(out, "{}else:", pad(indent))?;
     writeln!(out, "{}{} = _LIR_ABSENT", pad(indent + 1), capture_value_name(field))?;
-    writeln!(out, "{}{} = False", pad(indent + 1), capture_valid_name(field))?;
     Ok(())
 }
 
@@ -463,7 +460,7 @@ fn emit_result_return(
     if cx.captures_outputs {
         for key in &cx.output_layout.capture_keys {
             let field = cx.output_layout.field(key)?;
-            writeln!(out, "{}if {}:", pad(indent), capture_valid_name(field))?;
+            writeln!(out, "{}if {} is not _LIR_ABSENT:", pad(indent), capture_value_name(field))?;
             writeln!(
                 out,
                 "{}_lir_result.{field} = {}",
@@ -663,7 +660,7 @@ impl OutputLayout {
         self.capture_keys
             .iter()
             .filter_map(|key| self.field_by_key.get(key))
-            .flat_map(|field| [capture_value_name(field), capture_valid_name(field)])
+            .map(|field| capture_value_name(field))
             .collect()
     }
 
@@ -831,10 +828,6 @@ fn is_python_keyword(name: &str) -> bool {
 
 fn capture_value_name(field: &str) -> String {
     format!("_lir_capture_{field}")
-}
-
-fn capture_valid_name(field: &str) -> String {
-    format!("_lir_capture_{field}_valid")
 }
 
 fn result_class_name(function_name: &str) -> String {
@@ -1037,11 +1030,7 @@ fn entry_args_list(
     captures_effects: bool,
 ) -> String {
     let mut args = if output_layout.captures_outputs() {
-        output_layout
-            .capture_keys
-            .iter()
-            .flat_map(|_| ["_LIR_ABSENT".to_owned(), "False".to_owned()])
-            .collect::<Vec<_>>()
+        output_layout.capture_keys.iter().map(|_| "_LIR_ABSENT".to_owned()).collect::<Vec<_>>()
     } else {
         Vec::new()
     };
@@ -1876,13 +1865,13 @@ mod tests {
         assert_no_trampoline_protocol(&emitted);
         assert!(emitted.contains("return _stale_capture_bb_1("), "{emitted}");
         assert!(emitted.contains(r#"_lir_capture_slot = _LIR_ABSENT"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_slot_valid = False"#), "{emitted}");
-        assert!(emitted.contains(r#"if _lir_capture_slot_valid:"#), "{emitted}");
+        assert!(emitted.contains(r#"if _lir_capture_slot is not _LIR_ABSENT:"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_result.slot = _lir_capture_slot"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_absent_fields = frozenset(("slot",))"#), "{emitted}");
         assert!(emitted.contains("__getattr__ = _lir_result_getattr"), "{emitted}");
         assert_no_absent_result_field_init(&emitted, "slot");
         assert!(!emitted.contains(r#"_lir_result.slot = None"#), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_slot_valid"), "{emitted}");
         assert!(!emitted.contains("_lir_capture_slot_present"), "{emitted}");
         assert!(!emitted.contains("_lir_capture_slot_defined"), "{emitted}");
 
@@ -1944,14 +1933,14 @@ mod tests {
 
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
-        assert!(emitted.contains(r#"_lir_capture_slot_valid = True"#), "{emitted}");
-        assert!(emitted.contains(r#"if _lir_capture_slot_valid:"#), "{emitted}");
+        assert!(emitted.contains(r#"if _lir_capture_slot is not _LIR_ABSENT:"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_result.slot = _lir_capture_slot"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_absent_fields = frozenset(("slot",))"#), "{emitted}");
         assert!(emitted.contains("__getattr__ = _lir_result_getattr"), "{emitted}");
         assert_no_absent_result_field_init(&emitted, "slot");
         assert!(!emitted.contains("    def __init__(self):"), "{emitted}");
         assert!(!emitted.contains(r#"_lir_result.slot = value"#), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_slot_valid"), "{emitted}");
         assert!(!emitted.contains("_lir_capture_slot_present"), "{emitted}");
         assert!(!emitted.contains("_lir_capture_slot_defined"), "{emitted}");
         assert_result_field_writes_follow_exit_packing(&emitted);
@@ -1999,11 +1988,11 @@ mod tests {
         assert_no_trampoline_protocol(&emitted);
         assert!(!emitted.contains("is not _LIR_UNDEF"), "{emitted}");
         assert!(emitted.contains(r#"_lir_capture_slot = value"#), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_slot_valid = True"#), "{emitted}");
-        assert!(emitted.contains(r#"if _lir_capture_slot_valid:"#), "{emitted}");
+        assert!(emitted.contains(r#"if _lir_capture_slot is not _LIR_ABSENT:"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_result.slot = _lir_capture_slot"#), "{emitted}");
         assert_no_absent_result_field_init(&emitted, "slot");
         assert!(!emitted.contains(r#"_lir_result.slot = None"#), "{emitted}");
+        assert!(!emitted.contains("_lir_capture_slot_valid"), "{emitted}");
         assert!(!emitted.contains("_lir_capture_slot_present"), "{emitted}");
         assert!(!emitted.contains("_lir_capture_slot_defined"), "{emitted}");
         assert_result_field_writes_follow_exit_packing(&emitted);

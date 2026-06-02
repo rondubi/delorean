@@ -99,6 +99,7 @@ const LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchMerge,
     BackwardPassKind::BranchSquash,
+    BackwardPassKind::PredicateInlining,
     BackwardPassKind::AggressiveScalarSelectRecovery,
     BackwardPassKind::HelperSignaturePruning,
     BackwardPassKind::CopyAliasPropagation,
@@ -107,6 +108,7 @@ const LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchMerge,
     BackwardPassKind::BranchSquash,
+    BackwardPassKind::PredicateInlining,
     BackwardPassKind::AggressiveScalarSelectRecovery,
     BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::UnaryTempInlining,
@@ -116,6 +118,7 @@ const LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
 const FINAL_LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::BranchMerge,
     BackwardPassKind::BranchSquash,
+    BackwardPassKind::PredicateInlining,
     BackwardPassKind::AggressiveScalarSelectRecovery,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
@@ -1567,7 +1570,7 @@ fn is_total_comparison_operand(expr: &Expr, local_types: &[LirType]) -> bool {
     match expr {
         Expr::Local(local) => matches!(
             local_types.get(local.0),
-            Some(LirType::Bool | LirType::Int | LirType::Real | LirType::Str)
+            Some(LirType::Bool | LirType::Int | LirType::Real | LirType::Str | LirType::Unknown)
         ),
         Expr::Const(
             ConstValue::Bool(_) | ConstValue::Int(_) | ConstValue::Real(_) | ConstValue::Str(_),
@@ -3910,6 +3913,7 @@ mod tests {
             &[
                 BackwardPassKind::BranchMerge,
                 BackwardPassKind::BranchSquash,
+                BackwardPassKind::PredicateInlining,
                 BackwardPassKind::AggressiveScalarSelectRecovery,
                 BackwardPassKind::DeadAssignments,
                 BackwardPassKind::HelperSignaturePruning,
@@ -5374,6 +5378,33 @@ mod tests {
         for body in [&mut with_call, &mut with_div_comparison] {
             assert!(!inline_predicates_in_body(body, &local_types(&function), &HashSet::new(),));
         }
+    }
+
+    #[test]
+    fn predicate_inlining_accepts_unknown_locals_in_pure_comparisons() {
+        let function = unknown_predicate_function();
+        let predicate = bool_and(
+            compare_expr(BinaryOp::Le, Expr::Local(LocalId(0)), Expr::Const(ConstValue::Int(0))),
+            compare_expr(BinaryOp::Eq, Expr::Local(LocalId(1)), Expr::Const(ConstValue::Int(2))),
+        );
+        let mut body = vec![
+            assign_expr(LocalId(2), predicate.clone()),
+            StructuredStmt::If {
+                cond: Expr::Local(LocalId(2)),
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            },
+        ];
+
+        assert!(inline_predicates_in_body(&mut body, &local_types(&function), &HashSet::new(),));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::If {
+                cond: predicate,
+                then_body: vec![assign_int(LocalId(3), 1)],
+                else_body: vec![assign_int(LocalId(3), 0)],
+            }]
+        );
     }
 
     #[test]
@@ -7433,6 +7464,25 @@ mod tests {
                 Local { id: LocalId(2), name_hint: "temp".to_owned(), ty: LirType::Int },
                 Local { id: LocalId(3), name_hint: "out".to_owned(), ty: LirType::Bool },
                 Local { id: LocalId(4), name_hint: "flag".to_owned(), ty: LirType::Bool },
+            ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        }
+    }
+
+    fn unknown_predicate_function() -> Function {
+        Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(0), LocalId(1)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "a".to_owned(), ty: LirType::Unknown },
+                Local { id: LocalId(1), name_hint: "b".to_owned(), ty: LirType::Unknown },
+                Local { id: LocalId(2), name_hint: "pred".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(3), name_hint: "out".to_owned(), ty: LirType::Int },
             ],
             local_variable_touched: HashMap::new(),
             local_generic_temp_name: HashMap::new(),
