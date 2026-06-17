@@ -24,9 +24,15 @@ pub(crate) struct StructuredHelper {
 pub(crate) enum StructuredStmt {
     Stmt(Stmt),
     If { cond: Expr, then_body: Vec<StructuredStmt>, else_body: Vec<StructuredStmt> },
-    CallHelper(Label),
+    CallHelper { label: Label, arg_hints: Vec<LocalId> },
     Return(Vec<ReturnValue>),
     Raise(&'static str),
+}
+
+impl StructuredStmt {
+    pub(crate) fn call_helper(label: Label) -> Self {
+        Self::CallHelper { label, arg_hints: Vec::new() }
+    }
 }
 
 pub(crate) fn structure(function: &Function) -> Result<StructuredFunction> {
@@ -65,7 +71,7 @@ pub(crate) fn structure(function: &Function) -> Result<StructuredFunction> {
 
     let start = Instant::now();
     let body = if builder.plan.is_helper(function.entry) {
-        vec![StructuredStmt::CallHelper(function.entry)]
+        vec![StructuredStmt::call_helper(function.entry)]
     } else {
         let mut active = HashSet::new();
         builder.block_body(function.entry, &mut active)?
@@ -77,6 +83,7 @@ pub(crate) fn structure(function: &Function) -> Result<StructuredFunction> {
     let mut structured = StructuredFunction { helpers, body, facts: Default::default() };
     let start = Instant::now();
     structured.facts = lir_backward::run_backward_passes(function, &mut structured);
+    populate_helper_call_arg_hints(&mut structured);
     validate_helper_calls(&structured)?;
     if timing {
         eprintln!("mir-lift timing: {} structure-backward {:?}", function.name, start.elapsed());
@@ -102,12 +109,46 @@ fn validate_helper_calls(structured: &StructuredFunction) -> Result<()> {
 fn collect_helper_calls(body: &[StructuredStmt], referenced: &mut HashSet<Label>) {
     for stmt in body {
         match stmt {
-            StructuredStmt::CallHelper(label) => {
+            StructuredStmt::CallHelper { label, .. } => {
                 referenced.insert(*label);
             }
             StructuredStmt::If { then_body, else_body, .. } => {
                 collect_helper_calls(then_body, referenced);
                 collect_helper_calls(else_body, referenced);
+            }
+            StructuredStmt::Stmt(_) | StructuredStmt::Return(_) | StructuredStmt::Raise(_) => {}
+        }
+    }
+}
+
+fn populate_helper_call_arg_hints(structured: &mut StructuredFunction) {
+    let helper_params = structured
+        .helpers
+        .iter()
+        .map(|helper| (helper.label, helper.params.clone()))
+        .collect::<HashMap<_, _>>();
+    populate_helper_call_arg_hints_in_body(&mut structured.body, &helper_params);
+    for helper in &mut structured.helpers {
+        populate_helper_call_arg_hints_in_body(&mut helper.body, &helper_params);
+    }
+}
+
+fn populate_helper_call_arg_hints_in_body(
+    body: &mut [StructuredStmt],
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) {
+    for stmt in body {
+        match stmt {
+            StructuredStmt::CallHelper { label, arg_hints } => {
+                if let Some(params) = helper_params.get(label) {
+                    if !lir_backward::helper_arg_hints_are_valid_read_set(arg_hints, params) {
+                        *arg_hints = params.clone();
+                    }
+                }
+            }
+            StructuredStmt::If { then_body, else_body, .. } => {
+                populate_helper_call_arg_hints_in_body(then_body, helper_params);
+                populate_helper_call_arg_hints_in_body(else_body, helper_params);
             }
             StructuredStmt::Stmt(_) | StructuredStmt::Return(_) | StructuredStmt::Raise(_) => {}
         }
@@ -187,7 +228,7 @@ impl StructureBuilder<'_> {
         active: &mut HashSet<Label>,
     ) -> Result<Vec<StructuredStmt>> {
         if self.plan.is_helper(label) {
-            return Ok(vec![StructuredStmt::CallHelper(label)]);
+            return Ok(vec![StructuredStmt::call_helper(label)]);
         }
 
         if active.contains(&label) {
@@ -246,4 +287,42 @@ fn mark_cycle_targets_from(
 
     visiting.remove(&label);
     visited.insert(label);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn populate_helper_call_arg_hints_preserves_strict_subsets() {
+        let target = Label(9);
+        let mut structured = StructuredFunction {
+            body: vec![
+                StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] },
+                StructuredStmt::CallHelper {
+                    label: target,
+                    arg_hints: vec![LocalId(3), LocalId(1)],
+                },
+            ],
+            helpers: vec![StructuredHelper {
+                label: target,
+                params: vec![LocalId(1), LocalId(3)],
+                body: Vec::new(),
+            }],
+            facts: Default::default(),
+        };
+
+        populate_helper_call_arg_hints(&mut structured);
+
+        assert_eq!(
+            structured.body,
+            vec![
+                StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] },
+                StructuredStmt::CallHelper {
+                    label: target,
+                    arg_hints: vec![LocalId(1), LocalId(3)],
+                },
+            ]
+        );
+    }
 }

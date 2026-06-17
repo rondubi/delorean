@@ -276,11 +276,11 @@ fn emit_structured_stmt(
         StructuredStmt::If { cond, then_body, else_body } => {
             emit_if(out, cond, then_body, else_body, cx, indent, assigned, defined)?;
         }
-        StructuredStmt::CallHelper(label) => {
+        StructuredStmt::CallHelper { label, arg_hints } => {
             if Some(*label) == cx.current_helper {
-                emit_self_loop_continue(out, *label, cx, indent, assigned)?;
+                emit_self_loop_continue(out, *label, arg_hints, cx, indent, assigned)?;
             } else {
-                let args = helper_args_list(*label, cx, assigned)?;
+                let args = helper_args_list(*label, arg_hints, cx, assigned)?;
                 writeln!(
                     out,
                     "{}return {}({args})",
@@ -358,12 +358,13 @@ fn emit_if(
 fn emit_self_loop_continue(
     out: &mut String,
     label: Label,
+    arg_hints: &[LocalId],
     cx: &EmitCx<'_>,
     indent: usize,
     assigned: &HashSet<LocalId>,
 ) -> Result<()> {
     let params = cx.helper_params.get(&label).cloned().unwrap_or_default();
-    let args = helper_param_arg_exprs(label, cx, assigned)?;
+    let args = helper_param_arg_exprs(label, arg_hints, cx, assigned)?;
     if !params.is_empty() {
         let targets = params.iter().map(|param| cx.names.local(*param)).collect::<Vec<_>>();
         if targets != args {
@@ -374,28 +375,36 @@ fn emit_self_loop_continue(
     Ok(())
 }
 
-fn helper_args_list(label: Label, cx: &EmitCx<'_>, assigned: &HashSet<LocalId>) -> Result<String> {
+fn helper_args_list(
+    label: Label,
+    arg_hints: &[LocalId],
+    cx: &EmitCx<'_>,
+    assigned: &HashSet<LocalId>,
+) -> Result<String> {
     let mut args =
         if cx.captures_outputs { cx.output_layout.capture_state_names() } else { Vec::new() };
     if cx.captures_effects {
         args.push("_lir_invalid_params".to_owned());
     }
-    args.extend(helper_param_arg_exprs(label, cx, assigned)?);
+    args.extend(helper_param_arg_exprs(label, arg_hints, cx, assigned)?);
     Ok(args.join(", "))
 }
 
 fn helper_param_arg_exprs(
     label: Label,
+    arg_hints: &[LocalId],
     cx: &EmitCx<'_>,
     assigned: &HashSet<LocalId>,
 ) -> Result<Vec<String>> {
-    cx.helper_params
-        .get(&label)
-        .cloned()
-        .unwrap_or_default()
+    let params = cx.helper_params.get(&label).cloned().unwrap_or_default();
+    let required = helper_call_required_args(arg_hints, &params);
+    params
         .into_iter()
         .map(|arg| -> Result<String> {
-            if !assigned.contains(&arg) && !cx.optional_helper_live_ins.contains(&(label, arg)) {
+            if required.contains(&arg)
+                && !assigned.contains(&arg)
+                && !cx.optional_helper_live_ins.contains(&(label, arg))
+            {
                 bail!(
                     "structured LIR helper {} requires {} before it is defined",
                     helper_name(cx.helper_prefix, label),
@@ -409,6 +418,14 @@ fn helper_param_arg_exprs(
             }
         })
         .collect()
+}
+
+fn helper_call_required_args(arg_hints: &[LocalId], params: &[LocalId]) -> HashSet<LocalId> {
+    if crate::lir_backward::helper_arg_hints_are_valid_read_set(arg_hints, params) {
+        arg_hints.iter().copied().collect()
+    } else {
+        params.iter().copied().collect()
+    }
 }
 
 fn tuple_items(items: &[String]) -> String {
@@ -935,7 +952,7 @@ fn validate_self_loop_stmt(
     saw_self_call: &mut bool,
 ) -> Result<()> {
     match stmt {
-        StructuredStmt::CallHelper(target) if *target == label => {
+        StructuredStmt::CallHelper { label: target, .. } if *target == label => {
             *saw_self_call = true;
         }
         StructuredStmt::If { then_body, else_body, .. } => {
@@ -943,7 +960,7 @@ fn validate_self_loop_stmt(
             validate_self_loop_body_inner(label, else_body, saw_self_call)?;
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => {}
     }
@@ -984,7 +1001,7 @@ fn body_calls_helper(body: &[StructuredStmt], target: Label) -> bool {
 
 fn stmt_calls_helper(stmt: &StructuredStmt, target: Label) -> bool {
     match stmt {
-        StructuredStmt::CallHelper(label) => *label == target,
+        StructuredStmt::CallHelper { label, .. } => *label == target,
         StructuredStmt::If { then_body, else_body, .. } => {
             body_calls_helper(then_body, target) || body_calls_helper(else_body, target)
         }
@@ -995,7 +1012,7 @@ fn stmt_calls_helper(stmt: &StructuredStmt, target: Label) -> bool {
 fn collect_structured_helper_calls(body: &[StructuredStmt], calls: &mut Vec<Label>) {
     for stmt in body {
         match stmt {
-            StructuredStmt::CallHelper(label) => calls.push(*label),
+            StructuredStmt::CallHelper { label, .. } => calls.push(*label),
             StructuredStmt::If { then_body, else_body, .. } => {
                 collect_structured_helper_calls(then_body, calls);
                 collect_structured_helper_calls(else_body, calls);
@@ -1198,7 +1215,7 @@ fn stmt_captures_effects(stmt: &StructuredStmt) -> bool {
             body_captures_effects(then_body) || body_captures_effects(else_body)
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     }
@@ -1733,7 +1750,7 @@ mod tests {
         let assigned = HashSet::from([a, b]);
         let mut emitted = String::new();
 
-        super::emit_self_loop_continue(&mut emitted, label, &cx, 2, &assigned).unwrap();
+        super::emit_self_loop_continue(&mut emitted, label, &[a, b], &cx, 2, &assigned).unwrap();
 
         assert_eq!(emitted, "        continue\n");
         assert!(!emitted.contains("a, b = a, b"), "{emitted}");
@@ -1773,15 +1790,55 @@ mod tests {
         let assigned = HashSet::from([a]);
         let mut emitted = String::new();
 
-        super::emit_self_loop_continue(&mut emitted, label, &cx, 2, &assigned).unwrap();
+        super::emit_self_loop_continue(&mut emitted, label, &[a, b], &cx, 2, &assigned).unwrap();
 
         assert_eq!(emitted, "        a, b = a, _LIR_UNDEF\n        continue\n");
     }
 
     #[test]
+    fn helper_call_args_use_per_call_hints_for_unassigned_dead_params() {
+        let a = LocalId(0);
+        let b = LocalId(1);
+        let label = Label(4);
+        let function = Function {
+            name: "hinted_call".to_owned(),
+            params: Vec::new(),
+            locals: vec![
+                Local { id: a, name_hint: "a".to_owned(), ty: LirType::Int },
+                Local { id: b, name_hint: "b".to_owned(), ty: LirType::Int },
+            ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        };
+        let names = super::NameTable::new(&function);
+        let optional_helper_live_ins = HashSet::new();
+        let cx = super::EmitCx {
+            names: &names,
+            helper_params: HashMap::from([(label, vec![a, b])]),
+            optional_helper_live_ins: &optional_helper_live_ins,
+            helper_prefix: "hinted_call",
+            captures_outputs: false,
+            captures_effects: false,
+            output_layout: super::OutputLayout::new(&function, false),
+            current_helper: None,
+        };
+        let assigned = HashSet::from([a]);
+
+        let args = super::helper_args_list(label, &[a], &cx, &assigned).unwrap();
+        assert_eq!(args, "a, _LIR_UNDEF");
+
+        let err = super::helper_args_list(label, &[b, a], &cx, &assigned).unwrap_err().to_string();
+        assert!(err.contains("requires b before it is defined"), "{err}");
+    }
+
+    #[test]
     fn rejects_multi_helper_cycle_instead_of_recursive_python_calls() {
         let structured = crate::lir_structure::StructuredFunction {
-            body: vec![crate::lir_structure::StructuredStmt::CallHelper(Label(1))],
+            body: vec![crate::lir_structure::StructuredStmt::call_helper(Label(1))],
             helpers: vec![
                 crate::lir_structure::StructuredHelper {
                     label: Label(1),
@@ -1790,7 +1847,7 @@ mod tests {
                         crate::lir_structure::StructuredStmt::Stmt(Stmt::Expr(Expr::Const(
                             ConstValue::Int(1),
                         ))),
-                        crate::lir_structure::StructuredStmt::CallHelper(Label(2)),
+                        crate::lir_structure::StructuredStmt::call_helper(Label(2)),
                     ],
                 },
                 crate::lir_structure::StructuredHelper {
@@ -1800,7 +1857,7 @@ mod tests {
                         crate::lir_structure::StructuredStmt::Stmt(Stmt::Expr(Expr::Const(
                             ConstValue::Int(2),
                         ))),
-                        crate::lir_structure::StructuredStmt::CallHelper(Label(1)),
+                        crate::lir_structure::StructuredStmt::call_helper(Label(1)),
                     ],
                 },
             ],
@@ -1987,7 +2044,7 @@ mod tests {
         let emitted = emit_function(&function).unwrap();
         assert_no_trampoline_protocol(&emitted);
         assert!(!emitted.contains("is not _LIR_UNDEF"), "{emitted}");
-        assert!(emitted.contains(r#"_lir_capture_slot = value"#), "{emitted}");
+        assert!(emitted.contains(r#"_lir_capture_slot = 11"#), "{emitted}");
         assert!(emitted.contains(r#"if _lir_capture_slot is not _LIR_ABSENT:"#), "{emitted}");
         assert!(emitted.contains(r#"_lir_result.slot = _lir_capture_slot"#), "{emitted}");
         assert_no_absent_result_field_init(&emitted, "slot");

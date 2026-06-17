@@ -1110,9 +1110,12 @@ function %taint_names(v0, v1, v2) {
         unit.param_name_hints = hints;
         let lifted = emit_function_unit(&unit, &interner).unwrap();
 
-        assert!(lifted.contains("p3 = (param_left) + (given_right)"), "{lifted}");
+        assert!(lifted.contains("v3 = (param_left) + (given_right)"), "{lifted}");
         assert!(lifted.contains("v4 = (v2) + (param_left)"), "{lifted}");
-        assert!(lifted.contains("v5 = (p3) + (v4)"), "{lifted}");
+        assert!(
+            lifted.contains("v5 = ((param_left) + (given_right)) + ((v2) + (param_left))"),
+            "{lifted}"
+        );
         assert!(!lifted.contains("p4 ="), "{lifted}");
         assert!(!lifted.contains("p5 ="), "{lifted}");
     }
@@ -1122,7 +1125,7 @@ function %taint_names(v0, v1, v2) {
         let input = r#"
 function %call_taint(v0) {
     fn0 = const fn %simparam_opt(2) -> 1
-    v1 = fconst 0x1p0
+    v1 = fconst 0x1.0000000000000p0
                                 block0:
                                     v2 = call fn0(v0, v1)
 }

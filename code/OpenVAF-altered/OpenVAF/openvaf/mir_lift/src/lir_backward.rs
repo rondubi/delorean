@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::lir::{
     BinaryOp, CallEffect, ConstValue, Expr, Function, Label, LirType, LocalId, ReturnValue, Stmt,
@@ -14,12 +15,29 @@ const COST_INLINE_HELPER_CALL_LIMIT: usize = 3;
 const COST_INLINE_MIN_SAVINGS: usize = 32;
 const PUSH_UP_HELPER_CALL_LIMIT: usize = 4;
 const PREDICATE_INLINE_EXPR_NODE_LIMIT: usize = 12;
+const HELPER_ARG_HINT_READS_DISABLE_ENV: &str = "MIR_LIFT_DISABLE_HELPER_ARG_HINT_READS";
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BackwardFacts {
     pub entry_live_ins: Vec<LocalId>,
     pub helper_live_ins: HashMap<Label, Vec<LocalId>>,
     pub optional_helper_live_ins: HashSet<(Label, LocalId)>,
+    helper_arg_hints_dirty: bool,
+    branch_merge_dirty: bool,
+    predicate_inlining_dirty: bool,
+}
+
+impl Default for BackwardFacts {
+    fn default() -> Self {
+        Self {
+            entry_live_ins: Vec::new(),
+            helper_live_ins: HashMap::new(),
+            optional_helper_live_ins: HashSet::new(),
+            helper_arg_hints_dirty: true,
+            branch_merge_dirty: true,
+            predicate_inlining_dirty: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +82,8 @@ const CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::HelperForwarding,
     BackwardPassKind::CommonTailHelperSinking,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::HelperCallArgHints,
+    BackwardPassKind::StructuredConstantPropagation,
     BackwardPassKind::CostBasedHelperInlining,
     BackwardPassKind::StructuredSimplify,
     BackwardPassKind::BranchInvariantHoist,
@@ -71,6 +91,8 @@ const CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperComputationPushUp,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::HelperCallArgHints,
+    BackwardPassKind::StructuredConstantPropagation,
     BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::UnaryTempInlining,
     BackwardPassKind::DeadAssignments,
@@ -82,17 +104,23 @@ const CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::PredicateInlining,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::HelperCallArgHints,
+    BackwardPassKind::StructuredConstantPropagation,
 ];
 const STRUCTURAL_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::HelperForwarding,
     BackwardPassKind::CommonTailHelperSinking,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::HelperCallArgHints,
+    BackwardPassKind::StructuredConstantPropagation,
     BackwardPassKind::CostBasedHelperInlining,
     BackwardPassKind::StructuredSimplify,
     BackwardPassKind::BranchInvariantHoist,
     BackwardPassKind::BranchSquash,
     BackwardPassKind::HelperComputationPushUp,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::HelperCallArgHints,
+    BackwardPassKind::StructuredConstantPropagation,
 ];
 const LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::DropNonSemanticEffects,
@@ -102,6 +130,8 @@ const LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::PredicateInlining,
     BackwardPassKind::AggressiveScalarSelectRecovery,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::HelperCallArgHints,
+    BackwardPassKind::StructuredConstantPropagation,
     BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::UnaryTempInlining,
     BackwardPassKind::DeadAssignments,
@@ -110,10 +140,12 @@ const LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::BranchSquash,
     BackwardPassKind::PredicateInlining,
     BackwardPassKind::AggressiveScalarSelectRecovery,
+    BackwardPassKind::StructuredConstantPropagation,
     BackwardPassKind::CopyAliasPropagation,
     BackwardPassKind::UnaryTempInlining,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::HelperCallArgHints,
 ];
 const FINAL_LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::BranchMerge,
@@ -122,11 +154,15 @@ const FINAL_LATE_CLEANUP_PASSES: &[BackwardPassKind] = &[
     BackwardPassKind::AggressiveScalarSelectRecovery,
     BackwardPassKind::DeadAssignments,
     BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::HelperCallArgHints,
     BackwardPassKind::DeadAssignments,
 ];
 const POST_DCE_CLEANUP_PASSES: &[BackwardPassKind] = CLEANUP_PASSES;
-const FINALIZATION_PASSES: &[BackwardPassKind] =
-    &[BackwardPassKind::HelperSignaturePruning, BackwardPassKind::OptionalHelperLiveIns];
+const FINALIZATION_PASSES: &[BackwardPassKind] = &[
+    BackwardPassKind::HelperSignaturePruning,
+    BackwardPassKind::HelperCallArgHints,
+    BackwardPassKind::OptionalHelperLiveIns,
+];
 
 pub(crate) fn run_backward_passes(
     function: &Function,
@@ -208,6 +244,8 @@ enum BackwardPassKind {
     HelperComputationPushUp,
     HelperLiveIns,
     OptionalHelperLiveIns,
+    HelperCallArgHints,
+    StructuredConstantPropagation,
     CopyAliasPropagation,
     UnaryTempInlining,
     DeadAssignments,
@@ -230,6 +268,8 @@ impl BackwardPassKind {
             Self::HelperComputationPushUp => "helper-computation-push-up",
             Self::HelperLiveIns => "helper-live-ins",
             Self::OptionalHelperLiveIns => "optional-helper-live-ins",
+            Self::HelperCallArgHints => "helper-call-arg-hints",
+            Self::StructuredConstantPropagation => "structured-constant-propagation",
             Self::CopyAliasPropagation => "copy-alias-propagation",
             Self::UnaryTempInlining => "unary-temp-inlining",
             Self::DeadAssignments => "dead-assignments",
@@ -254,10 +294,32 @@ impl BackwardPassKind {
             Self::HelperComputationPushUp => run_backward_pass::<HelperComputationPushUp>(cx),
             Self::HelperLiveIns => run_backward_pass::<HelperLiveIns>(cx),
             Self::OptionalHelperLiveIns => run_backward_pass::<OptionalHelperLiveIns>(cx),
+            Self::HelperCallArgHints => run_backward_pass::<HelperCallArgHints>(cx),
+            Self::StructuredConstantPropagation => {
+                run_backward_pass::<StructuredConstantPropagation>(cx)
+            }
             Self::CopyAliasPropagation => run_backward_pass::<CopyAliasPropagation>(cx),
             Self::UnaryTempInlining => run_backward_pass::<UnaryTempInlining>(cx),
             Self::DeadAssignments => run_backward_pass::<DeadAssignments>(cx),
         }
+    }
+
+    fn invalidates_helper_arg_hints(self) -> bool {
+        !matches!(self, Self::HelperCallArgHints | Self::OptionalHelperLiveIns)
+    }
+
+    fn invalidates_branch_merge(self) -> bool {
+        !matches!(
+            self,
+            Self::HelperSignaturePruning
+                | Self::HelperLiveIns
+                | Self::OptionalHelperLiveIns
+                | Self::HelperCallArgHints
+        )
+    }
+
+    fn invalidates_predicate_inlining(self) -> bool {
+        !matches!(self, Self::PredicateInlining | Self::OptionalHelperLiveIns)
     }
 }
 
@@ -268,11 +330,33 @@ struct BackwardPipeline {
 
 impl BackwardPipeline {
     fn run(&self, cx: &mut BackwardPassCx<'_>) -> bool {
-        let _pipeline_name = self.name;
+        let timing = std::env::var_os("MIR_LIFT_TIMING").is_some();
         let mut changed = false;
         for pass in self.passes {
-            let _pass_name = pass.name();
-            changed |= pass.run(cx);
+            let start = Instant::now();
+            let pass_changed = pass.run(cx);
+            if pass_changed {
+                if pass.invalidates_helper_arg_hints() {
+                    cx.facts.helper_arg_hints_dirty = true;
+                }
+                if pass.invalidates_branch_merge() {
+                    cx.facts.branch_merge_dirty = true;
+                }
+                if pass.invalidates_predicate_inlining() {
+                    cx.facts.predicate_inlining_dirty = true;
+                }
+            }
+            if timing {
+                eprintln!(
+                    "mir-lift timing: {} {} {} changed={} {:?}",
+                    cx.function.name,
+                    self.name,
+                    pass.name(),
+                    pass_changed,
+                    start.elapsed()
+                );
+            }
+            changed |= pass_changed;
         }
         changed
     }
@@ -312,10 +396,42 @@ impl BackwardPassCx<'_> {
             if let Some(helper) =
                 self.structured.helpers.iter_mut().find(|helper| helper.label == label)
             {
-                helper.params = params;
+                helper.params = params.clone();
             }
         }
         changed
+    }
+}
+
+fn refresh_helper_call_arg_hints(
+    structured: &mut StructuredFunction,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) {
+    refresh_helper_call_arg_hints_in_body(&mut structured.body, helper_params);
+    for helper in &mut structured.helpers {
+        refresh_helper_call_arg_hints_in_body(&mut helper.body, helper_params);
+    }
+}
+
+fn refresh_helper_call_arg_hints_in_body(
+    body: &mut [StructuredStmt],
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) {
+    for stmt in body {
+        match stmt {
+            StructuredStmt::CallHelper { label, arg_hints } => {
+                if let Some(params) = helper_params.get(label) {
+                    if !helper_arg_hints_are_valid_read_set(arg_hints, params) {
+                        *arg_hints = params.clone();
+                    }
+                }
+            }
+            StructuredStmt::If { then_body, else_body, .. } => {
+                refresh_helper_call_arg_hints_in_body(then_body, helper_params);
+                refresh_helper_call_arg_hints_in_body(else_body, helper_params);
+            }
+            StructuredStmt::Stmt(_) | StructuredStmt::Return(_) | StructuredStmt::Raise(_) => {}
+        }
     }
 }
 
@@ -357,7 +473,7 @@ fn drop_non_semantic_effects_in_stmt(stmt: &mut StructuredStmt) -> bool {
             then_changed || else_changed
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     }
@@ -404,7 +520,7 @@ impl BackwardLirPass for HelperForwarding {
 
 fn helper_forward_target(body: &[StructuredStmt]) -> Option<Label> {
     match body {
-        [StructuredStmt::CallHelper(label)] => Some(*label),
+        [StructuredStmt::CallHelper { label, .. }] => Some(*label),
         [StructuredStmt::If { then_body, else_body, .. }] => {
             let then_target = terminal_helper_call(then_body)?;
             let else_target = terminal_helper_call(else_body)?;
@@ -416,7 +532,7 @@ fn helper_forward_target(body: &[StructuredStmt]) -> Option<Label> {
 
 fn terminal_helper_call(body: &[StructuredStmt]) -> Option<Label> {
     match body {
-        [StructuredStmt::CallHelper(label)] => Some(*label),
+        [StructuredStmt::CallHelper { label, .. }] => Some(*label),
         _ => None,
     }
 }
@@ -445,10 +561,13 @@ fn rewrite_helper_calls_in_body(
 
 fn rewrite_helper_calls_in_stmt(stmt: &mut StructuredStmt, direct: &HashMap<Label, Label>) -> bool {
     match stmt {
-        StructuredStmt::CallHelper(label) => {
+        StructuredStmt::CallHelper { label, arg_hints } => {
             let canonical = canonical_helper(*label, direct);
             let changed = canonical != *label;
             *label = canonical;
+            if changed {
+                arg_hints.clear();
+            }
             changed
         }
         StructuredStmt::If { then_body, else_body, .. } => {
@@ -495,11 +614,11 @@ fn sink_common_tail_helpers_in_body(body: &mut Vec<StructuredStmt>) -> bool {
         match stmt {
             StructuredStmt::If { cond, mut then_body, mut else_body } => {
                 match common_tail_helper(&then_body, &else_body) {
-                    Some(label) if can_sink_tail_helper(&then_body, &else_body) => {
+                    Some((label, arg_hints)) if can_sink_tail_helper(&then_body, &else_body) => {
                         then_body.pop();
                         else_body.pop();
                         rewritten.push(StructuredStmt::If { cond, then_body, else_body });
-                        rewritten.push(StructuredStmt::CallHelper(label));
+                        rewritten.push(StructuredStmt::CallHelper { label, arg_hints });
                         changed = true;
                     }
                     _ => {
@@ -523,18 +642,23 @@ fn sink_common_tail_helpers_in_stmt(stmt: &mut StructuredStmt) -> bool {
             then_changed || else_changed
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     }
 }
 
-fn common_tail_helper(then_body: &[StructuredStmt], else_body: &[StructuredStmt]) -> Option<Label> {
+fn common_tail_helper(
+    then_body: &[StructuredStmt],
+    else_body: &[StructuredStmt],
+) -> Option<(Label, Vec<LocalId>)> {
     match (then_body.last(), else_body.last()) {
         (
-            Some(StructuredStmt::CallHelper(then_label)),
-            Some(StructuredStmt::CallHelper(else_label)),
-        ) if then_label == else_label => Some(*then_label),
+            Some(StructuredStmt::CallHelper { label: then_label, arg_hints: then_arg_hints }),
+            Some(StructuredStmt::CallHelper { label: else_label, arg_hints: else_arg_hints }),
+        ) if then_label == else_label && then_arg_hints == else_arg_hints => {
+            Some((*then_label, then_arg_hints.clone()))
+        }
         _ => None,
     }
 }
@@ -593,10 +717,9 @@ impl BackwardLirPass for CostBasedHelperInlining {
             );
         }
 
-        let inlineable = candidates
-            .into_iter()
-            .map(|(label, candidate)| (label, candidate.body))
-            .collect::<HashMap<_, _>>();
+        let inlineable = fully_expand_inlineable_helpers(
+            candidates.into_iter().map(|(label, candidate)| (label, candidate.body)).collect(),
+        );
         let mut changed = false;
         changed |= inline_helper_calls_in_body(&mut cx.structured.body, &inlineable);
         for helper in &mut cx.structured.helpers {
@@ -706,7 +829,7 @@ fn structured_stmt_text_cost(
                 + structured_body_text_cost(function, then_body, helper_params)
                 + structured_body_text_cost(function, else_body, helper_params)
         }
-        StructuredStmt::CallHelper(label) => helper_call_text_cost(
+        StructuredStmt::CallHelper { label, .. } => helper_call_text_cost(
             function,
             helper_params.get(label).map(Vec::as_slice).unwrap_or_default(),
         ),
@@ -817,7 +940,7 @@ fn simplify_stmt(stmt: &mut StructuredStmt) -> bool {
             then_changed || else_changed
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     }
@@ -882,7 +1005,7 @@ fn hoist_branch_invariants_in_stmt(stmt: &mut StructuredStmt) -> bool {
             then_changed || else_changed
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     }
@@ -946,6 +1069,11 @@ struct BranchMerge;
 
 impl BackwardLirPass for BranchMerge {
     fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        if !cx.facts.branch_merge_dirty {
+            return false;
+        }
+        cx.facts.branch_merge_dirty = false;
+
         let local_types = local_types(cx.function);
         let mut changed =
             merge_matching_condition_branches_in_body(&mut cx.structured.body, &local_types);
@@ -993,7 +1121,7 @@ fn merge_matching_condition_branches_in_stmt(
                 | merge_matching_condition_branches_in_body(else_body, local_types)
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     }
@@ -1200,7 +1328,7 @@ fn summarize_structured_stmt(stmt: &StructuredStmt) -> RegionSummary {
             summary.absorb(summarize_region(then_body));
             summary.absorb(summarize_region(else_body));
         }
-        StructuredStmt::CallHelper(_) => {
+        StructuredStmt::CallHelper { label: _, .. } => {
             summary.has_helper_call = true;
         }
         StructuredStmt::Return(values) => {
@@ -1243,6 +1371,11 @@ struct PredicateInlining;
 
 impl BackwardLirPass for PredicateInlining {
     fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        if !cx.facts.predicate_inlining_dirty {
+            return false;
+        }
+        cx.facts.predicate_inlining_dirty = false;
+
         let local_types = local_types(cx.function);
         let blocked_after = HashSet::new();
         let helper_params = cx.facts.helper_live_ins.clone();
@@ -1284,11 +1417,14 @@ fn inline_predicates_in_body_with_helper_params(
     helper_params: &HashMap<Label, Vec<LocalId>>,
 ) -> bool {
     let mut changed = false;
+    let suffix_observations = suffix_observations_after_each_stmt(body, helper_params);
     for index in 0..body.len() {
-        let mut blocked_after_stmt = blocked_after_body.clone();
-        if suffix_may_observe_locals(body, index + 1, &mut blocked_after_stmt, helper_params) {
+        let suffix_observation = &suffix_observations[index];
+        if suffix_observation.opaque {
             continue;
         }
+        let mut blocked_after_stmt = blocked_after_body.clone();
+        blocked_after_stmt.extend(suffix_observation.locals.iter().copied());
         if let StructuredStmt::If { then_body, else_body, .. } = &mut body[index] {
             changed |= inline_predicates_in_body_with_helper_params(
                 then_body,
@@ -1325,6 +1461,81 @@ fn inline_predicates_in_body_with_helper_params(
     }
 
     changed
+}
+
+#[derive(Clone, Debug, Default)]
+struct ObservationSummary {
+    locals: HashSet<LocalId>,
+    opaque: bool,
+}
+
+impl ObservationSummary {
+    fn absorb(&mut self, other: ObservationSummary) {
+        self.locals.extend(other.locals);
+        self.opaque |= other.opaque;
+    }
+}
+
+fn suffix_observations_after_each_stmt(
+    body: &[StructuredStmt],
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> Vec<ObservationSummary> {
+    let mut suffixes = vec![ObservationSummary::default(); body.len()];
+    let mut suffix = ObservationSummary::default();
+    for (index, stmt) in body.iter().enumerate().rev() {
+        suffixes[index] = suffix.clone();
+        suffix.absorb(observation_summary_for_stmt(stmt, helper_params));
+    }
+    suffixes
+}
+
+fn observation_summary_for_body(
+    body: &[StructuredStmt],
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> ObservationSummary {
+    let mut summary = ObservationSummary::default();
+    for stmt in body {
+        summary.absorb(observation_summary_for_stmt(stmt, helper_params));
+    }
+    summary
+}
+
+fn observation_summary_for_stmt(
+    stmt: &StructuredStmt,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> ObservationSummary {
+    let mut summary = ObservationSummary::default();
+    match stmt {
+        StructuredStmt::Stmt(Stmt::Assign { value, .. })
+        | StructuredStmt::Stmt(Stmt::Capture { value, .. })
+        | StructuredStmt::Stmt(Stmt::Expr(value)) => {
+            collect_expr_locals_into_set(value, &mut summary.locals);
+        }
+        StructuredStmt::Stmt(Stmt::CallEffect(effect)) => {
+            collect_call_effect_locals_into_set(effect, &mut summary.locals);
+        }
+        StructuredStmt::Stmt(Stmt::Unsupported { .. }) => {
+            summary.opaque = true;
+        }
+        StructuredStmt::If { cond, then_body, else_body } => {
+            collect_expr_locals_into_set(cond, &mut summary.locals);
+            summary.absorb(observation_summary_for_body(then_body, helper_params));
+            summary.absorb(observation_summary_for_body(else_body, helper_params));
+        }
+        StructuredStmt::CallHelper { label, arg_hints } => {
+            match helper_call_read_locals(*label, arg_hints, helper_params) {
+                Some(reads) => summary.locals.extend(reads),
+                None => summary.opaque = true,
+            }
+        }
+        StructuredStmt::Return(values) => {
+            for value in values {
+                collect_return_value_locals_into_set(value, &mut summary.locals);
+            }
+        }
+        StructuredStmt::Raise(_) => {}
+    }
+    summary
 }
 
 fn inlineable_predicate_assignment(
@@ -1423,13 +1634,15 @@ fn stmt_may_observe_any_local(
             suffix_may_observe_locals(then_body, 0, observed, helper_params)
                 || suffix_may_observe_locals(else_body, 0, observed, helper_params)
         }
-        StructuredStmt::CallHelper(label) => match helper_params.get(label) {
-            Some(params) => {
-                observed.extend(params.iter().copied());
-                false
+        StructuredStmt::CallHelper { label, arg_hints } => {
+            match helper_call_read_locals(*label, arg_hints, helper_params) {
+                Some(reads) => {
+                    observed.extend(reads);
+                    false
+                }
+                None => true,
             }
-            None => true,
-        },
+        }
         StructuredStmt::Return(values) => {
             for value in values {
                 collect_return_value_locals_into_set(value, observed);
@@ -1456,8 +1669,9 @@ fn stmt_may_observe_local(
                 || body_may_observe_local(then_body, needle, helper_params)
                 || body_may_observe_local(else_body, needle, helper_params)
         }
-        StructuredStmt::CallHelper(label) => {
-            helper_params.get(label).map_or(true, |params| params.contains(&needle))
+        StructuredStmt::CallHelper { label, arg_hints } => {
+            helper_call_read_locals(*label, arg_hints, helper_params)
+                .map_or(true, |reads| reads.contains(&needle))
         }
         StructuredStmt::Return(values) => values.iter().any(|value| match value {
             ReturnValue::Named { value, .. } => expr_uses_local(value, needle),
@@ -1472,6 +1686,63 @@ fn body_may_observe_local(
     helper_params: &HashMap<Label, Vec<LocalId>>,
 ) -> bool {
     body.iter().any(|stmt| stmt_may_observe_local(stmt, needle, helper_params))
+}
+
+fn helper_call_read_locals(
+    label: Label,
+    arg_hints: &[LocalId],
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> Option<Vec<LocalId>> {
+    let params = helper_params.get(&label)?;
+    Some(helper_call_read_locals_from_params(arg_hints, params))
+}
+
+fn helper_call_read_locals_from_params(arg_hints: &[LocalId], params: &[LocalId]) -> Vec<LocalId> {
+    if helper_arg_hints_are_valid_read_set(arg_hints, params) {
+        arg_hints.to_vec()
+    } else {
+        params.to_vec()
+    }
+}
+
+pub(crate) fn helper_arg_hints_are_valid_read_set(
+    arg_hints: &[LocalId],
+    params: &[LocalId],
+) -> bool {
+    if std::env::var_os(HELPER_ARG_HINT_READS_DISABLE_ENV).is_some() {
+        return false;
+    }
+    if arg_hints == params {
+        return true;
+    }
+    if arg_hints.is_empty() && !params.is_empty() {
+        return false;
+    }
+    if arg_hints.len() > params.len() {
+        return false;
+    }
+    if !arg_hints.windows(2).all(|pair| pair[0] < pair[1]) {
+        return false;
+    }
+
+    if params.windows(2).all(|pair| pair[0] < pair[1]) {
+        let mut param_index = 0;
+        for hint in arg_hints {
+            while params.get(param_index).is_some_and(|param| param < hint) {
+                param_index += 1;
+            }
+            if params.get(param_index) != Some(hint) {
+                return false;
+            }
+        }
+        true
+    } else {
+        arg_hints.iter().all(|hint| params.contains(hint))
+    }
+}
+
+fn helper_arg_hints_are_strict_valid_read_set(arg_hints: &[LocalId], params: &[LocalId]) -> bool {
+    arg_hints.len() < params.len() && helper_arg_hints_are_valid_read_set(arg_hints, params)
 }
 
 fn expr_uses_local(expr: &Expr, needle: LocalId) -> bool {
@@ -1633,7 +1904,7 @@ fn squash_branches_in_stmt(stmt: &mut StructuredStmt, local_types: &[LirType]) -
                 | squash_branches_in_body(else_body, local_types)
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     };
@@ -1878,7 +2149,7 @@ fn rewrite_aggressive_scalar_selects_in_stmt(
                 | rewrite_aggressive_scalar_selects_in_body(else_body, local_types)
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => false,
     };
@@ -2283,7 +2554,7 @@ fn count_helper_calls_in_body(body: &[StructuredStmt], counts: &mut HashMap<Labe
 
 fn count_helper_calls_in_stmt(stmt: &StructuredStmt, counts: &mut HashMap<Label, usize>) {
     match stmt {
-        StructuredStmt::CallHelper(label) => {
+        StructuredStmt::CallHelper { label, .. } => {
             *counts.entry(*label).or_insert(0) += 1;
         }
         StructuredStmt::If { then_body, else_body, .. } => {
@@ -2344,12 +2615,11 @@ fn count_safe_helper_calls_in_body(
                 then_defined.retain(|local| else_defined.contains(local));
                 *defined = then_defined;
             }
-            StructuredStmt::CallHelper(label) => {
-                let safe = helper_params
-                    .get(label)
+            StructuredStmt::CallHelper { label, arg_hints } => {
+                let safe = helper_call_read_locals(*label, arg_hints, helper_params)
                     .into_iter()
                     .flatten()
-                    .all(|param| defined.contains(param));
+                    .all(|param| defined.contains(&param));
                 if safe {
                     *counts.entry(*label).or_insert(0) += 1;
                 }
@@ -2369,7 +2639,7 @@ fn structured_stmt_weight(stmt: &StructuredStmt) -> usize {
             1 + structured_stmt_count(then_body) + structured_stmt_count(else_body)
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => 1,
     }
@@ -2389,7 +2659,7 @@ fn linear_helper_body(body: &[StructuredStmt]) -> bool {
 
 fn structured_stmt_helper_call_count(stmt: &StructuredStmt) -> usize {
     match stmt {
-        StructuredStmt::CallHelper(_) => 1,
+        StructuredStmt::CallHelper { label: _, .. } => 1,
         StructuredStmt::If { then_body, else_body, .. } => {
             structured_helper_call_count(then_body) + structured_helper_call_count(else_body)
         }
@@ -2407,7 +2677,7 @@ fn structured_stmt_branch_count(stmt: &StructuredStmt) -> usize {
             1 + structured_branch_count(then_body) + structured_branch_count(else_body)
         }
         StructuredStmt::Stmt(_)
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Return(_)
         | StructuredStmt::Raise(_) => 0,
     }
@@ -2415,7 +2685,7 @@ fn structured_stmt_branch_count(stmt: &StructuredStmt) -> usize {
 
 fn stmt_calls_helper(stmt: &StructuredStmt, target: Label) -> bool {
     match stmt {
-        StructuredStmt::CallHelper(label) => *label == target,
+        StructuredStmt::CallHelper { label, .. } => *label == target,
         StructuredStmt::If { then_body, else_body, .. } => {
             body_calls_helper(then_body, target) || body_calls_helper(else_body, target)
         }
@@ -2432,17 +2702,87 @@ fn inline_helper_calls_in_body(
 
     for mut stmt in body.drain(..) {
         match stmt {
-            StructuredStmt::CallHelper(label) => {
+            StructuredStmt::CallHelper { label, arg_hints } => {
                 if let Some(replacement) = inlineable.get(&label) {
                     inlined.extend(replacement.clone());
                     changed = true;
                 } else {
-                    inlined.push(StructuredStmt::CallHelper(label));
+                    inlined.push(StructuredStmt::CallHelper { label, arg_hints });
                 }
             }
             StructuredStmt::If { ref mut then_body, ref mut else_body, .. } => {
                 changed |= inline_helper_calls_in_body(then_body, inlineable);
                 changed |= inline_helper_calls_in_body(else_body, inlineable);
+                inlined.push(stmt);
+            }
+            other => inlined.push(other),
+        }
+    }
+
+    *body = inlined;
+    changed
+}
+
+fn fully_expand_inlineable_helpers(
+    inlineable: HashMap<Label, Vec<StructuredStmt>>,
+) -> HashMap<Label, Vec<StructuredStmt>> {
+    let labels = inlineable.keys().copied().collect::<Vec<_>>();
+    let mut expanded = HashMap::new();
+    for label in labels {
+        let mut visiting = HashSet::new();
+        let body = expanded_inlineable_body(label, &inlineable, &mut expanded, &mut visiting);
+        expanded.insert(label, body);
+    }
+    expanded
+}
+
+fn expanded_inlineable_body(
+    label: Label,
+    inlineable: &HashMap<Label, Vec<StructuredStmt>>,
+    expanded: &mut HashMap<Label, Vec<StructuredStmt>>,
+    visiting: &mut HashSet<Label>,
+) -> Vec<StructuredStmt> {
+    if let Some(body) = expanded.get(&label) {
+        return body.clone();
+    }
+    let Some(body) = inlineable.get(&label) else {
+        return Vec::new();
+    };
+    if !visiting.insert(label) {
+        return body.clone();
+    }
+
+    let mut body = body.clone();
+    expand_inlineable_calls_in_body(&mut body, inlineable, expanded, visiting);
+    visiting.remove(&label);
+    expanded.insert(label, body.clone());
+    body
+}
+
+fn expand_inlineable_calls_in_body(
+    body: &mut Vec<StructuredStmt>,
+    inlineable: &HashMap<Label, Vec<StructuredStmt>>,
+    expanded: &mut HashMap<Label, Vec<StructuredStmt>>,
+    visiting: &mut HashSet<Label>,
+) -> bool {
+    let mut changed = false;
+    let mut inlined = Vec::with_capacity(body.len());
+
+    for mut stmt in body.drain(..) {
+        match stmt {
+            StructuredStmt::CallHelper { label, arg_hints } => {
+                if inlineable.contains_key(&label) && !visiting.contains(&label) {
+                    inlined.extend(expanded_inlineable_body(label, inlineable, expanded, visiting));
+                    changed = true;
+                } else {
+                    inlined.push(StructuredStmt::CallHelper { label, arg_hints });
+                }
+            }
+            StructuredStmt::If { ref mut then_body, ref mut else_body, .. } => {
+                changed |=
+                    expand_inlineable_calls_in_body(then_body, inlineable, expanded, visiting);
+                changed |=
+                    expand_inlineable_calls_in_body(else_body, inlineable, expanded, visiting);
                 inlined.push(stmt);
             }
             other => inlined.push(other),
@@ -2554,12 +2894,12 @@ fn push_up_helper_computations_in_body(
 
     for mut stmt in body.drain(..) {
         match stmt {
-            StructuredStmt::CallHelper(label) => {
+            StructuredStmt::CallHelper { label, arg_hints } => {
                 if let Some(candidate) = candidates.get(&label) {
                     rewritten.push(candidate.stmt.clone());
                     changed = true;
                 }
-                rewritten.push(StructuredStmt::CallHelper(label));
+                rewritten.push(StructuredStmt::CallHelper { label, arg_hints });
             }
             StructuredStmt::If { ref mut then_body, ref mut else_body, .. } => {
                 changed |= push_up_helper_computations_in_body(then_body, candidates);
@@ -2598,6 +2938,98 @@ impl BackwardLirPass for HelperSignaturePruning {
     }
 }
 
+#[derive(Default)]
+struct HelperCallArgHints;
+
+impl BackwardLirPass for HelperCallArgHints {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        if !cx.facts.helper_arg_hints_dirty {
+            return false;
+        }
+        cx.facts.helper_arg_hints_dirty = false;
+
+        if cx.facts.helper_live_ins.is_empty() {
+            return false;
+        }
+        let helper_params = cx.facts.helper_live_ins.clone();
+        let mut changed = false;
+
+        let mut defined = cx.function.params.iter().copied().collect::<HashSet<_>>();
+        changed |= refresh_precise_helper_call_arg_hints_in_body(
+            &mut cx.structured.body,
+            &mut defined,
+            &helper_params,
+        );
+
+        for helper in &mut cx.structured.helpers {
+            let mut defined = helper.params.iter().copied().collect::<HashSet<_>>();
+            changed |= refresh_precise_helper_call_arg_hints_in_body(
+                &mut helper.body,
+                &mut defined,
+                &helper_params,
+            );
+        }
+
+        changed
+    }
+}
+
+fn refresh_precise_helper_call_arg_hints_in_body(
+    body: &mut [StructuredStmt],
+    defined: &mut HashSet<LocalId>,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> bool {
+    let mut changed = false;
+
+    for stmt in body {
+        match stmt {
+            StructuredStmt::Stmt(stmt) => mark_stmt_defs_for_definedness(stmt, defined),
+            StructuredStmt::If { then_body, else_body, .. } => {
+                let mut then_defined = defined.clone();
+                changed |= refresh_precise_helper_call_arg_hints_in_body(
+                    then_body,
+                    &mut then_defined,
+                    helper_params,
+                );
+                let mut else_defined = defined.clone();
+                changed |= refresh_precise_helper_call_arg_hints_in_body(
+                    else_body,
+                    &mut else_defined,
+                    helper_params,
+                );
+                then_defined.retain(|local| else_defined.contains(local));
+                *defined = then_defined;
+            }
+            StructuredStmt::CallHelper { label, arg_hints } => {
+                let Some(params) = helper_params.get(label) else {
+                    continue;
+                };
+                if helper_arg_hints_are_strict_valid_read_set(arg_hints, params) {
+                    continue;
+                }
+
+                let narrowed = params
+                    .iter()
+                    .copied()
+                    .filter(|param| defined.contains(param))
+                    .collect::<Vec<_>>();
+                let refreshed = if narrowed.is_empty() && !params.is_empty() {
+                    params.clone()
+                } else {
+                    narrowed
+                };
+                if *arg_hints != refreshed {
+                    *arg_hints = refreshed;
+                    changed = true;
+                }
+            }
+            StructuredStmt::Return(_) | StructuredStmt::Raise(_) => {}
+        }
+    }
+
+    changed
+}
+
 fn retain_reachable_helpers(cx: &mut BackwardPassCx<'_>) -> bool {
     let reachable = reachable_helper_labels(cx.structured);
     let before = cx.structured.helpers.len();
@@ -2630,7 +3062,7 @@ fn reachable_helper_labels(structured: &StructuredFunction) -> HashSet<Label> {
 fn collect_helper_call_labels(body: &[StructuredStmt], labels: &mut Vec<Label>) {
     for stmt in body {
         match stmt {
-            StructuredStmt::CallHelper(label) => labels.push(*label),
+            StructuredStmt::CallHelper { label, .. } => labels.push(*label),
             StructuredStmt::If { then_body, else_body, .. } => {
                 collect_helper_call_labels(then_body, labels);
                 collect_helper_call_labels(else_body, labels);
@@ -2669,6 +3101,10 @@ fn recompute_helper_live_ins(cx: &mut BackwardPassCx<'_>) -> bool {
     let mut changed = false;
     for (label, params) in updates {
         changed |= cx.update_helper_params(label, params);
+    }
+    if changed {
+        let helper_params = cx.facts.helper_live_ins.clone();
+        refresh_helper_call_arg_hints(cx.structured, &helper_params);
     }
 
     changed
@@ -2722,6 +3158,11 @@ struct OptionalHelperLiveIns;
 
 impl BackwardLirPass for OptionalHelperLiveIns {
     fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        if cx.facts.helper_live_ins.is_empty() {
+            let changed = !cx.facts.optional_helper_live_ins.is_empty();
+            cx.facts.optional_helper_live_ins.clear();
+            return changed;
+        }
         let mut optional = HashSet::new();
 
         for helper in &cx.structured.helpers {
@@ -2775,10 +3216,12 @@ fn collect_optional_helper_live_ins(
                 then_defined.retain(|local| else_defined.contains(local));
                 *defined = then_defined;
             }
-            StructuredStmt::CallHelper(label) => {
-                for param in helper_params.get(label).into_iter().flatten() {
-                    if !defined.contains(param) {
-                        optional.insert((*label, *param));
+            StructuredStmt::CallHelper { label, arg_hints } => {
+                for param in
+                    helper_call_read_locals(*label, arg_hints, helper_params).into_iter().flatten()
+                {
+                    if !defined.contains(&param) {
+                        optional.insert((*label, param));
                     }
                 }
             }
@@ -2810,34 +3253,267 @@ fn expr_is_definitely_defined_by(expr: &Expr, defined: &HashSet<LocalId>) -> boo
 }
 
 #[derive(Default)]
+struct StructuredConstantPropagation;
+
+impl BackwardLirPass for StructuredConstantPropagation {
+    fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
+        let helper_params = cx.facts.helper_live_ins.clone();
+        let mut changed = false;
+
+        for helper in &mut cx.structured.helpers {
+            let mut constants = HashMap::new();
+            changed |= propagate_structured_constants_in_body(
+                &mut helper.body,
+                &mut constants,
+                &helper_params,
+            )
+            .changed;
+        }
+
+        let mut constants = HashMap::new();
+        changed |= propagate_structured_constants_in_body(
+            &mut cx.structured.body,
+            &mut constants,
+            &helper_params,
+        )
+        .changed;
+        changed
+    }
+}
+
+type StructuredConstMap = HashMap<LocalId, ConstValue>;
+
+#[derive(Clone, Debug, Default)]
+struct StructuredConstFlow {
+    changed: bool,
+    may_continue: bool,
+}
+
+fn propagate_structured_constants_in_body(
+    body: &mut [StructuredStmt],
+    constants: &mut StructuredConstMap,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> StructuredConstFlow {
+    let mut flow = StructuredConstFlow { changed: false, may_continue: true };
+
+    for stmt in body {
+        if !flow.may_continue {
+            break;
+        }
+        let stmt_flow = propagate_structured_constants_in_stmt(stmt, constants, helper_params);
+        flow.changed |= stmt_flow.changed;
+        flow.may_continue = stmt_flow.may_continue;
+    }
+
+    flow
+}
+
+fn propagate_structured_constants_in_stmt(
+    stmt: &mut StructuredStmt,
+    constants: &mut StructuredConstMap,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> StructuredConstFlow {
+    match stmt {
+        StructuredStmt::Stmt(stmt) => {
+            let changed = propagate_structured_constants_in_plain_stmt(stmt, constants);
+            StructuredConstFlow { changed, may_continue: true }
+        }
+        StructuredStmt::If { cond, then_body, else_body } => {
+            let mut changed = rewrite_const_expr(cond, constants);
+            let incoming = constants.clone();
+
+            let mut then_constants = incoming.clone();
+            let then_flow = propagate_structured_constants_in_body(
+                then_body,
+                &mut then_constants,
+                helper_params,
+            );
+            changed |= then_flow.changed;
+
+            let mut else_constants = incoming;
+            let else_flow = propagate_structured_constants_in_body(
+                else_body,
+                &mut else_constants,
+                helper_params,
+            );
+            changed |= else_flow.changed;
+
+            match (then_flow.may_continue, else_flow.may_continue) {
+                (true, true) => *constants = intersect_const_maps(&then_constants, &else_constants),
+                (true, false) => *constants = then_constants,
+                (false, true) => *constants = else_constants,
+                (false, false) => constants.clear(),
+            }
+
+            StructuredConstFlow {
+                changed,
+                may_continue: then_flow.may_continue || else_flow.may_continue,
+            }
+        }
+        StructuredStmt::CallHelper { label, arg_hints } => {
+            invalidate_helper_observed_constants(constants, *label, arg_hints, helper_params);
+            StructuredConstFlow { changed: false, may_continue: false }
+        }
+        StructuredStmt::Return(values) => {
+            let mut changed = false;
+            for value in values {
+                match value {
+                    ReturnValue::Named { value, .. } => {
+                        changed |= rewrite_const_expr(value, constants);
+                    }
+                }
+            }
+            constants.clear();
+            StructuredConstFlow { changed, may_continue: false }
+        }
+        StructuredStmt::Raise(_) => {
+            constants.clear();
+            StructuredConstFlow { changed: false, may_continue: false }
+        }
+    }
+}
+
+fn propagate_structured_constants_in_plain_stmt(
+    stmt: &mut Stmt,
+    constants: &mut StructuredConstMap,
+) -> bool {
+    match stmt {
+        Stmt::Assign { dst, value } => {
+            let changed = rewrite_const_expr(value, constants);
+            match value {
+                Expr::Const(value) => {
+                    constants.insert(*dst, value.clone());
+                }
+                _ => {
+                    constants.remove(dst);
+                }
+            }
+            changed
+        }
+        Stmt::Capture { value, .. } | Stmt::Expr(value) => rewrite_const_expr(value, constants),
+        Stmt::CallEffect(effect) => rewrite_const_call_effect(effect, constants),
+        Stmt::Unsupported { dsts, .. } => {
+            for dst in dsts {
+                constants.remove(dst);
+            }
+            false
+        }
+    }
+}
+
+fn invalidate_helper_observed_constants(
+    constants: &mut StructuredConstMap,
+    label: Label,
+    arg_hints: &[LocalId],
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) {
+    let Some(reads) = helper_call_read_locals(label, arg_hints, helper_params) else {
+        constants.clear();
+        return;
+    };
+    for local in reads {
+        constants.remove(&local);
+    }
+}
+
+fn rewrite_const_call_effect(effect: &mut CallEffect, constants: &StructuredConstMap) -> bool {
+    match effect {
+        CallEffect::Diagnostic { args, .. } => {
+            let mut changed = false;
+            for arg in args {
+                changed |= rewrite_const_expr(arg, constants);
+            }
+            changed
+        }
+        CallEffect::SetInvalidParam { .. } | CallEffect::CollapseHint { .. } => false,
+    }
+}
+
+fn rewrite_const_expr(expr: &mut Expr, constants: &StructuredConstMap) -> bool {
+    match expr {
+        Expr::Local(local) => {
+            let Some(value) = constants.get(local).cloned() else {
+                return false;
+            };
+            *expr = Expr::Const(value);
+            true
+        }
+        Expr::Const(_) => false,
+        Expr::Unary { arg, .. } => rewrite_const_expr(arg, constants),
+        Expr::Abs { arg } => rewrite_const_expr(arg, constants),
+        Expr::Binary { lhs, rhs, .. } => {
+            rewrite_const_expr(lhs, constants) | rewrite_const_expr(rhs, constants)
+        }
+        Expr::Max { lhs, rhs } | Expr::Min { lhs, rhs } => {
+            rewrite_const_expr(lhs, constants) | rewrite_const_expr(rhs, constants)
+        }
+        Expr::SimparamOpt { name, default } => {
+            rewrite_const_expr(name, constants) | rewrite_const_expr(default, constants)
+        }
+        Expr::Call { args, .. } | Expr::Unsupported { args, .. } => {
+            let mut changed = false;
+            for arg in args {
+                changed |= rewrite_const_expr(arg, constants);
+            }
+            changed
+        }
+    }
+}
+
+fn intersect_const_maps(
+    left: &StructuredConstMap,
+    right: &StructuredConstMap,
+) -> StructuredConstMap {
+    left.iter()
+        .filter_map(|(local, value)| {
+            right
+                .get(local)
+                .is_some_and(|right_value| right_value == value)
+                .then_some((*local, value.clone()))
+        })
+        .collect()
+}
+
+#[derive(Default)]
 struct CopyAliasPropagation;
 
 impl BackwardLirPass for CopyAliasPropagation {
     fn run(&mut self, cx: &mut BackwardPassCx<'_>) -> bool {
         let mut changed = false;
+        let helper_params = cx.facts.helper_live_ins.clone();
 
         for helper in &mut cx.structured.helpers {
             let mut aliases = HashMap::new();
-            changed |= propagate_copy_aliases_in_body(&mut helper.body, &mut aliases);
+            changed |=
+                propagate_copy_aliases_in_body(&mut helper.body, &mut aliases, &helper_params);
         }
 
         let mut aliases = HashMap::new();
-        changed |= propagate_copy_aliases_in_body(&mut cx.structured.body, &mut aliases);
+        changed |=
+            propagate_copy_aliases_in_body(&mut cx.structured.body, &mut aliases, &helper_params);
         changed
     }
 }
 
 type CopyAliasMap = HashMap<LocalId, LocalId>;
 
-fn propagate_copy_aliases_in_body(body: &mut [StructuredStmt], aliases: &mut CopyAliasMap) -> bool {
+fn propagate_copy_aliases_in_body(
+    body: &mut [StructuredStmt],
+    aliases: &mut CopyAliasMap,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> bool {
     let mut changed = false;
     for stmt in body {
-        changed |= propagate_copy_aliases_in_stmt(stmt, aliases);
+        changed |= propagate_copy_aliases_in_stmt(stmt, aliases, helper_params);
     }
     changed
 }
 
-fn propagate_copy_aliases_in_stmt(stmt: &mut StructuredStmt, aliases: &mut CopyAliasMap) -> bool {
+fn propagate_copy_aliases_in_stmt(
+    stmt: &mut StructuredStmt,
+    aliases: &mut CopyAliasMap,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> bool {
     match stmt {
         StructuredStmt::Stmt(stmt) => propagate_copy_aliases_in_plain_stmt(stmt, aliases),
         StructuredStmt::If { cond, then_body, else_body } => {
@@ -2846,13 +3522,13 @@ fn propagate_copy_aliases_in_stmt(stmt: &mut StructuredStmt, aliases: &mut CopyA
             let incoming = aliases.clone();
             let mut then_aliases = incoming.clone();
             let mut else_aliases = incoming;
-            changed |= propagate_copy_aliases_in_body(then_body, &mut then_aliases);
-            changed |= propagate_copy_aliases_in_body(else_body, &mut else_aliases);
+            changed |= propagate_copy_aliases_in_body(then_body, &mut then_aliases, helper_params);
+            changed |= propagate_copy_aliases_in_body(else_body, &mut else_aliases, helper_params);
             *aliases = intersect_alias_maps(&then_aliases, &else_aliases);
             changed
         }
-        StructuredStmt::CallHelper(_) => {
-            aliases.clear();
+        StructuredStmt::CallHelper { label, arg_hints } => {
+            retain_helper_unobserved_aliases(aliases, *label, arg_hints, helper_params);
             false
         }
         StructuredStmt::Return(values) => {
@@ -2872,6 +3548,19 @@ fn propagate_copy_aliases_in_stmt(stmt: &mut StructuredStmt, aliases: &mut CopyA
             false
         }
     }
+}
+
+fn retain_helper_unobserved_aliases(
+    aliases: &mut CopyAliasMap,
+    label: Label,
+    arg_hints: &[LocalId],
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) {
+    let Some(reads) = helper_call_read_locals(label, arg_hints, helper_params) else {
+        aliases.clear();
+        return;
+    };
+    aliases.retain(|alias, target| !reads.contains(alias) && !reads.contains(target));
 }
 
 fn propagate_copy_aliases_in_plain_stmt(stmt: &mut Stmt, aliases: &mut CopyAliasMap) -> bool {
@@ -3002,7 +3691,9 @@ fn inline_unary_temps_in_body(
 
     let mut index = 0;
     while index + 1 < body.len() {
-        if let Some((dst, replacement)) = inlineable_unary_temp_assignment(body, index) {
+        if let Some((dst, replacement)) =
+            inlineable_unary_temp_assignment(body, index, helper_params)
+        {
             if !protected_locals.contains(&dst)
                 && !unary_temp_observed_before_redefinition(body, index + 2, dst, helper_params)
                 && replace_single_local_use_in_stmt(&mut body[index + 1], dst, &replacement)
@@ -3021,6 +3712,7 @@ fn inline_unary_temps_in_body(
 fn inlineable_unary_temp_assignment(
     body: &[StructuredStmt],
     index: usize,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
 ) -> Option<(LocalId, Expr)> {
     let StructuredStmt::Stmt(Stmt::Assign { dst, value }) = body.get(index)? else {
         return None;
@@ -3033,7 +3725,7 @@ fn inlineable_unary_temp_assignment(
         _ => return None,
     }
     let next = body.get(index + 1)?;
-    if single_rewrite_stmt_local_use_count(next, *dst) == 1 {
+    if single_rewrite_stmt_local_use_count(next, *dst, helper_params) == 1 {
         Some((*dst, value.clone()))
     } else {
         None
@@ -3044,13 +3736,10 @@ fn unary_temp_observed_before_redefinition(
     body: &[StructuredStmt],
     start: usize,
     needle: LocalId,
-    _helper_params: &HashMap<Label, Vec<LocalId>>,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
 ) -> bool {
     for stmt in body.iter().skip(start) {
-        if structured_stmt_uses_local(stmt, needle) {
-            return true;
-        }
-        if let StructuredStmt::CallHelper(_) = stmt {
+        if stmt_may_observe_local(stmt, needle, helper_params) {
             return true;
         }
         if structured_stmt_redefines_local(stmt, needle) {
@@ -3060,12 +3749,18 @@ fn unary_temp_observed_before_redefinition(
     false
 }
 
-fn single_rewrite_stmt_local_use_count(stmt: &StructuredStmt, needle: LocalId) -> usize {
+fn single_rewrite_stmt_local_use_count(
+    stmt: &StructuredStmt,
+    needle: LocalId,
+    helper_params: &HashMap<Label, Vec<LocalId>>,
+) -> usize {
     match stmt {
         StructuredStmt::Stmt(Stmt::Assign { value, .. })
         | StructuredStmt::Stmt(Stmt::Capture { value, .. }) => expr_local_use_count(value, needle),
         StructuredStmt::If { cond, then_body, else_body } => {
-            if body_uses_local(then_body, needle) || body_uses_local(else_body, needle) {
+            if body_may_observe_local(then_body, needle, helper_params)
+                || body_may_observe_local(else_body, needle, helper_params)
+            {
                 usize::MAX
             } else {
                 expr_local_use_count(cond, needle)
@@ -3080,7 +3775,7 @@ fn single_rewrite_stmt_local_use_count(stmt: &StructuredStmt, needle: LocalId) -
         StructuredStmt::Stmt(Stmt::Expr(_))
         | StructuredStmt::Stmt(Stmt::CallEffect(_))
         | StructuredStmt::Stmt(Stmt::Unsupported { .. })
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Raise(_) => usize::MAX,
     }
 }
@@ -3112,7 +3807,7 @@ fn replace_single_local_use_in_stmt(
         StructuredStmt::Stmt(Stmt::Expr(_))
         | StructuredStmt::Stmt(Stmt::CallEffect(_))
         | StructuredStmt::Stmt(Stmt::Unsupported { .. })
-        | StructuredStmt::CallHelper(_)
+        | StructuredStmt::CallHelper { .. }
         | StructuredStmt::Raise(_) => false,
     }
 }
@@ -3274,10 +3969,12 @@ fn apply_liveness_transfer(
             }
         }
         StructuredStmt::If { cond, .. } => collect_expr_locals(cond, live),
-        StructuredStmt::CallHelper(label) => {
+        StructuredStmt::CallHelper { label, arg_hints } => {
             live.clear();
-            for local in helper_params.get(label).into_iter().flatten() {
-                live.insert(*local);
+            for local in
+                helper_call_read_locals(*label, arg_hints, helper_params).into_iter().flatten()
+            {
+                live.insert(local);
             }
         }
         StructuredStmt::Return(values) => {
@@ -3485,9 +4182,9 @@ fn read_before_def_stmt_static(
                 (false, false) => summary.terminate(),
             }
         }
-        StructuredStmt::CallHelper(label) => {
+        StructuredStmt::CallHelper { label, arg_hints } => {
             let params = compute_helper_params(*label, locals_len, bodies, computed, visiting);
-            summary.note_helper_reads(params);
+            summary.note_helper_reads(helper_call_read_locals_from_params(arg_hints, &params));
             summary.terminate();
         }
         StructuredStmt::Return(values) => {
@@ -3554,10 +4251,11 @@ fn live_in_stmt_static(
             collect_expr_locals(cond, &mut then_live);
             live = then_live;
         }
-        StructuredStmt::CallHelper(label) => {
+        StructuredStmt::CallHelper { label, arg_hints } => {
+            let params = compute_helper_params(*label, locals_len, bodies, computed, visiting);
             live = LiveSet::from_locals(
                 locals_len,
-                compute_helper_params(*label, locals_len, bodies, computed, visiting),
+                helper_call_read_locals_from_params(arg_hints, &params),
             );
         }
         StructuredStmt::Return(values) => {
@@ -3698,7 +4396,7 @@ fn collect_structured_stmt_uses(stmt: &StructuredStmt, locals: &mut Vec<LocalId>
                 }
             }
         }
-        StructuredStmt::CallHelper(_) | StructuredStmt::Raise(_) => {}
+        StructuredStmt::CallHelper { .. } | StructuredStmt::Raise(_) => {}
     }
 }
 
@@ -3917,6 +4615,7 @@ mod tests {
                 BackwardPassKind::AggressiveScalarSelectRecovery,
                 BackwardPassKind::DeadAssignments,
                 BackwardPassKind::HelperSignaturePruning,
+                BackwardPassKind::HelperCallArgHints,
                 BackwardPassKind::DeadAssignments,
             ]
         );
@@ -3927,8 +4626,8 @@ mod tests {
         let target = Label(7);
         let mut body = vec![StructuredStmt::If {
             cond: Expr::Local(LocalId(0)),
-            then_body: vec![assign_int(LocalId(1), 0), StructuredStmt::CallHelper(target)],
-            else_body: vec![assign_int(LocalId(1), 1), StructuredStmt::CallHelper(target)],
+            then_body: vec![assign_int(LocalId(1), 0), StructuredStmt::call_helper(target)],
+            else_body: vec![assign_int(LocalId(1), 1), StructuredStmt::call_helper(target)],
         }];
 
         assert!(sink_common_tail_helpers_in_body(&mut body));
@@ -3940,7 +4639,7 @@ mod tests {
                     then_body: vec![assign_int(LocalId(1), 0)],
                     else_body: vec![assign_int(LocalId(1), 1)],
                 },
-                StructuredStmt::CallHelper(target),
+                StructuredStmt::call_helper(target),
             ]
         );
     }
@@ -3954,8 +4653,8 @@ mod tests {
                 lhs: Box::new(Expr::Local(LocalId(0))),
                 rhs: Box::new(Expr::Const(ConstValue::Int(0))),
             },
-            then_body: vec![StructuredStmt::CallHelper(target)],
-            else_body: vec![StructuredStmt::CallHelper(target)],
+            then_body: vec![StructuredStmt::call_helper(target)],
+            else_body: vec![StructuredStmt::call_helper(target)],
         }];
 
         assert!(sink_common_tail_helpers_in_body(&mut body));
@@ -3971,11 +4670,11 @@ mod tests {
                     then_body: Vec::new(),
                     else_body: Vec::new(),
                 },
-                StructuredStmt::CallHelper(target),
+                StructuredStmt::call_helper(target),
             ]
         );
         assert!(simplify_body(&mut body));
-        assert_eq!(body, vec![StructuredStmt::CallHelper(target)]);
+        assert_eq!(body, vec![StructuredStmt::call_helper(target)]);
     }
 
     #[test]
@@ -3983,8 +4682,8 @@ mod tests {
         let target = Label(13);
         let mut body = vec![StructuredStmt::If {
             cond: Expr::Local(LocalId(0)),
-            then_body: vec![StructuredStmt::CallHelper(target)],
-            else_body: vec![assign_int(LocalId(1), 1), StructuredStmt::CallHelper(target)],
+            then_body: vec![StructuredStmt::call_helper(target)],
+            else_body: vec![assign_int(LocalId(1), 1), StructuredStmt::call_helper(target)],
         }];
 
         assert!(!sink_common_tail_helpers_in_body(&mut body));
@@ -3996,7 +4695,7 @@ mod tests {
         let live = Label(1);
         let dead = Label(2);
         let mut structured = StructuredFunction {
-            body: vec![StructuredStmt::CallHelper(live)],
+            body: vec![StructuredStmt::call_helper(live)],
             helpers: vec![
                 crate::lir_structure::StructuredHelper {
                     label: live,
@@ -4027,6 +4726,7 @@ mod tests {
                 (dead, vec![LocalId(0)]),
             ]),
             optional_helper_live_ins: HashSet::from([(dead, LocalId(0))]),
+            ..BackwardFacts::default()
         };
 
         let mut pass = HelperSignaturePruning;
@@ -4152,7 +4852,7 @@ mod tests {
         let caller = Label(1);
         let callee = Label(2);
         let mut structured = StructuredFunction {
-            body: vec![StructuredStmt::CallHelper(caller)],
+            body: vec![StructuredStmt::call_helper(caller)],
             helpers: vec![
                 crate::lir_structure::StructuredHelper {
                     label: caller,
@@ -4166,7 +4866,7 @@ mod tests {
                             target: "Display".to_owned(),
                             args: vec![Expr::Local(LocalId(1))],
                         })),
-                        StructuredStmt::CallHelper(callee),
+                        StructuredStmt::call_helper(callee),
                     ],
                 },
                 crate::lir_structure::StructuredHelper {
@@ -4189,6 +4889,257 @@ mod tests {
         assert!(pass.run(&mut cx));
         assert_eq!(structured.helpers[0].params, vec![LocalId(0), LocalId(1), LocalId(3)]);
         assert_eq!(structured.helpers[1].params, vec![LocalId(3)]);
+    }
+
+    #[test]
+    fn valid_arg_hints_reduce_caller_helper_live_ins_only() {
+        let function = helper_live_in_function();
+        let caller = Label(1);
+        let callee = Label(2);
+        let mut structured = StructuredFunction {
+            body: vec![StructuredStmt::call_helper(caller)],
+            helpers: vec![
+                crate::lir_structure::StructuredHelper {
+                    label: caller,
+                    params: vec![LocalId(1), LocalId(3)],
+                    body: vec![StructuredStmt::CallHelper {
+                        label: callee,
+                        arg_hints: vec![LocalId(1)],
+                    }],
+                },
+                crate::lir_structure::StructuredHelper {
+                    label: callee,
+                    params: vec![LocalId(1), LocalId(3)],
+                    body: vec![
+                        StructuredStmt::Stmt(Stmt::Capture {
+                            key: "y".to_owned(),
+                            value: Expr::Local(LocalId(1)),
+                        }),
+                        StructuredStmt::Stmt(Stmt::Capture {
+                            key: "z".to_owned(),
+                            value: Expr::Local(LocalId(3)),
+                        }),
+                    ],
+                },
+            ],
+            facts: BackwardFacts::default(),
+        };
+        let mut facts = BackwardFacts::default();
+
+        let mut pass = HelperSignaturePruning;
+        let mut cx =
+            BackwardPassCx { function: &function, structured: &mut structured, facts: &mut facts };
+
+        assert!(pass.run(&mut cx));
+        assert_eq!(structured.helpers[0].params, vec![LocalId(1)]);
+        assert_eq!(structured.helpers[1].params, vec![LocalId(1), LocalId(3)]);
+        assert_eq!(
+            structured.helpers[0].body,
+            vec![StructuredStmt::CallHelper { label: callee, arg_hints: vec![LocalId(1)] }]
+        );
+    }
+
+    #[test]
+    fn dce_uses_valid_arg_hints_but_keeps_helper_params_authoritative() {
+        let target = Label(4);
+        let helper_params = HashMap::from([(target, vec![LocalId(1), LocalId(3)])]);
+        let mut live = LiveSet::new(4);
+        let mut body = vec![
+            assign_int(LocalId(3), 9),
+            StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] },
+        ];
+
+        assert!(prune_dead_assignments_in_body(&mut body, &mut live, &helper_params));
+        assert_eq!(
+            body,
+            vec![StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] }]
+        );
+        assert_eq!(helper_params.get(&target), Some(&vec![LocalId(1), LocalId(3)]));
+    }
+
+    #[test]
+    fn invalid_arg_hints_fall_back_to_helper_params() {
+        let target = Label(5);
+        let helper_params = HashMap::from([(target, vec![LocalId(1), LocalId(3)])]);
+        let mut live = LiveSet::new(4);
+        let mut body = vec![
+            assign_int(LocalId(3), 9),
+            StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(2)] },
+        ];
+
+        assert!(!prune_dead_assignments_in_body(&mut body, &mut live, &helper_params));
+        assert_eq!(
+            body,
+            vec![
+                assign_int(LocalId(3), 9),
+                StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(2)] },
+            ]
+        );
+    }
+
+    #[test]
+    fn refreshing_arg_hints_preserves_valid_subsets_and_repairs_invalid_hints() {
+        let target = Label(6);
+        let helper_params = HashMap::from([(target, vec![LocalId(1), LocalId(3)])]);
+        let mut structured = StructuredFunction {
+            body: vec![
+                StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] },
+                StructuredStmt::CallHelper {
+                    label: target,
+                    arg_hints: vec![LocalId(3), LocalId(1)],
+                },
+            ],
+            helpers: Vec::new(),
+            facts: BackwardFacts::default(),
+        };
+
+        refresh_helper_call_arg_hints(&mut structured, &helper_params);
+
+        assert_eq!(
+            structured.body,
+            vec![
+                StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] },
+                StructuredStmt::CallHelper {
+                    label: target,
+                    arg_hints: vec![LocalId(1), LocalId(3)],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn helper_call_arg_hint_pass_preserves_strict_subsets_and_narrows_full_hints() {
+        let target = Label(7);
+        let function = Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(1)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "p0".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(1), name_hint: "p1".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(2), name_hint: "p2".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(3), name_hint: "p3".to_owned(), ty: LirType::Int },
+            ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        };
+        let mut structured = StructuredFunction {
+            body: vec![
+                StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] },
+                StructuredStmt::CallHelper {
+                    label: target,
+                    arg_hints: vec![LocalId(1), LocalId(3)],
+                },
+            ],
+            helpers: Vec::new(),
+            facts: BackwardFacts::default(),
+        };
+        let mut facts = BackwardFacts {
+            helper_live_ins: HashMap::from([(target, vec![LocalId(1), LocalId(3)])]),
+            ..BackwardFacts::default()
+        };
+        let mut pass = HelperCallArgHints;
+        let mut cx =
+            BackwardPassCx { function: &function, structured: &mut structured, facts: &mut facts };
+
+        assert!(pass.run(&mut cx));
+        assert_eq!(
+            structured.body,
+            vec![
+                StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] },
+                StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] },
+            ]
+        );
+    }
+
+    #[test]
+    fn helper_arg_hint_refresh_does_not_wake_branch_merge() {
+        const PASSES: &[BackwardPassKind] =
+            &[BackwardPassKind::HelperCallArgHints, BackwardPassKind::BranchMerge];
+
+        let target = Label(8);
+        let function = Function {
+            name: "test".to_owned(),
+            params: vec![LocalId(1)],
+            locals: vec![
+                Local { id: LocalId(0), name_hint: "cond".to_owned(), ty: LirType::Bool },
+                Local { id: LocalId(1), name_hint: "p1".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(2), name_hint: "p2".to_owned(), ty: LirType::Int },
+                Local { id: LocalId(3), name_hint: "p3".to_owned(), ty: LirType::Int },
+            ],
+            local_variable_touched: HashMap::new(),
+            local_generic_temp_name: HashMap::new(),
+            entry: Label(0),
+            blocks: Vec::new(),
+            returns: Vec::new(),
+            output_types: HashMap::new(),
+        };
+        let mut structured = StructuredFunction {
+            body: vec![
+                StructuredStmt::CallHelper {
+                    label: target,
+                    arg_hints: vec![LocalId(1), LocalId(3)],
+                },
+                StructuredStmt::If {
+                    cond: Expr::Local(LocalId(0)),
+                    then_body: vec![assign_int(LocalId(2), 1)],
+                    else_body: vec![assign_int(LocalId(2), 2)],
+                },
+                StructuredStmt::If {
+                    cond: Expr::Local(LocalId(0)),
+                    then_body: vec![assign_int(LocalId(3), 3)],
+                    else_body: vec![assign_int(LocalId(3), 4)],
+                },
+            ],
+            helpers: Vec::new(),
+            facts: BackwardFacts::default(),
+        };
+        let mut facts = BackwardFacts {
+            helper_live_ins: HashMap::from([(target, vec![LocalId(1), LocalId(3)])]),
+            helper_arg_hints_dirty: true,
+            branch_merge_dirty: false,
+            ..BackwardFacts::default()
+        };
+
+        assert!(BackwardPipeline { name: "test", passes: PASSES }.run(&mut BackwardPassCx {
+            function: &function,
+            structured: &mut structured,
+            facts: &mut facts,
+        }));
+
+        assert_eq!(
+            structured.body.first(),
+            Some(&StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] })
+        );
+        assert_eq!(structured.body.len(), 3);
+        assert!(!facts.branch_merge_dirty);
+    }
+
+    #[test]
+    fn inline_candidate_expansion_flattens_nested_candidates_in_one_pass() {
+        let outer = Label(10);
+        let inner = Label(11);
+        let inlineable = HashMap::from([
+            (
+                outer,
+                vec![
+                    assign_int(LocalId(1), 1),
+                    StructuredStmt::CallHelper { label: inner, arg_hints: Vec::new() },
+                ],
+            ),
+            (inner, vec![assign_int(LocalId(2), 2)]),
+        ]);
+
+        let expanded = fully_expand_inlineable_helpers(inlineable);
+
+        assert_eq!(
+            expanded.get(&outer),
+            Some(&vec![assign_int(LocalId(1), 1), assign_int(LocalId(2), 2)])
+        );
+        assert_eq!(expanded.get(&inner), Some(&vec![assign_int(LocalId(2), 2)]));
     }
 
     #[test]
@@ -4342,8 +5293,8 @@ mod tests {
             },
             StructuredStmt::If {
                 cond: Expr::Local(LocalId(0)),
-                then_body: vec![StructuredStmt::CallHelper(target)],
-                else_body: vec![StructuredStmt::CallHelper(target)],
+                then_body: vec![StructuredStmt::call_helper(target)],
+                else_body: vec![StructuredStmt::call_helper(target)],
             },
         ];
         let mut body = original.clone();
@@ -4564,7 +5515,7 @@ mod tests {
         let function = branch_merge_function();
         let cond = Expr::Local(LocalId(4));
         let invalid_arms = [
-            vec![StructuredStmt::CallHelper(Label(9))],
+            vec![StructuredStmt::call_helper(Label(9))],
             vec![StructuredStmt::Return(vec![ReturnValue::Named {
                 key: "x".to_owned(),
                 value: Expr::Local(LocalId(2)),
@@ -4955,7 +5906,7 @@ mod tests {
     fn branch_merge_rejects_separated_effectful_intervening_block() {
         let function = branch_merge_function();
         let cond = Expr::Local(LocalId(4));
-        let invalid_middle = [StructuredStmt::CallHelper(Label(9))];
+        let invalid_middle = [StructuredStmt::call_helper(Label(9))];
 
         for middle in invalid_middle {
             let original = vec![
@@ -5268,7 +6219,7 @@ mod tests {
             assign_expr(LocalId(2), predicate),
             StructuredStmt::If {
                 cond: Expr::Local(LocalId(2)),
-                then_body: vec![StructuredStmt::CallHelper(Label(7))],
+                then_body: vec![StructuredStmt::call_helper(Label(7))],
                 else_body: vec![assign_int(LocalId(3), 0)],
             },
         ];
@@ -5291,7 +6242,7 @@ mod tests {
             assign_expr(LocalId(2), predicate.clone()),
             StructuredStmt::If {
                 cond: Expr::Local(LocalId(2)),
-                then_body: vec![StructuredStmt::CallHelper(helper)],
+                then_body: vec![StructuredStmt::call_helper(helper)],
                 else_body: vec![StructuredStmt::Return(vec![ReturnValue::Named {
                     key: "out".to_owned(),
                     value: Expr::Local(LocalId(3)),
@@ -5310,7 +6261,7 @@ mod tests {
             body,
             vec![StructuredStmt::If {
                 cond: predicate,
-                then_body: vec![StructuredStmt::CallHelper(helper)],
+                then_body: vec![StructuredStmt::call_helper(helper)],
                 else_body: vec![StructuredStmt::Return(vec![ReturnValue::Named {
                     key: "out".to_owned(),
                     value: Expr::Local(LocalId(3)),
@@ -6337,7 +7288,7 @@ mod tests {
                 ],
                 else_body: vec![assign_bool(LocalId(3), false)],
             },
-            StructuredStmt::CallHelper(helper),
+            StructuredStmt::call_helper(helper),
         ];
         let helper_params = HashMap::from([(helper, vec![LocalId(0), LocalId(1), LocalId(4)])]);
 
@@ -6358,7 +7309,7 @@ mod tests {
                         bool_and(cond, Expr::Local(LocalId(4)))
                     ),
                 }),
-                StructuredStmt::CallHelper(helper),
+                StructuredStmt::call_helper(helper),
             ]
         );
     }
@@ -6381,7 +7332,7 @@ mod tests {
                 ],
                 else_body: vec![assign_bool(LocalId(3), false)],
             },
-            StructuredStmt::CallHelper(helper),
+            StructuredStmt::call_helper(helper),
         ];
         let helper_params = HashMap::from([(helper, vec![LocalId(2)])]);
         let mut body = original.clone();
@@ -6934,12 +7885,70 @@ mod tests {
         let helper_params = HashMap::from([(target, vec![LocalId(1)])]);
         let body = vec![
             StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(1), value: Expr::Local(LocalId(0)) }),
-            StructuredStmt::CallHelper(target),
+            StructuredStmt::call_helper(target),
         ];
 
         collect_optional_helper_live_ins(&body, &mut defined, &helper_params, &mut optional);
 
         assert_eq!(optional, HashSet::from([(target, LocalId(1))]));
+    }
+
+    #[test]
+    fn optional_live_ins_respect_per_call_arg_hints() {
+        let target = Label(4);
+        let mut optional = HashSet::new();
+        let mut defined = HashSet::new();
+        let helper_params = HashMap::from([(target, vec![LocalId(1), LocalId(3)])]);
+        let body = vec![StructuredStmt::CallHelper { label: target, arg_hints: vec![LocalId(1)] }];
+
+        collect_optional_helper_live_ins(&body, &mut defined, &helper_params, &mut optional);
+
+        assert_eq!(optional, HashSet::from([(target, LocalId(1))]));
+    }
+
+    #[test]
+    fn structured_constant_propagation_rewrites_const_before_later_helper() {
+        let helper = Label(4);
+        let mut body = vec![
+            assign_int(LocalId(1), 7),
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(1)),
+            }),
+            StructuredStmt::CallHelper { label: helper, arg_hints: vec![LocalId(3)] },
+        ];
+        let helper_params = HashMap::from([(helper, vec![LocalId(1), LocalId(3)])]);
+        let mut constants = HashMap::new();
+
+        let flow =
+            propagate_structured_constants_in_body(&mut body, &mut constants, &helper_params);
+
+        assert!(flow.changed);
+        assert!(!flow.may_continue);
+        assert_eq!(
+            body[1],
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Const(ConstValue::Int(7)),
+            })
+        );
+    }
+
+    #[test]
+    fn structured_constant_helper_invalidation_uses_arg_hints_and_fallback() {
+        let helper = Label(5);
+        let helper_params = HashMap::from([(helper, vec![LocalId(1), LocalId(3)])]);
+        let mut constants =
+            HashMap::from([(LocalId(1), ConstValue::Int(7)), (LocalId(3), ConstValue::Int(9))]);
+
+        invalidate_helper_observed_constants(&mut constants, helper, &[LocalId(3)], &helper_params);
+        assert!(constants.contains_key(&LocalId(1)));
+        assert!(!constants.contains_key(&LocalId(3)));
+
+        let mut constants =
+            HashMap::from([(LocalId(1), ConstValue::Int(7)), (LocalId(3), ConstValue::Int(9))]);
+        invalidate_helper_observed_constants(&mut constants, helper, &[LocalId(4)], &helper_params);
+        assert!(constants.is_empty());
     }
 
     #[test]
@@ -7085,7 +8094,7 @@ mod tests {
         let neg = Expr::Unary { op: UnaryOp::Neg, arg: Box::new(Expr::Local(LocalId(0))) };
         let original = vec![
             assign_expr(LocalId(1), neg.clone()),
-            StructuredStmt::CallHelper(Label(2)),
+            StructuredStmt::call_helper(Label(2)),
             assign_expr(LocalId(2), Expr::Local(LocalId(1))),
         ];
         let mut body = original.clone();
@@ -7107,6 +8116,27 @@ mod tests {
     }
 
     #[test]
+    fn unary_temp_inlining_allows_later_helper_call_that_arg_hints_exclude() {
+        let helper = Label(2);
+        let neg = Expr::Unary { op: UnaryOp::Neg, arg: Box::new(Expr::Local(LocalId(0))) };
+        let mut body = vec![
+            assign_expr(LocalId(1), neg.clone()),
+            assign_expr(LocalId(2), Expr::Local(LocalId(1))),
+            StructuredStmt::CallHelper { label: helper, arg_hints: vec![LocalId(3)] },
+        ];
+        let helper_params = HashMap::from([(helper, vec![LocalId(1), LocalId(3)])]);
+
+        assert!(inline_unary_temps_in_body(&mut body, &helper_params, &HashSet::new()));
+        assert_eq!(
+            body,
+            vec![
+                assign_expr(LocalId(2), neg),
+                StructuredStmt::CallHelper { label: helper, arg_hints: vec![LocalId(3)] },
+            ]
+        );
+    }
+
+    #[test]
     fn copy_alias_propagation_rewrites_straight_line_and_leaves_dce_removal() {
         let mut body = vec![
             StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(1), value: Expr::Local(LocalId(0)) }),
@@ -7124,7 +8154,7 @@ mod tests {
             }]),
         ];
 
-        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new(), &HashMap::new()));
         assert_eq!(
             body[1],
             StructuredStmt::Stmt(Stmt::Assign {
@@ -7169,7 +8199,7 @@ mod tests {
             }),
         ];
 
-        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new(), &HashMap::new()));
         assert_eq!(
             body[2],
             StructuredStmt::Stmt(Stmt::Capture {
@@ -7199,7 +8229,7 @@ mod tests {
             }),
         ];
 
-        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new(), &HashMap::new()));
         assert_eq!(
             body[1],
             StructuredStmt::Stmt(Stmt::Capture {
@@ -7230,7 +8260,7 @@ mod tests {
             original_capture.clone(),
         ];
 
-        assert!(!propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert!(!propagate_copy_aliases_in_body(&mut body, &mut HashMap::new(), &HashMap::new()));
         assert_eq!(body[1], original_capture);
     }
 
@@ -7245,7 +8275,7 @@ mod tests {
             }),
         ];
 
-        assert!(!propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert!(!propagate_copy_aliases_in_body(&mut body, &mut HashMap::new(), &HashMap::new()));
         assert_eq!(
             body[2],
             StructuredStmt::Stmt(Stmt::Capture {
@@ -7269,7 +8299,7 @@ mod tests {
             }),
         ];
 
-        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new()));
+        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new(), &HashMap::new()));
         assert_eq!(
             body[1],
             StructuredStmt::Stmt(Stmt::Capture {
@@ -7281,6 +8311,47 @@ mod tests {
                 },
             })
         );
+    }
+
+    #[test]
+    fn copy_alias_propagation_crosses_helper_call_that_arg_hints_exclude() {
+        let helper = Label(2);
+        let mut body = vec![
+            StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(1), value: Expr::Local(LocalId(0)) }),
+            StructuredStmt::CallHelper { label: helper, arg_hints: vec![LocalId(3)] },
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(1)),
+            }),
+        ];
+        let helper_params = HashMap::from([(helper, vec![LocalId(1), LocalId(3)])]);
+
+        assert!(propagate_copy_aliases_in_body(&mut body, &mut HashMap::new(), &helper_params));
+        assert_eq!(
+            body[2],
+            StructuredStmt::Stmt(Stmt::Capture {
+                key: "x".to_owned(),
+                value: Expr::Local(LocalId(0)),
+            })
+        );
+    }
+
+    #[test]
+    fn copy_alias_propagation_keeps_invalid_arg_hints_as_helper_barrier() {
+        let helper = Label(2);
+        let original_capture = StructuredStmt::Stmt(Stmt::Capture {
+            key: "x".to_owned(),
+            value: Expr::Local(LocalId(1)),
+        });
+        let mut body = vec![
+            StructuredStmt::Stmt(Stmt::Assign { dst: LocalId(1), value: Expr::Local(LocalId(0)) }),
+            StructuredStmt::CallHelper { label: helper, arg_hints: vec![LocalId(4)] },
+            original_capture.clone(),
+        ];
+        let helper_params = HashMap::from([(helper, vec![LocalId(1), LocalId(3)])]);
+
+        assert!(!propagate_copy_aliases_in_body(&mut body, &mut HashMap::new(), &helper_params));
+        assert_eq!(body[2], original_capture);
     }
 
     fn assign_int(dst: LocalId, value: i32) -> StructuredStmt {
@@ -7379,7 +8450,7 @@ mod tests {
         let function = helper_live_in_function();
         let label = Label(1);
         let mut structured = StructuredFunction {
-            body: vec![StructuredStmt::CallHelper(label)],
+            body: vec![StructuredStmt::call_helper(label)],
             helpers: vec![crate::lir_structure::StructuredHelper {
                 label,
                 params: vec![LocalId(0), LocalId(1), LocalId(2), LocalId(3)],
