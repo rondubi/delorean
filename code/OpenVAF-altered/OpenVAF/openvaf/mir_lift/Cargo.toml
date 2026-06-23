@@ -1,0 +1,18 @@
+[package]
+name = "mir_lift"
+version = "0.0.0"
+authors = ["DSPOM"]
+edition = "2021"
+license = "GPL-3.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+lasso = { version = "0.7", features = ["ahash"] }
+mir = { version = "0.0.0", path = "../mir" }
+mir_reader = { version = "0.0.0", path = "../mir_reader" }
+hir_lower = { version = "0.0.0", path = "../hir_lower" }

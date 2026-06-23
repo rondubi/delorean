@@ -51,5 +51,5 @@ fn hash(db: &CompilationDB, defines: &[String]) -> md5::Digest {
 pub fn file_name(db: &CompilationDB, opts: &Opts) -> String {
     let hash = u128::from_ne_bytes(*hash(db, &opts.defines));
     let hash = base_n::encode(hash, base_n::CASE_INSENSITIVE);
-    format!("{}.osdi", hash)
+    format!("{}.{}", hash, opts.backend.output_extension())
 }

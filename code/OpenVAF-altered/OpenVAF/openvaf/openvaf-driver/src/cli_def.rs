@@ -1,7 +1,6 @@
+use core::convert::Infallible;
 use std::fs;
 use std::path::Path;
-use std::error::Error;
-use core::convert::Infallible;
 
 use anyhow::bail;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -28,10 +27,12 @@ pub fn main_command() -> Command {
             output(),
             batchmode(),
             dry_run(),
-            dump_mir(), 
-            dump_unopt_mir(), 
-            dump_ir(), 
-            dump_unopt_ir(), 
+            dump_mir(),
+            dump_unopt_mir(),
+            dump_ir(),
+            dump_unopt_ir(),
+            dump_lir(),
+            backend(),
             cache_dir(),
             opt_lvl(),
             target(),
@@ -58,6 +59,8 @@ pub const DUMPMIR: &str = "dump-mir";
 pub const DUMPUNOPTMIR: &str = "dump-unopt-mir";
 pub const DUMPIR: &str = "dump-ir";
 pub const DUMPUNOPTIR: &str = "dump-unopt-ir";
+pub const DUMPLIR: &str = "dump-lir";
+pub const BACKEND: &str = "backend";
 pub const TARGET: &str = "target";
 pub const SUPPORTED_TARGETS: &str = "supported-targets";
 pub const LINTS: &str = "lints";
@@ -77,7 +80,6 @@ pub const DENY: &str = "deny";
 // RDUBI changes
 pub const PARAM_TO_LEAVE: &str = "dyn-use-param";
 pub const ELISION_FILE: &str = "elision-file";
-
 
 fn interface() -> Arg {
     Arg::new(INTERFACE)
@@ -125,6 +127,26 @@ fn dump_unopt_ir() -> Arg {
     flag(DUMPUNOPTIR, "dump-unopt-ir")
         .help("Dump unoptimized LLVM IR during compilation.")
         .long_help("Dump unoptimized LLVM IR during compilation.\nUsed for debugging.")
+}
+
+fn dump_lir() -> Arg {
+    flag(DUMPLIR, "dump-lir")
+        .help("Dump LIR during mir-lift compilation.")
+        .long_help("Dump LIR during mir-lift compilation.\nUsed for debugging.")
+}
+
+fn backend() -> Arg {
+    Arg::new(BACKEND)
+        .long(BACKEND)
+        .help("Select the backend used after MIR lowering.")
+        .long_help(
+            "Select the backend used after MIR lowering.\n\npossible values\n\nllvm - generate the normal OSDI shared library through LLVM\nmir-lift - lift MIR to Python instead of generating LLVM IR",
+        )
+        .value_parser(["llvm", "mir-lift"])
+        .default_value("llvm")
+        .value_name("BACKEND")
+        .required(false)
+        .hide_possible_values(true)
 }
 
 fn target() -> Arg {

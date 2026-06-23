@@ -4,12 +4,15 @@ use std::process::exit;
 use anyhow::{bail, Context, Result};
 use camino::Utf8PathBuf;
 use clap::ArgMatches;
-use openvaf::{builtin_lints, get_target_names, host_triple, AbsPathBuf, LintLevel, OptLevel};
+use openvaf::{
+    builtin_lints, get_target_names, host_triple, AbsPathBuf, CodegenBackend, LintLevel, OptLevel,
+};
 use termcolor::{Color, ColorChoice, ColorSpec, WriteColor};
 
 use crate::cli_def::{
-    ALLOW, BATCHMODE, CACHE_DIR, CODEGEN, DEFINE, DENY, DRYRUN, DUMPMIR, DUMPUNOPTMIR, DUMPIR, DUMPUNOPTIR, INCLUDE, INPUT, LINTS, OPT_LVL,
-    OUTPUT, SUPPORTED_TARGETS, TARGET, TARGET_CPU, WARN, PARAM_TO_LEAVE, ELISION_FILE,
+    ALLOW, BACKEND, BATCHMODE, CACHE_DIR, CODEGEN, DEFINE, DENY, DRYRUN, DUMPIR, DUMPLIR, DUMPMIR,
+    DUMPUNOPTIR, DUMPUNOPTMIR, ELISION_FILE, INCLUDE, INPUT, LINTS, OPT_LVL, OUTPUT,
+    PARAM_TO_LEAVE, SUPPORTED_TARGETS, TARGET, TARGET_CPU, WARN,
 };
 use crate::{CompilationDestination, Opts};
 use openvaf::elysian::{parse_file, to_cli_defaults};
@@ -39,6 +42,12 @@ pub fn matches_to_opts(matches: ArgMatches) -> Result<Opts> {
         lints.extend(deny.map(|lint| (lint.to_owned(), LintLevel::Deny)));
     }
 
+    let backend = match matches.get_one::<String>(BACKEND).map(String::as_str).unwrap_or("llvm") {
+        "llvm" => CodegenBackend::Llvm,
+        "mir-lift" => CodegenBackend::MirLift,
+        backend => bail!("unknown backend {backend}"),
+    };
+
     let output = if matches.get_flag(BATCHMODE) {
         let cache_dir = if let Some(val) = matches.get_one::<Utf8PathBuf>(CACHE_DIR) {
             val.clone()
@@ -62,7 +71,7 @@ pub fn matches_to_opts(matches: ArgMatches) -> Result<Opts> {
         let lib_file = if let Some(output) = matches.get_one::<Utf8PathBuf>(OUTPUT) {
             output.clone()
         } else {
-            input.with_extension("osdi")
+            input.with_extension(backend.output_extension())
         };
 
         CompilationDestination::Path { lib_file }
@@ -106,7 +115,8 @@ pub fn matches_to_opts(matches: ArgMatches) -> Result<Opts> {
         matches.get_one(TARGET_CPU).cloned().unwrap_or_else(|| default_cpu.to_owned());
 
     // RDUBI CHANGES
-    let params_to_leave: Vec<u32> = matches.get_many::<u32>(PARAM_TO_LEAVE)
+    let params_to_leave: Vec<u32> = matches
+        .get_many::<u32>(PARAM_TO_LEAVE)
         .map(|vals| vals.cloned().collect())
         .unwrap_or_default();
     let param_defaults = if let Some(filename_str) = matches.get_one::<String>(ELISION_FILE) {
@@ -135,12 +145,14 @@ pub fn matches_to_opts(matches: ArgMatches) -> Result<Opts> {
         opt_lvl,
         target,
         target_cpu,
-        dump_mir: matches.get_flag(DUMPMIR), 
-        dump_unopt_mir: matches.get_flag(DUMPUNOPTMIR), 
-        dump_ir: matches.get_flag(DUMPIR), 
-        dump_unopt_ir: matches.get_flag(DUMPUNOPTIR), 
+        backend,
+        dump_mir: matches.get_flag(DUMPMIR),
+        dump_unopt_mir: matches.get_flag(DUMPUNOPTMIR),
+        dump_ir: matches.get_flag(DUMPIR),
+        dump_unopt_ir: matches.get_flag(DUMPUNOPTIR),
+        dump_lir: matches.get_flag(DUMPLIR),
         dry_run: matches.get_flag(DRYRUN),
-        params_to_leave: vec![],
+        params_to_leave,
         param_defaults,
     })
 }
