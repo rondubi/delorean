@@ -119,10 +119,15 @@ pub fn matches_to_opts(matches: ArgMatches) -> Result<Opts> {
         .get_many::<u32>(PARAM_TO_LEAVE)
         .map(|vals| vals.cloned().collect())
         .unwrap_or_default();
-    let param_defaults = if let Some(filename) = matches.get_one::<Utf8PathBuf>(ELISION_FILE) {
-        let parsed = parse_file(filename)
-            .with_context(|| format!("failed to parse elision file {}", filename))?;
-        to_cli_defaults(&parsed)
+    let param_defaults = if let Some(filename_str) = matches.get_one::<String>(ELISION_FILE) {
+        let filename = Utf8PathBuf::from(filename_str);
+        match parse_file(&filename) {
+            Ok(parsed) => to_cli_defaults(&parsed),
+            Err(e) => {
+                eprintln!("Warning: failed to parse elision file: {e}");
+                vec![]
+            }
+        }
     } else {
         vec![]
     };

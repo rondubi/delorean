@@ -223,16 +223,12 @@ fn param_to_elide() -> Arg {
 }
 
 fn elision_file() -> Arg {
-    elision_file_to_path_arg(ELISION_FILE)
+    Arg::new(ELISION_FILE)
         .long(ELISION_FILE)
         .required(false)
-        .action(ArgAction::Append)
-}
-
-fn elision_file_to_path_arg(name: &'static str) -> Arg {
-    let parse = |raw: &str| Ok::<Utf8PathBuf, Infallible>(Utf8PathBuf::from(raw).to_owned());
-
-    Arg::new(name).value_name(ELISION_FILE).value_parser(parse)
+        .action(ArgAction::Set)
+        .num_args(1)
+        .help("Path to elision file with parameter defaults")
 }
 
 // END RDUBI CHANGES
