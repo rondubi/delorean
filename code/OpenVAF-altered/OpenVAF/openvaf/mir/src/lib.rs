@@ -248,6 +248,61 @@ impl fmt::Display for SourceLoc {
 }
 
 impl Function {
+    /// Compact values and blocks to use contiguous indices, removing dead entries.
+    /// Returns the (value_map, block_map) for callers to remap external references.
+    /// Returns None if nothing needed compacting.
+    pub fn compact(&mut self) -> Option<(Vec<Option<Value>>, Vec<Option<Block>>)> {
+        let num_builtin_consts = 16usize; // GRAVESTONE through INFINITY
+
+        // === Phase 1: Build mappings ===
+
+        // Block mapping: only blocks in the layout get new indices
+        let old_num_blocks = self.layout.num_blocks();
+        let mut block_map: Vec<Option<Block>> = vec![None; old_num_blocks];
+        let mut new_block_count = 0u32;
+        for bb in self.layout.blocks() {
+            block_map[usize::from(bb)] = Some(Block::from(new_block_count as usize));
+            new_block_count += 1;
+        }
+
+        // Value mapping: built-in constants keep position, other live values get compacted
+        let old_num_values = self.dfg.num_values();
+        let mut value_map: Vec<Option<Value>> = vec![None; old_num_values];
+
+        // Built-in constants stay at their original positions
+        for i in 0..num_builtin_consts.min(old_num_values) {
+            value_map[i] = Some(Value::from(i));
+        }
+
+        // Other live values get new contiguous indices
+        let mut new_val_count = num_builtin_consts as u32;
+        for old_idx in num_builtin_consts..old_num_values {
+            let old_val = Value::from(old_idx);
+            let keep = match self.dfg.value_def(old_val) {
+                ValueDef::Result(inst, _) => self.layout.inst_block(inst).is_some(),
+                ValueDef::Param(_) | ValueDef::Const(_) => true,
+                ValueDef::Invalid => false,
+            };
+            if keep {
+                value_map[old_idx] = Some(Value::from(new_val_count as usize));
+                new_val_count += 1;
+            }
+        }
+
+        // Skip if nothing to compact
+        if new_val_count as usize == old_num_values
+            && new_block_count as usize == old_num_blocks
+        {
+            return None;
+        }
+
+        // === Phase 2: Rebuild structures ===
+        self.dfg.compact(&value_map, &block_map, new_val_count as usize);
+        self.layout.compact_blocks(&block_map);
+
+        Some((value_map, block_map))
+    }
+
     pub fn remove_opt_barriers(&mut self) {
         for inst in self.dfg.insts.iter() {
             if let InstructionData::Unary { opcode: Opcode::OptBarrier, arg } = self.dfg.insts[inst]

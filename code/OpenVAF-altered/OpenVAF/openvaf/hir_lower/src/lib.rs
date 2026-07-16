@@ -395,6 +395,54 @@ impl HirInterner {
             }
         })
     }
+
+    /// Remap all MIR Value references after a compaction pass.
+    pub fn remap_values(&mut self, value_map: &[Option<Value>]) {
+        // Remap output values
+        for val in self.outputs.values_mut() {
+            if let Some(old_val) = val.expand() {
+                if let Some(new_val) = value_map.get(usize::from(old_val)).and_then(|v| *v) {
+                    *val = new_val.into();
+                }
+            }
+        }
+
+        // Remap param values
+        for val in self.params.raw.values_mut() {
+            if let Some(new_val) = value_map.get(usize::from(*val)).and_then(|v| *v) {
+                *val = new_val;
+            }
+        }
+
+        // Rebuild tagged_reads with remapped Value keys
+        let old_reads = std::mem::take(&mut self.tagged_reads);
+        self.tagged_reads = old_reads
+            .into_iter()
+            .filter_map(|(old_val, var)| {
+                value_map
+                    .get(usize::from(old_val))
+                    .and_then(|v| *v)
+                    .map(|new_val| (new_val, var))
+            })
+            .collect();
+
+        // Rebuild lim_state with remapped keys and values
+        let old_lim = std::mem::take(&mut self.lim_state);
+        for (old_key, old_vec) in old_lim.raw {
+            if let Some(new_key) = value_map.get(usize::from(old_key)).and_then(|v| *v) {
+                let new_vec: Vec<(Value, bool)> = old_vec
+                    .into_iter()
+                    .filter_map(|(v, b)| {
+                        value_map
+                            .get(usize::from(v))
+                            .and_then(|nv| *nv)
+                            .map(|nv| (nv, b))
+                    })
+                    .collect();
+                self.lim_state.raw.insert(new_key, new_vec);
+            }
+        }
+    }
 }
 
 pub struct MirBuilder<'a> {

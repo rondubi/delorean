@@ -103,6 +103,33 @@ impl DaeSystem {
             matrix_entry.resist != F_ZERO || matrix_entry.react != F_ZERO
         })
     }
+
+    /// Remap all MIR Value references after a compaction pass.
+    pub fn remap_values(&mut self, value_map: &[Option<Value>]) {
+        let mut remap = |v: Value| -> Value {
+            value_map
+                .get(usize::from(v))
+                .and_then(|nv| *nv)
+                .unwrap_or(v)
+        };
+
+        for residual in &mut self.residual {
+            residual.map_vals(&mut remap);
+        }
+
+        for entry in self.jacobian.raw.iter_mut() {
+            entry.resist = remap(entry.resist);
+            entry.react = remap(entry.react);
+        }
+
+        for noise in &mut self.noise_sources {
+            noise.map_vals(&mut remap);
+        }
+
+        // Rebuild small_signal_parameters with remapped values
+        let old_ssp = std::mem::take(&mut self.small_signal_parameters);
+        self.small_signal_parameters = old_ssp.into_iter().map(|v| remap(v)).collect();
+    }
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]

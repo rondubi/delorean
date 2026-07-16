@@ -1,7 +1,7 @@
 use hir::{BranchWrite, CompilationDB, Node};
 use hir_lower::{CurrentKind, HirInterner, ImplicitEquation, ParamKind};
 use lasso::Rodeo;
-use mir::Function;
+use mir::{Function, Value};
 use mir_opt::{simplify_cfg, sparse_conditional_constant_propagation};
 use stdx::impl_debug_display;
 
@@ -241,6 +241,28 @@ impl<'a> CompiledModule<'a> {
             println!();
         }
         
+        // Compact all MIR functions to remove dead values/blocks and reduce memory
+        if let Some((value_map, _block_map)) = cx.func.compact() {
+            cx.intern.remap_values(&value_map);
+            dae_system.remap_values(&value_map);
+        }
+        if let Some((value_map, _block_map)) = init.func.compact() {
+            init.intern.remap_values(&value_map);
+            let old_cached = std::mem::take(&mut init.cached_vals);
+            init.cached_vals = old_cached
+                .into_iter()
+                .filter_map(|(v, slot)| {
+                    value_map
+                        .get(usize::from(v))
+                        .and_then(|nv| *nv)
+                        .map(|nv| (nv, slot))
+                })
+                .collect();
+        }
+        if let Some((value_map, _block_map)) = model_param_setup.compact() {
+            model_param_intern.remap_values(&value_map);
+        }
+
         CompiledModule {
             eval: cx.func,
             intern: cx.intern,
