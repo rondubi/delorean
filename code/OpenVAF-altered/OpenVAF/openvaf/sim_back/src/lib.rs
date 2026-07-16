@@ -188,6 +188,10 @@ impl<'a> CompiledModule<'a> {
         let gvn = cx.optimize(OptimiziationStage::PostDerivative);
         dae_system.sparsify(&mut cx);
 
+        // ADCE + CFG cleanup after sparsification
+        cx.compute_cfg();
+        cx.optimize(OptimiziationStage::Final);
+
         debug_assert!(cx.func.validate());
 
         // Instance setup MIR - a copy of module MIR where only those instructions 
